@@ -49,9 +49,14 @@ NINJA_FILE="${NINJA_FILES[0]}"
 [[ -x "$NINJA" ]] || fail "$NINJA not found. Set NINJA to a ninja binary."
 mapfile -t OBJECTS < <(grep '^build obj/libembedpdf.a:' "$NINJA_FILE" | tr ' ' '\n' | grep '\.o$')
 (( ${#OBJECTS[@]} > 0 )) || fail "libembedpdf.a has no objects in $NINJA_FILE."
+DEPS="$(mktemp)"
+trap 'rm -f "$DEPS"' EXIT
+"$NINJA" -C "$BUILD" -t deps "${OBJECTS[@]}" > "$DEPS" || fail "ninja could not read the dependency log."
+# An object without recorded dependencies would hide the libraries it was built from.
+mapfile -t UNKNOWN < <(sed -n 's/^\(.*\): deps not found$/\1/p' "$DEPS")
+(( ${#UNKNOWN[@]} == 0 )) || fail "the dependency log has no entry for ${#UNKNOWN[@]} objects: ${UNKNOWN[*]}"
 mapfile -t LIBS < <(
-  "$NINJA" -C "$BUILD" -t deps "${OBJECTS[@]}" |
-    sed -n 's#^[[:space:]]\{1,\}\(\.\./\)*\(/ws/runtime/\)\{0,1\}\(third_party/[^/]*\)/.*#\3#p' |
+  sed -n 's#^[[:space:]]\{1,\}\(\.\./\)*\(/ws/runtime/\)\{0,1\}\(third_party/[^/]*\)/.*#\3#p' "$DEPS" |
     grep -v '^third_party/emsdk$' |
     sort -u
 )
@@ -94,7 +99,7 @@ LICENSES="$OUT/THIRD_PARTY_LICENSES"
 } > "$LICENSES"
 
 STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
+trap 'rm -rf "$STAGE" "$DEPS"' EXIT
 cp "$OUT/inkbar-pdfium.wasm" "$OUT/inkbar-pdfium.mjs" "$OUT/exports.txt" "$OUT/manifest.json" "$LICENSES" LICENSE NOTICE "$STAGE/"
 
 # Fixed order, owner and mtime keep the archive reproducible. gzip -n drops the timestamp.
