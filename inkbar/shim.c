@@ -1,0 +1,95 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Edward Coleridge Smith
+//
+// Glue that a JavaScript host needs and PDFium's C API leaves to the embedder.
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "fpdf_formfill.h"
+#include "fpdf_save.h"
+#include "fpdfview.h"
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#define INK_EXPORT EMSCRIPTEN_KEEPALIVE
+#else
+#define INK_EXPORT
+#endif
+
+typedef struct {
+  FPDF_FILEWRITE base;
+  unsigned char* data;
+  size_t size;
+  size_t cap;
+} InkWriter;
+
+static int WriteBlock(FPDF_FILEWRITE* self, const void* data, unsigned long size) {
+  InkWriter* w = (InkWriter*)self;
+  if (w->size + size > w->cap) {
+    size_t cap = w->cap ? w->cap * 2 : 65536;
+    while (cap < w->size + size)
+      cap *= 2;
+    unsigned char* grown = realloc(w->data, cap);
+    if (!grown)
+      return 0;
+    w->data = grown;
+    w->cap = cap;
+  }
+  memcpy(w->data + w->size, data, size);
+  w->size += size;
+  return 1;
+}
+
+INK_EXPORT void INK_Init(void) {
+  FPDF_LIBRARY_CONFIG config;
+  memset(&config, 0, sizeof(config));
+  config.version = 2;
+  FPDF_InitLibraryWithConfig(&config);
+}
+
+INK_EXPORT void INK_Destroy(void) {
+  FPDF_DestroyLibrary();
+}
+
+// Returns NULL on failure.
+INK_EXPORT InkWriter* INK_Save(FPDF_DOCUMENT doc, unsigned long flags) {
+  InkWriter* w = calloc(1, sizeof(InkWriter));
+  if (!w)
+    return NULL;
+  w->base.version = 1;
+  w->base.WriteBlock = WriteBlock;
+  if (!FPDF_SaveAsCopy(doc, &w->base, flags)) {
+    free(w->data);
+    free(w);
+    return NULL;
+  }
+  return w;
+}
+
+INK_EXPORT unsigned char* INK_WriterData(InkWriter* w) {
+  return w->data;
+}
+
+INK_EXPORT size_t INK_WriterSize(InkWriter* w) {
+  return w->size;
+}
+
+INK_EXPORT void INK_WriterFree(InkWriter* w) {
+  if (!w)
+    return;
+  free(w->data);
+  free(w);
+}
+
+// Version 1: AcroForm only, no XFA, no JavaScript platform.
+INK_EXPORT FPDF_FORMFILLINFO* INK_NewFormFillInfo(void) {
+  FPDF_FORMFILLINFO* info = calloc(1, sizeof(FPDF_FORMFILLINFO));
+  if (info)
+    info->version = 1;
+  return info;
+}
+
+INK_EXPORT void INK_FreeFormFillInfo(FPDF_FORMFILLINFO* info) {
+  free(info);
+}

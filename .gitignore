@@ -78,3 +78,6 @@
 *.xcodeproj
 *~
 
+/inkbar/out/
+/third_party/emsdk/
+/.cipd-site/

@@ -18,7 +18,28 @@ Everything Inkbar adds lives under `inkbar/`. Changes to files outside that dire
 
 ## Build
 
-The build is documented here once it lands.
+The build runs in a container pinned to an Ubuntu 24.04 image by digest. Run it from the repository root.
+
+```sh
+inkbar/build.sh
+node inkbar/smoke.mjs testing/resources/hello_world.pdf
+```
+
+The script uses `podman`. Set `CONTAINER=docker` to use Docker. The first run downloads several gigabytes of dependencies into the checkout. They are ignored by git. A clean build takes about ten minutes.
+
+The checkout is mounted into the container. `scripts/embedpdf-runtime/build-target.sh wasm32` builds `libembedpdf.a`. `inkbar/link.sh` then links it with `inkbar/shim.c` into `inkbar/out/`.
+
+| File | Contents |
+| --- | --- |
+| `inkbar-pdfium.wasm` | The module. |
+| `inkbar-pdfium.mjs` | An ES module. Its default export is the Emscripten factory. |
+| `exports.txt` | A copy of the export allowlist. |
+
+`inkbar/exports.txt` lists every exported function. A function that is not on the list is not in the module. `inkbar/size-budget.txt` holds the largest gzipped size of the `.wasm` file in bytes. The link step fails above it.
+
+The binary is single-threaded.
+
+Current size of `inkbar-pdfium.wasm`: 5,750,585 bytes raw, 2,563,012 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
 
 ## Taking upstream
 
