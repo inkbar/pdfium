@@ -25,6 +25,8 @@ inkbar/build.sh
 node inkbar/smoke.mjs testing/resources/hello_world.pdf
 ```
 
+The build needs a full-history clone with an `origin` remote and a clean working tree.
+
 The script uses `podman`. Set `CONTAINER=docker` to use Docker. The first run downloads several gigabytes of dependencies into the checkout. They are ignored by git. A clean build takes about ten minutes.
 
 The checkout is mounted into the container. `scripts/embedpdf-runtime/build-target.sh wasm32` builds `libembedpdf.a`. `inkbar/link.sh` then links it with `inkbar/shim.c` into `inkbar/out/`.

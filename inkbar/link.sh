@@ -9,7 +9,7 @@ set -euo pipefail
 export PATH="$PWD/third_party/emsdk/upstream/emscripten:$PWD/third_party/emsdk/upstream/bin:$PATH"
 export EM_CONFIG="$PWD/third_party/emsdk/.emscripten"
 
-LIB=$(find out/embedpdf-runtime/wasm32 -name libembedpdf.a | head -1)
+LIB=$(find out/embedpdf-runtime/wasm32 -name libembedpdf.a -print -quit)
 [[ -n "$LIB" ]] || { echo "libembedpdf.a not found" >&2; exit 1; }
 
 mkdir -p inkbar/out
