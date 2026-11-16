@@ -1,0 +1,34 @@
+name: upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://pdfium.googlesource.com/pdfium
+          git fetch --quiet upstream main
+
+      - name: Report
+        run: |
+          {
+            echo "## Upstream PDFium"
+            echo
+            echo "Commits on upstream/main that this branch lacks: $(git rev-list --count HEAD..upstream/main)"
+            echo
+            echo '```'
+            python3 scripts/embedpdf-runtime/check-upstream-freshness.py --upstream upstream/main || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

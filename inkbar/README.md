@@ -6,7 +6,7 @@ This is Inkbar's fork of PDFium. It is built for `@inkbar/engine`, the PDF engin
 
 The history here comes from three sources, in order.
 
-1. PDFium, from https://pdfium.googlesource.com/pdfium. The remote `upstream` points at it.
+1. PDFium, from https://pdfium.googlesource.com/pdfium. A fresh clone has no remote for it. Add one with `git remote add upstream https://pdfium.googlesource.com/pdfium`.
 2. `embedpdf/runtime`, from https://github.com/embedpdf/runtime. It is an Apache-2.0 fork of PDFium that adds editing and WebAssembly work.
 3. Inkbar's own commits, which follow the pinned commit.
 
@@ -45,7 +45,20 @@ Current size of `inkbar-pdfium.wasm`: 5,750,585 bytes raw, 2,563,012 bytes gzipp
 
 ## Taking upstream
 
-The process for taking in upstream PDFium changes is documented here once the release process lands.
+Take upstream once a month. Also take it out of cycle when a Chrome stable release notes list a PDFium security fix.
+
+1. Fetch and merge: `git fetch upstream main && git merge upstream/main`. Resolve conflicts, keeping changes outside `inkbar/` small.
+2. Rebuild with `inkbar/build.sh` and run `node inkbar/smoke.mjs testing/resources/hello_world.pdf`.
+3. Run the `@inkbar/engine` tests against the new archive. Do this before the monorepo's lock file moves to the new release.
+4. Push `main`, then push a tag named `v<branch>.<n>`. `<branch>` is the highest Chromium branch number that is an ancestor of `HEAD`. `<n>` counts releases on that branch, starting at 1. The release workflow builds the module and publishes the archive.
+
+The `upstream` workflow runs every Monday. It writes the number of upstream commits not yet merged to its job summary. It also runs the freshness check, and it never fails for being behind.
+
+## Releases
+
+A tag that starts with `v` triggers the release workflow. It builds the module and publishes `inkbar-pdfium-wasm32-<tag>.tar.gz` to a GitHub release. The release notes give the upstream commit, the Chromium branch, the gzipped size of the module and the SHA-256 of the archive.
+
+The archive holds `inkbar-pdfium.wasm`, `inkbar-pdfium.mjs`, `exports.txt`, `manifest.json`, `LICENSE` and `NOTICE`. `manifest.json` records the tag, the fork and upstream commits, the Chromium branch, the Emscripten version, the GN arguments and the module's SHA-256 and gzipped size.
 
 ## Licence
 
