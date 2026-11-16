@@ -37,7 +37,7 @@ The checkout is mounted into the container. `scripts/embedpdf-runtime/build-targ
 | `inkbar-pdfium.mjs` | An ES module. Its default export is the Emscripten factory. |
 | `exports.txt` | A copy of the export allowlist. |
 
-`inkbar/exports.txt` lists every exported function. A function that is not on the list is not in the module. `inkbar/size-budget.txt` holds the largest gzipped size of the `.wasm` file in bytes. The link step fails above it.
+`inkbar/exports.txt` lists every exported function. The link step passes it to Emscripten as `EXPORTED_FUNCTIONS`, and `inkbar/shim.c` marks no function for export itself. `inkbar/smoke.mjs` instantiates the module and fails if its function exports differ from the list. `inkbar/size-budget.txt` holds the largest gzipped size of the `.wasm` file in bytes. The link step fails above it.
 
 The binary is single-threaded.
 

@@ -16,7 +16,14 @@ const m = await createModule()
 for (const name of names) {
   assert.equal(typeof m[`_${name}`], 'function', `missing export ${name}`)
 }
-assert.equal(m._FPDF_GetMetaText, undefined)
+// The module exports the allowlist and nothing else. Emscripten's own runtime
+// helpers start with "__" or "_emscripten_" and are not counted.
+const exported = Object.keys(m)
+  .filter((key) => key.startsWith('_') && typeof m[key] === 'function')
+  .filter((key) => !key.startsWith('__') && !key.startsWith('_emscripten_'))
+  .map((key) => key.slice(1))
+  .sort()
+assert.deepEqual(exported, [...names].sort())
 
 m._INK_Init()
 const bytes = readFileSync(pdfPath)

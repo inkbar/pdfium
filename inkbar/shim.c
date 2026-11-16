@@ -2,6 +2,7 @@
 // Copyright 2026 Edward Coleridge Smith
 //
 // Glue that a JavaScript host needs and PDFium's C API leaves to the embedder.
+// inkbar/exports.txt alone decides which of these functions the module exports.
 
 #include <stdlib.h>
 #include <string.h>
@@ -9,13 +10,6 @@
 #include "fpdf_formfill.h"
 #include "fpdf_save.h"
 #include "fpdfview.h"
-
-#ifdef __EMSCRIPTEN__
-#include <emscripten.h>
-#define INK_EXPORT EMSCRIPTEN_KEEPALIVE
-#else
-#define INK_EXPORT
-#endif
 
 typedef struct {
   FPDF_FILEWRITE base;
@@ -41,19 +35,19 @@ static int WriteBlock(FPDF_FILEWRITE* self, const void* data, unsigned long size
   return 1;
 }
 
-INK_EXPORT void INK_Init(void) {
+void INK_Init(void) {
   FPDF_LIBRARY_CONFIG config;
   memset(&config, 0, sizeof(config));
   config.version = 2;
   FPDF_InitLibraryWithConfig(&config);
 }
 
-INK_EXPORT void INK_Destroy(void) {
+void INK_Destroy(void) {
   FPDF_DestroyLibrary();
 }
 
 // Returns NULL on failure.
-INK_EXPORT InkWriter* INK_Save(FPDF_DOCUMENT doc, unsigned long flags) {
+InkWriter* INK_Save(FPDF_DOCUMENT doc, unsigned long flags) {
   InkWriter* w = calloc(1, sizeof(InkWriter));
   if (!w)
     return NULL;
@@ -67,15 +61,15 @@ INK_EXPORT InkWriter* INK_Save(FPDF_DOCUMENT doc, unsigned long flags) {
   return w;
 }
 
-INK_EXPORT unsigned char* INK_WriterData(InkWriter* w) {
+unsigned char* INK_WriterData(InkWriter* w) {
   return w->data;
 }
 
-INK_EXPORT size_t INK_WriterSize(InkWriter* w) {
+size_t INK_WriterSize(InkWriter* w) {
   return w->size;
 }
 
-INK_EXPORT void INK_WriterFree(InkWriter* w) {
+void INK_WriterFree(InkWriter* w) {
   if (!w)
     return;
   free(w->data);
@@ -83,13 +77,13 @@ INK_EXPORT void INK_WriterFree(InkWriter* w) {
 }
 
 // Version 1: AcroForm only, no XFA, no JavaScript platform.
-INK_EXPORT FPDF_FORMFILLINFO* INK_NewFormFillInfo(void) {
+FPDF_FORMFILLINFO* INK_NewFormFillInfo(void) {
   FPDF_FORMFILLINFO* info = calloc(1, sizeof(FPDF_FORMFILLINFO));
   if (info)
     info->version = 1;
   return info;
 }
 
-INK_EXPORT void INK_FreeFormFillInfo(FPDF_FORMFILLINFO* info) {
+void INK_FreeFormFillInfo(FPDF_FORMFILLINFO* info) {
   free(info);
 }
