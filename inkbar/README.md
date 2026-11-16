@@ -18,7 +18,7 @@ Everything Inkbar adds lives under `inkbar/`. Changes to files outside that dire
 
 ## Build
 
-The build runs in a container pinned to an Ubuntu 24.04 image by digest. Run it from the repository root.
+The build runs in a container pinned to an Ubuntu 24.04 image by digest. The scripts find the repository root themselves, so they run from any directory. The commands below are run from the root.
 
 ```sh
 inkbar/build.sh
