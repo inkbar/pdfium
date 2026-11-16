@@ -4,6 +4,7 @@
 // Glue that a JavaScript host needs and PDFium's C API leaves to the embedder.
 // inkbar/exports.txt alone decides which of these functions the module exports.
 
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -20,10 +21,16 @@ typedef struct {
 
 static int WriteBlock(FPDF_FILEWRITE* self, const void* data, unsigned long size) {
   InkWriter* w = (InkWriter*)self;
-  if (w->size + size > w->cap) {
-    size_t cap = w->cap ? w->cap * 2 : 65536;
-    while (cap < w->size + size)
+  if (size > SIZE_MAX - w->size)
+    return 0;
+  size_t need = w->size + size;
+  if (need > w->cap) {
+    size_t cap = w->cap ? w->cap : 65536;
+    while (cap < need) {
+      if (cap > SIZE_MAX / 2)
+        return 0;
       cap *= 2;
+    }
     unsigned char* grown = realloc(w->data, cap);
     if (!grown)
       return 0;
