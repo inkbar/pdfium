@@ -27,6 +27,13 @@ for b in $(git branch -r --list 'upstream/chromium/*' | sort -t/ -k3 -n -r); do
   fi
 done
 [[ -n "$BRANCH" ]] || { echo "write-manifest.sh: no upstream chromium branch is an ancestor of HEAD." >&2; exit 1; }
+# Tags are v<branch>.<n>. The branch part must name the branch the build is on.
+TAG_BRANCH="${TAG#v}"
+TAG_BRANCH="${TAG_BRANCH%%.*}"
+[[ "$TAG_BRANCH" == "$BRANCH" ]] || {
+  echo "write-manifest.sh: tag $TAG names branch $TAG_BRANCH, but HEAD is on chromium branch $BRANCH." >&2
+  exit 1
+}
 
 EMSDK="$(sed -n 's/^EMSDK_VERSION=//p' inkbar/build.sh | head -n 1)"
 GN_ARGS="$(tr '\n' ' ' < "$ARGS" | sed 's/ $//')"

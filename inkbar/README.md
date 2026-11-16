@@ -62,6 +62,8 @@ The archive holds seven files: `inkbar-pdfium.wasm`, `inkbar-pdfium.mjs`, `expor
 
 `inkbar/package.sh` writes `THIRD_PARTY_LICENSES`. It reads Ninja's dependency log for the objects in `libembedpdf.a` and collects every directory under `third_party/` that their sources and headers come from. For each one it copies the files named on the `License File` line of its `README.chromium` or `README.pdfium`. It then adds the licences of Emscripten and of the C library, C++ library and compiler runtime that Emscripten links in. The script fails when a library has no licence file, so a new dependency cannot ship without its licence. It needs GNU tar, so it runs on Linux.
 
+`inkbar/write-manifest.sh` fails when the tag's branch part differs from the Chromium branch it finds.
+
 ## Licence
 
 Apache License, Version 2.0. See `LICENSE`. `NOTICE` records the origin of this repository and the copyright of each contributor.
