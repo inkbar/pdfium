@@ -23,3 +23,12 @@ upstream PDFium:
 Patch artifacts under patches/embedpdf-runtime and binary or generated test
 resources are excluded from the CloudPDF-owned source manifest unless they
 contain standalone CloudPDF-authored source.
+
+Inkbar Modifications
+Copyright 2026 Edward Coleridge Smith
+
+This repository is derived from https://github.com/embedpdf/runtime at commit
+f2ea7597287f26bdcb450602de6616ff6939d506, which is itself derived from PDFium.
+Inkbar has modified it. Files under inkbar/ are Inkbar additions, licensed
+under the Apache License, Version 2.0. Other changes made by Inkbar are
+recorded in this repository's commit history from that commit onward.
