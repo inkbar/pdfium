@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 77)
+assert.equal(names.length, 78)
 
 const m = await createModule()
 for (const name of names) {
@@ -286,6 +286,37 @@ const bs = /\/BS\s*<<((?:[^<>]|<<[^<>]*>>)*)>>/.exec(squareText)
 assert.ok(bs, 'the square has no /BS')
 assert.match(bs[1], /\/S\s*\/D(?![A-Za-z0-9])/, `/BS ${bs[1]} is not dashed`)
 assert.match(bs[1], /\/D\s*\[\s*3(\.0*)?\s+1(\.0*)?\s*\]/, `/BS ${bs[1]} has no /D [3 1]`)
+
+// A reply points at an annotation that already exists: look it up by object
+// number, link a new Text annotation to it under /IRT, and release both handles.
+const FPDF_ANNOT_TEXT = 1
+const target = m._FPDFPage_CreateAnnot(formPage, FPDF_ANNOT_TEXT)
+assert.notEqual(target, 0)
+const targetNum = m._EPDFAnnot_GetObjectNumber(target)
+assert.ok(targetNum > 0, 'the target has no object number')
+m._FPDFPage_CloseAnnot(target)
+const found = m._EPDFPage_GetAnnotByObjectNumber(formPage, targetNum)
+assert.notEqual(found, 0, 'lookup by object number found nothing')
+assert.equal(m._EPDFAnnot_GetObjectNumber(found), targetNum)
+const reply = m._FPDFPage_CreateAnnot(formPage, FPDF_ANNOT_TEXT)
+assert.notEqual(reply, 0)
+const replyNum = m._EPDFAnnot_GetObjectNumber(reply)
+assert.ok(replyNum > 0 && replyNum !== targetNum, 'the reply has no distinct object number')
+withStrings(['IRT'], (key) => assert.equal(m._EPDFAnnot_SetLinkedAnnot(reply, key, found), 1))
+m._FPDFPage_CloseAnnot(found)
+m._FPDFPage_CloseAnnot(reply)
+const replySaved = save(second.doc).toString('latin1')
+assert.match(
+  objectText(replySaved, replyNum),
+  new RegExp(`/IRT\\s+${targetNum}\\s+0\\s+R`),
+  `the reply's /IRT does not refer to object ${targetNum}`,
+)
+// An object number that is not an annotation on this page, and one that is no object.
+const pageNum = Number(/(\d+)\s+0\s+obj(?:(?!endobj)[\s\S])*?\/Type\s*\/Page(?![A-Za-z])/.exec(replySaved)?.[1])
+assert.ok(pageNum > 0, 'found no page object')
+assert.equal(m._EPDFPage_GetAnnotByObjectNumber(formPage, pageNum), 0, 'the page itself is not an annotation')
+assert.equal(m._EPDFPage_GetAnnotByObjectNumber(formPage, 999999), 0, 'no such object')
+assert.equal(m._EPDFPage_GetAnnotByObjectNumber(formPage, 0), 0, 'object number 0')
 m._FPDFPage_CloseAnnot(text)
 m._FPDFPage_CloseAnnot(square)
 m._FPDF_ClosePage(formPage)
@@ -353,7 +384,7 @@ m._free(forms.buf)
 
 m._INK_Destroy()
 // SMOKE_OUT and SMOKE_FORM_OUT name files to receive the saved documents, for
-// qpdf --check: the appearance document and the text box and border one.
+// qpdf --check: the appearance document and the text box, border and reply one.
 if (process.env.SMOKE_OUT) writeFileSync(process.env.SMOKE_OUT, saved)
-if (process.env.SMOKE_FORM_OUT) writeFileSync(process.env.SMOKE_FORM_OUT, borderSaved)
+if (process.env.SMOKE_FORM_OUT) writeFileSync(process.env.SMOKE_FORM_OUT, replySaved, 'latin1')
 console.log('SMOKE_OK')

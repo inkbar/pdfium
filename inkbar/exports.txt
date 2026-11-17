@@ -35,6 +35,7 @@ FPDF_GetSignatureCount
 EPDF_SetRuntimeOwnerPermissions
 FPDFPage_CreateAnnot
 FPDFPage_CloseAnnot
+EPDFPage_GetAnnotByObjectNumber
 EPDFPage_RemoveAnnotByObjectNumber
 EPDFAnnot_GetObjectNumber
 FPDFAnnot_SetRect
