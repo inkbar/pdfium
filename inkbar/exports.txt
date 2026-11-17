@@ -31,7 +31,6 @@ INK_Appearance_Free
 INK_Annot_SetAppearance
 INK_Annot_SetData
 FPDF_GetPageBoundingBox
-FPDF_GetSignatureCount
 EPDF_SetRuntimeOwnerPermissions
 FPDFPage_CreateAnnot
 FPDFPage_CloseAnnot
@@ -41,7 +40,6 @@ EPDFAnnot_GetObjectNumber
 FPDFAnnot_SetRect
 FPDFAnnot_SetFlags
 FPDFAnnot_SetStringValue
-FPDFAnnot_SetAttachmentPoints
 FPDFAnnot_AppendAttachmentPoints
 FPDFAnnot_AddInkStroke
 FPDFAnnot_SetBorder
@@ -57,7 +55,6 @@ EPDFAnnot_SetCalloutLine
 EPDFAnnot_SetDefaultAppearance
 EPDFAnnot_SetTextAlignment
 EPDFAnnot_SetLinkedAnnot
-EPDFAnnot_SetReplyType
 EPDFAnnot_SetName
 EPDFForm_LoadModel
 EPDFForm_CloseModel
