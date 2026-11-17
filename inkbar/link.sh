@@ -17,7 +17,24 @@ LIST=inkbar/out/exports.list
 sed 's/^/_/' inkbar/exports.txt > "$LIST"
 
 emcc -O2 -c inkbar/shim.c -Ipublic -o inkbar/out/shim.o
-em++ -O2 inkbar/out/shim.o "$LIB" -o inkbar/out/inkbar-pdfium.mjs \
+
+# appearance.cc reaches PDFium's internal classes, so it is compiled as PDFium's
+# own fpdfsdk sources are: the same defines, include paths and flags, read from
+# the Ninja file GN wrote, from the build directory the paths are relative to.
+BUILD="$(dirname "$(dirname "$LIB")")"
+NINJA_FILE="$BUILD/obj/fpdfsdk/fpdfsdk.ninja"
+[[ -f "$NINJA_FILE" ]] || { echo "$NINJA_FILE not found" >&2; exit 1; }
+FLAGS=""
+for var in defines include_dirs cflags cflags_cc; do
+  value="$(sed -n "s/^$var = //p" "$NINJA_FILE")"
+  [[ -n "$value" ]] || { echo "no $var in $NINJA_FILE" >&2; exit 1; }
+  FLAGS+=" $value"
+done
+ROOT="$PWD"
+# eval: Ninja runs the command through a shell, which strips the quoting in the defines.
+(cd "$BUILD" && eval "em++ $FLAGS -Wno-unknown-warning-option -c '$ROOT/inkbar/appearance.cc' -o '$ROOT/inkbar/out/appearance.o'")
+
+em++ -O2 inkbar/out/shim.o inkbar/out/appearance.o "$LIB" -o inkbar/out/inkbar-pdfium.mjs \
   -sMODULARIZE=1 -sEXPORT_ES6=1 -sENVIRONMENT=web,worker,node \
   -sALLOW_MEMORY_GROWTH=1 -sFILESYSTEM=0 \
   -sEXPORTED_FUNCTIONS=@"$LIST" \

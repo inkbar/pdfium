@@ -16,6 +16,17 @@ The pinned commit is `f2ea7597287f26bdcb450602de6616ff6939d506` on the `embedpdf
 
 Everything Inkbar adds lives under `inkbar/`. Changes to files outside that directory are kept small and are recorded in the commit history.
 
+| File | Contents |
+| --- | --- |
+| `shim.c` | What a JavaScript host needs and PDFium's C API leaves to the embedder: starting the library, saving to memory, form-fill setup. |
+| `appearance.h`, `appearance.cc` | `INK_Appearance_*` and `INK_Annot_*`. They build a Form XObject from content the caller draws, name its fonts, opacities, images, pages and nested forms, and install it as an annotation's `/AP /N`. They also store Inkbar's annotation data as a Flate stream under `/INKB_Gloss`. |
+| `exports.txt` | The export allowlist. |
+| `build.sh`, `link.sh` | The build. |
+| `smoke.mjs` | The smoke check. |
+| `sample.mjs` | Writes `inkbar/out/sample.pdf`, one annotation of each kind Inkbar writes, each with a hand-drawn appearance. Opening it in a viewer shows whether that viewer keeps the appearance or redraws its own. |
+| `package.sh`, `write-manifest.sh` | The release archive and its manifest. |
+| `size-budget.txt` | The size budget. |
+
 ## Build
 
 The build runs in a container pinned to an Ubuntu 24.04 image by digest. The scripts find the repository root themselves, so they run from any directory. The commands below are run from the root.
@@ -23,13 +34,14 @@ The build runs in a container pinned to an Ubuntu 24.04 image by digest. The scr
 ```sh
 inkbar/build.sh
 node inkbar/smoke.mjs testing/resources/hello_world.pdf
+node inkbar/sample.mjs
 ```
 
 The build needs a full-history clone with an `origin` remote and a clean working tree.
 
 The script uses `podman`. Set `CONTAINER=docker` to use Docker. The first run downloads several gigabytes of dependencies into the checkout. They are ignored by git. A clean build takes about ten minutes.
 
-The checkout is mounted into the container. `scripts/embedpdf-runtime/build-target.sh wasm32` builds `libembedpdf.a`. `inkbar/link.sh` then links it with `inkbar/shim.c` into `inkbar/out/`.
+The checkout is mounted into the container. `scripts/embedpdf-runtime/build-target.sh wasm32` builds `libembedpdf.a`. `inkbar/link.sh` then compiles `inkbar/shim.c` and `inkbar/appearance.cc` and links them with it into `inkbar/out/`. `appearance.cc` uses PDFium's internal classes, so the link step compiles it with the defines, include paths and flags GN gave PDFium's `fpdfsdk` sources. It reads them from `out/embedpdf-runtime/wasm32/obj/fpdfsdk/fpdfsdk.ninja`.
 
 | File | Contents |
 | --- | --- |
@@ -37,11 +49,11 @@ The checkout is mounted into the container. `scripts/embedpdf-runtime/build-targ
 | `inkbar-pdfium.mjs` | An ES module. Its default export is the Emscripten factory. |
 | `exports.txt` | A copy of the export allowlist. |
 
-`inkbar/exports.txt` lists every exported function. The link step passes it to Emscripten as `EXPORTED_FUNCTIONS`, and `inkbar/shim.c` marks no function for export itself. `inkbar/smoke.mjs` instantiates the module and fails if its function exports differ from the list. `inkbar/size-budget.txt` holds the largest gzipped size of the `.wasm` file in bytes. The link step fails above it.
+`inkbar/exports.txt` lists every exported function. The link step passes it to Emscripten as `EXPORTED_FUNCTIONS`, and no Inkbar source marks a function for export itself. `inkbar/smoke.mjs` instantiates the module and fails if its function exports differ from the list. `inkbar/size-budget.txt` holds the largest gzipped size of the `.wasm` file in bytes. The link step fails above it.
 
 The binary is single-threaded.
 
-Current size of `inkbar-pdfium.wasm`: 5,750,494 bytes raw, 2,563,069 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
+Current size of `inkbar-pdfium.wasm`: 5,928,830 bytes raw, 2,629,123 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
 
 ## Taking upstream
 
