@@ -44,6 +44,8 @@ FPDFAnnot_SetAttachmentPoints
 FPDFAnnot_AppendAttachmentPoints
 FPDFAnnot_AddInkStroke
 FPDFAnnot_SetBorder
+EPDFAnnot_SetBorderStyle
+EPDFAnnot_SetBorderDashPattern
 EPDFAnnot_SetColor
 EPDFAnnot_SetOpacity
 EPDFAnnot_SetVertices

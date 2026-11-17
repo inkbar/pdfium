@@ -15,9 +15,9 @@
 // the Add functions fail for any other name.
 //
 // Nothing here deletes objects. A replaced appearance, replaced data, and the
-// fonts, images and page forms of an appearance freed without being installed
-// stay in the document as unreferenced objects. A full save leaves them out;
-// an incremental save carries them.
+// fonts, images, page forms and nested child forms of an appearance freed
+// without being installed stay in the document as unreferenced objects. A full
+// save leaves them out; an incremental save carries them.
 
 #ifndef INKBAR_APPEARANCE_H_
 #define INKBAR_APPEARANCE_H_

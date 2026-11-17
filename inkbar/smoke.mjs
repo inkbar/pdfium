@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 71)
+assert.equal(names.length, 73)
 
 const m = await createModule()
 for (const name of names) {
@@ -242,7 +242,59 @@ for (const channel of after.slice(0, 3)) {
 m._FPDF_CloseDocument(reopened.doc)
 m._free(reopened.buf)
 
+// The text of indirect object |num| in |text|, from "obj" to "endobj".
+function objectText(text, num) {
+  const at = text.search(new RegExp(`(^|\\s)${num}\\s+0\\s+obj`))
+  assert.ok(at >= 0, `no object ${num}`)
+  return text.slice(at, text.indexOf('endobj', at))
+}
+
+// A text box in a document without a form, and a dashed square border.
+const FPDF_ANNOT_FREETEXT = 3
+const FPDF_FONT_HELVETICA = 4
+const FPDF_ANNOT_BS_DASHED = 2
+const second = load(original)
+assert.ok(!original.toString('latin1').includes('/AcroForm'), 'the input already has a form')
+const formPage = m._FPDF_LoadPage(second.doc, 0)
+// FS_RECTF: left, top, right, bottom.
+const rectPtr = m._malloc(16)
+m.HEAPF32.set([20, 180, 120, 120], rectPtr / 4)
+const text = m._FPDFPage_CreateAnnot(formPage, FPDF_ANNOT_FREETEXT)
+assert.notEqual(text, 0)
+assert.equal(m._FPDFAnnot_SetRect(text, rectPtr), 1)
+assert.equal(m._EPDFAnnot_SetDefaultAppearance(text, FPDF_FONT_HELVETICA, 12, 0, 0, 0), 1)
+const formSaved = save(second.doc)
+const formText = formSaved.toString('latin1')
+const formRef = /\/AcroForm\s+(\d+)\s+0\s+R/.exec(formText)
+assert.ok(formRef, 'setting the default appearance created no /AcroForm reference')
+assert.match(objectText(formText, formRef[1]), /\/Fields\s*\[/, 'the created /AcroForm has no /Fields array')
+
+const square = m._FPDFPage_CreateAnnot(formPage, FPDF_ANNOT_SQUARE)
+assert.notEqual(square, 0)
+assert.equal(m._FPDFAnnot_SetRect(square, rectPtr), 1)
+m._free(rectPtr)
+assert.equal(m._EPDFAnnot_SetBorderStyle(square, FPDF_ANNOT_BS_DASHED, 2), 1)
+const dashPtr = m._malloc(8)
+m.HEAPF32.set([3, 1], dashPtr / 4)
+assert.equal(m._EPDFAnnot_SetBorderDashPattern(square, dashPtr, 2), 1)
+m._free(dashPtr)
+const borderSaved = save(second.doc)
+const squareNum = m._EPDFAnnot_GetObjectNumber(square)
+assert.ok(squareNum > 0, 'the square has no object number')
+const squareText = objectText(borderSaved.toString('latin1'), squareNum)
+const bs = /\/BS\s*<<((?:[^<>]|<<[^<>]*>>)*)>>/.exec(squareText)
+assert.ok(bs, 'the square has no /BS')
+assert.match(bs[1], /\/S\s*\/D(?![A-Za-z0-9])/, `/BS ${bs[1]} is not dashed`)
+assert.match(bs[1], /\/D\s*\[\s*3(\.0*)?\s+1(\.0*)?\s*\]/, `/BS ${bs[1]} has no /D [3 1]`)
+m._FPDFPage_CloseAnnot(text)
+m._FPDFPage_CloseAnnot(square)
+m._FPDF_ClosePage(formPage)
+m._FPDF_CloseDocument(second.doc)
+m._free(second.buf)
+
 m._INK_Destroy()
-// SMOKE_OUT names a file to receive the saved document, for qpdf --check.
+// SMOKE_OUT and SMOKE_FORM_OUT name files to receive the saved documents, for
+// qpdf --check: the appearance document and the text box and border one.
 if (process.env.SMOKE_OUT) writeFileSync(process.env.SMOKE_OUT, saved)
+if (process.env.SMOKE_FORM_OUT) writeFileSync(process.env.SMOKE_FORM_OUT, borderSaved)
 console.log('SMOKE_OK')

@@ -310,6 +310,7 @@ RetainPtr<CPDF_Dictionary> InitDict(CPDF_Document* document) {
   auto form_dict = document->NewIndirect<CPDF_Dictionary>();
   document->GetMutableRoot()->SetNewFor<CPDF_Reference>(
       pdfium::catalog::kAcroForm, document, form_dict->GetObjNum());
+  form_dict->SetNewFor<CPDF_Array>("Fields");
 
   ByteString base_name;
   FX_Charset charset = GetNativeCharSet();

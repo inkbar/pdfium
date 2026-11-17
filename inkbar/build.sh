@@ -16,7 +16,7 @@ IMAGE="docker.io/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # gclient compares this with the checkout's own origin and tries to switch it when they differ.
 FORK_URL="$(git -C "$REPO" remote get-url origin 2>/dev/null)" || {
-  echo "build.sh: the checkout has no 'origin' remote. Clone inkbar/pdfium with full history." >&2
+  echo "build.sh: the checkout has no 'origin' remote. Add one with: git remote add origin <URL of inkbar/pdfium>" >&2
   exit 1
 }
 
