@@ -53,7 +53,13 @@ The checkout is mounted into the container. `scripts/embedpdf-runtime/build-targ
 
 The binary is single-threaded.
 
-Current size of `inkbar-pdfium.wasm`: 5,931,304 bytes raw, 2,630,210 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
+Current size of `inkbar-pdfium.wasm`: 5,931,856 bytes raw, 2,630,246 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
+
+## Changes outside `inkbar/`
+
+Every change this fork's Inkbar commits make outside `inkbar/`. Update this list with any further such change, and re-check each entry after every upstream merge.
+
+- `core/fpdfdoc/cpdf_interactiveform.cpp`, in `InitDict`: a created `/AcroForm` is given an empty `/Fields` array. ISO 32000 requires the entry, and without it Poppler reports "Can't get Fields array". The smoke check guards it.
 
 ## Taking upstream
 

@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 73)
+assert.equal(names.length, 77)
 
 const m = await createModule()
 for (const name of names) {
@@ -291,6 +291,65 @@ m._FPDFPage_CloseAnnot(square)
 m._FPDF_ClosePage(formPage)
 m._FPDF_CloseDocument(second.doc)
 m._free(second.buf)
+
+// Form reads on a document with a text box, a combo box and a list box.
+const EPDF_FORMFIELD_FAMILY_TEXT = 4
+const EPDF_FORMFIELD_FAMILY_COMBOBOX = 5
+const EPDF_FORMFIELD_FAMILY_LISTBOX = 6
+const EPDF_FORM_VALUE_NONE = 0
+const EPDF_FORM_VALUE_ARRAY = 2
+const formsBytes = readFileSync(new URL('../testing/resources/multiple_form_types.pdf', import.meta.url))
+const forms = load(formsBytes)
+const model = m._EPDFForm_LoadModel(forms.doc)
+assert.notEqual(model, 0, 'no form model')
+// A UTF-16LE string from a getter that takes (buffer, length) and returns the
+// byte length with the trailing NUL, or 0 for none.
+const utf16 = (read) => {
+  const size = read(0, 0)
+  if (size === 0) return ''
+  const ptr = m._malloc(size)
+  read(ptr, size)
+  const text = new TextDecoder('utf-16le').decode(m.HEAPU8.slice(ptr, ptr + size - 2))
+  m._free(ptr)
+  return text
+}
+let sawText = false
+let sawCombo = false
+let sawList = false
+for (let i = 0; i < m._EPDFForm_CountFields(model); i++) {
+  const family = m._EPDFForm_GetFieldFamily(model, i)
+  const kind = m._EPDFForm_GetFieldValueKind(model, i)
+  const flags = m._EPDFForm_GetFieldFlags(model, i) >>> 0
+  const options = m._EPDFForm_CountFieldOptions(model, i)
+  const first = utf16((ptr, size) => m._EPDFForm_GetFieldOptionValue(model, i, 0, ptr, size))
+  const name = utf16((ptr, size) => m._EPDFForm_GetFieldName(model, i, ptr, size))
+  if (family === EPDF_FORMFIELD_FAMILY_TEXT) {
+    sawText = true
+    assert.equal(kind, EPDF_FORM_VALUE_NONE, `${name} has no /V`)
+    assert.equal(options, 0, `${name} has no options`)
+    assert.equal(first, '')
+  } else if (family === EPDF_FORMFIELD_FAMILY_COMBOBOX || family === EPDF_FORMFIELD_FAMILY_LISTBOX) {
+    assert.ok(options > 0, `${name} has no options`)
+    assert.notEqual(first, '', `${name} has no first option value`)
+  }
+  if (name === 'Combo_Editable') {
+    sawCombo = true
+    assert.equal(options, 3)
+    assert.equal(first, 'foo', 'the export value, not the label')
+    assert.equal(flags, 393216, 'combo and edit bits of /Ff')
+  }
+  if (name === 'Listbox_MultiSelectMultipleSelected') {
+    sawList = true
+    assert.equal(kind, EPDF_FORM_VALUE_ARRAY)
+    assert.equal(options, 5)
+    assert.equal(first, 'Alpha')
+    assert.equal(flags, 2097152, 'multi-select bit of /Ff')
+  }
+}
+assert.ok(sawText && sawCombo && sawList, 'multiple_form_types.pdf lacks a text, combo or list field')
+m._EPDFForm_CloseModel(model)
+m._FPDF_CloseDocument(forms.doc)
+m._free(forms.buf)
 
 m._INK_Destroy()
 // SMOKE_OUT and SMOKE_FORM_OUT name files to receive the saved documents, for
