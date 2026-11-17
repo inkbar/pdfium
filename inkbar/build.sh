@@ -3,7 +3,7 @@
 # Copyright 2026 Edward Coleridge Smith
 #
 # Builds inkbar/out/inkbar-pdfium.{wasm,mjs} in a pinned Ubuntu container.
-# Needs a full-history clone with an origin remote and a clean tree. Run from anywhere. CONTAINER=docker switches the runtime (default podman).
+# Needs an origin remote. Builds the checkout as it is, uncommitted changes included. Run from anywhere. CONTAINER=docker switches the runtime (default podman).
 set -euo pipefail
 
 # Toolchain pins. The image is pinned below by digest.

@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { deflateSync } from 'node:zlib'
+import { deflateSync, inflateSync } from 'node:zlib'
 import createModule from './out/inkbar-pdfium.mjs'
 
 const pdfPath = process.argv[2]
@@ -52,6 +52,26 @@ function withStrings(texts, fn) {
     ptrs.forEach((ptr) => m._free(ptr))
   }
 }
+
+// How many times |text| occurs in |bytes|.
+function count(bytes, text) {
+  return bytes.toString('latin1').split(text).length - 1
+}
+
+// The decoded data of the stream that |key| references in |bytes|.
+function streamFor(bytes, key) {
+  const text = bytes.toString('latin1')
+  const ref = new RegExp(`/${key}\\s+(\\d+)\\s+0\\s+R`).exec(text)
+  assert.ok(ref, `no reference for /${key}`)
+  const obj = text.search(new RegExp(`(^|\\s)${ref[1]}\\s+0\\s+obj`))
+  assert.ok(obj >= 0, `no object ${ref[1]}`)
+  const start = /stream\r?\n/.exec(text.slice(obj))
+  const begin = obj + start.index + start[0].length
+  return inflateSync(bytes.subarray(begin, text.indexOf('endstream', begin)))
+}
+
+// /AS as a key, not as the start of a longer name.
+const AS_KEY = /\/AS(?![A-Za-z0-9#._-])/
 
 function newAppearance(doc, [left, bottom, right, top], content, group) {
   const bytes = Buffer.from(content, 'latin1')
@@ -141,6 +161,13 @@ const before = pixelAt(doc, ...probe)
 const page = m._FPDF_LoadPage(doc, 0)
 const annot = m._FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE)
 assert.notEqual(annot, 0)
+// An appearance state that installing a stream /N must remove.
+const asKey = heapString('AS')
+const asValue = heapBytes(Buffer.from('Off\0', 'utf16le'))
+assert.equal(m._FPDFAnnot_SetStringValue(annot, asKey, asValue), 1)
+m._free(asKey)
+m._free(asValue)
+assert.match(save(doc).toString('latin1'), AS_KEY, 'the setup left no /AS')
 
 const a = newAppearance(
   doc,
@@ -152,14 +179,27 @@ withStrings(['F0', 'Helvetica'], (name, base) => assert.equal(m._INK_Appearance_
 withStrings(['GS0'], (name) => assert.equal(m._INK_Appearance_AddOpacity(a, name, 0.5, -1), 1))
 withStrings(['P0'], (name) => assert.equal(m._INK_Appearance_AddPage(a, name, 0), 1))
 withStrings(['P1'], (name) => assert.equal(m._INK_Appearance_AddPage(a, name, 1), 0, 'page out of range'))
+// Names are [A-Za-z0-9]+, base fonts [A-Za-z0-9-]+.
+for (const bad of ['F 0', '/F0', '']) {
+  withStrings([bad, 'Helvetica'], (name, base) => assert.equal(m._INK_Appearance_AddFont(a, name, base), 0, `font name "${bad}"`))
+  withStrings([bad], (name) => {
+    assert.equal(m._INK_Appearance_AddOpacity(a, name, 0.5, -1), 0, `opacity name "${bad}"`)
+    assert.equal(m._INK_Appearance_AddPage(a, name, 0), 0, `page name "${bad}"`)
+  })
+}
+withStrings(['F9', 'Times Roman'], (name, base) => assert.equal(m._INK_Appearance_AddFont(a, name, base), 0, 'base font with a space'))
+withStrings(['F9', 'Times-Roman'], (name, base) => assert.equal(m._INK_Appearance_AddFont(a, name, base), 1, 'base font with a dash'))
 const child = newAppearance(doc, [0, 0, 10, 10], '1 0 0 rg 0 0 10 10 re f', true)
 // The child names the same font and page again; the document holds one of each.
 withStrings(['F1', 'Helvetica'], (name, base) => assert.equal(m._INK_Appearance_AddFont(child, name, base), 1))
 withStrings(['P0'], (name) => assert.equal(m._INK_Appearance_AddPage(child, name, 0), 1))
+const spare = newAppearance(doc, [0, 0, 10, 10], '', false)
+withStrings(['Fm 1'], (name) => assert.equal(m._INK_Appearance_AddForm(a, name, spare), 0, 'form name with a space'))
 withStrings(['Fm0'], (name) => assert.equal(m._INK_Appearance_AddForm(a, name, child), 1))
 
 const png = tinyPng()
 const pngPtr = heapBytes(png)
+withStrings(['Im 0'], (name) => assert.equal(m._INK_Appearance_AddImage(a, name, 0, pngPtr, png.length), 0, 'image name with a space'))
 withStrings(['Im0'], (name) => {
   assert.equal(m._INK_Appearance_AddImage(a, name, 0, pngPtr, png.length), 1)
   assert.equal(m._INK_Appearance_AddImage(a, name, 1, pngPtr, png.length), 0, 'PNG bytes are not a JPEG')
@@ -176,12 +216,12 @@ m._free(jsonPtr)
 
 const saved = save(doc)
 const savedText = saved.toString('latin1')
-assert.ok(savedText.includes('/INKB_Gloss'), 'saved bytes lack /INKB_Gloss')
-const count = (text) => savedText.split(text).length - 1
-// Only appearance fonts carry an /Encoding, and only page forms a /FormType.
-assert.equal(count('/WinAnsiEncoding'), 1, 'one font object per base font')
-assert.equal(count('/FormType'), 1, 'one Form XObject per page')
+assert.equal(streamFor(saved, 'INKB_Gloss').toString('latin1'), '{"v":1}')
+// Helvetica twice and Times-Roman once add two fonts; page 0 twice adds one form.
+assert.equal(count(saved, '/WinAnsiEncoding') - count(plain, '/WinAnsiEncoding'), 2, 'one font object per base font')
+assert.equal(count(saved, '/FormType') - count(plain, '/FormType'), 1, 'one Form XObject per page')
 assert.ok(savedText.includes('/SMask'), 'saved bytes lack the PNG /SMask')
+assert.doesNotMatch(savedText, AS_KEY, 'installing the appearance left /AS')
 
 assert.equal(m._INK_Annot_SetData(annot, 0, 0), 1)
 assert.ok(!save(doc).toString('latin1').includes('/INKB_Gloss'), 'length 0 left /INKB_Gloss')
@@ -194,6 +234,11 @@ m._free(buf)
 const reopened = load(saved)
 const after = pixelAt(reopened.doc, ...probe)
 assert.notDeepEqual(after, before, `the pixel at ${probe} did not change: ${after}`)
+// 0.5 g at fill opacity 0.5 over white: 0.5 * 0.5 + 0.5 * 1 = 0.75 of 255.
+const expected = Math.round(0.75 * 255)
+for (const channel of after.slice(0, 3)) {
+  assert.ok(Math.abs(channel - expected) <= 3, `the pixel at ${probe} is ${after}, not grey ${expected}`)
+}
 m._FPDF_CloseDocument(reopened.doc)
 m._free(reopened.buf)
 

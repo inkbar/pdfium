@@ -7,10 +7,10 @@
 
 #include "inkbar/appearance.h"
 
-#include <math.h>
-
+#include <cmath>
 #include <map>
 #include <memory>
+#include <string_view>
 #include <utility>
 
 #include "core/fpdfapi/edit/cpdf_npagetooneexporter.h"
@@ -80,8 +80,20 @@ DocCache* CacheFor(CPDF_Document* doc) {
   return it->second.get();
 }
 
-bool IsName(const char* name) {
-  return name && *name;
+// [A-Za-z0-9]+, or with |dash| also '-'. Resource names and base fonts are
+// written as PDF names; these characters need no escaping.
+bool IsPlainName(const char* name, bool dash = false) {
+  if (!name || !*name) {
+    return false;
+  }
+  for (char c : std::string_view(name)) {
+    const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                    (c >= '0' && c <= '9') || (dash && c == '-');
+    if (!ok) {
+      return false;
+    }
+  }
+  return true;
 }
 
 pdfium::span<const uint8_t> Bytes(const unsigned char* data, size_t len) {
@@ -178,8 +190,9 @@ INK_APPEARANCE* INK_Appearance_New(FPDF_DOCUMENT doc,
   if (!pdf || (!content && content_len)) {
     return nullptr;
   }
-  if (!isfinite(left) || !isfinite(bottom) || !isfinite(right) ||
-      !isfinite(top) || !(left < right) || !(bottom < top)) {
+  if (!std::isfinite(left) || !std::isfinite(bottom) ||
+      !std::isfinite(right) || !std::isfinite(top) || !(left < right) ||
+      !(bottom < top)) {
     return nullptr;
   }
 
@@ -203,7 +216,7 @@ INK_APPEARANCE* INK_Appearance_New(FPDF_DOCUMENT doc,
 int INK_Appearance_AddFont(INK_APPEARANCE* a,
                            const char* name,
                            const char* base_font) {
-  if (!a || !IsName(name) || !IsName(base_font)) {
+  if (!a || !IsPlainName(name) || !IsPlainName(base_font, /*dash=*/true)) {
     return 0;
   }
   ScopedFPDFDocumentView view(FPDFDocumentFromCPDFDocument(a->doc));
@@ -215,8 +228,8 @@ int INK_Appearance_AddOpacity(INK_APPEARANCE* a,
                               const char* name,
                               float fill,
                               float stroke) {
-  if (!a || !IsName(name) || isnan(fill) || isnan(stroke) || fill > 1 ||
-      stroke > 1) {
+  if (!a || !IsPlainName(name) || std::isnan(fill) || std::isnan(stroke) ||
+      fill > 1 || stroke > 1) {
     return 0;
   }
   ScopedFPDFDocumentView view(FPDFDocumentFromCPDFDocument(a->doc));
@@ -235,7 +248,7 @@ int INK_Appearance_AddImage(INK_APPEARANCE* a,
                             int format,
                             const unsigned char* data,
                             size_t len) {
-  if (!a || !IsName(name) || !data || (format != 0 && format != 1)) {
+  if (!a || !IsPlainName(name) || !data || (format != 0 && format != 1)) {
     return 0;
   }
   // The same lower bounds EPDFImageObj_SetPng and EPDFImageObj_SetJpeg check.
@@ -264,7 +277,7 @@ int INK_Appearance_AddImage(INK_APPEARANCE* a,
 int INK_Appearance_AddPage(INK_APPEARANCE* a,
                            const char* name,
                            int page_index) {
-  if (!a || !IsName(name)) {
+  if (!a || !IsPlainName(name)) {
     return 0;
   }
   ScopedFPDFDocumentView view(FPDFDocumentFromCPDFDocument(a->doc));
@@ -283,7 +296,7 @@ int INK_Appearance_AddForm(INK_APPEARANCE* a,
                            const char* name,
                            INK_APPEARANCE* child) {
   std::unique_ptr<INK_APPEARANCE> owned(child == a ? nullptr : child);
-  if (!a || !IsName(name) || !owned || owned->doc != a->doc) {
+  if (!a || !IsPlainName(name) || !owned || owned->doc != a->doc) {
     return 0;
   }
   ScopedFPDFDocumentView view(FPDFDocumentFromCPDFDocument(a->doc));
@@ -309,6 +322,8 @@ int INK_Annot_SetAppearance(FPDF_ANNOTATION annot, INK_APPEARANCE* a) {
   }
   const uint32_t objnum = owned->doc->AddIndirectObject(owned->stream);
   auto ap = dict->SetNewFor<CPDF_Dictionary>("AP");
+  // A stream /N has no states, so an /AS left behind would name none.
+  dict->RemoveFor("AS");
   ap->SetNewFor<CPDF_Reference>("N", owned->doc, objnum);
   dict->SetRectFor("Rect", owned->bbox);
   return 1;

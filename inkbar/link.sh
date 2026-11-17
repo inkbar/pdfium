@@ -28,6 +28,11 @@ FLAGS=""
 for var in defines include_dirs cflags cflags_cc; do
   value="$(sed -n "s/^$var = //p" "$NINJA_FILE")"
   [[ -n "$value" ]] || { echo "no $var in $NINJA_FILE" >&2; exit 1; }
+  # A $ is a Ninja variable or escape, which eval below would read as shell.
+  if [[ "$value" == *'$'* ]]; then
+    echo "$var in $NINJA_FILE contains a \$, which link.sh cannot expand like Ninja: $value" >&2
+    exit 1
+  fi
   FLAGS+=" $value"
 done
 ROOT="$PWD"

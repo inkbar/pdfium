@@ -5,10 +5,19 @@
 // Inkbar's annotation data beside it.
 //
 // An INK_APPEARANCE is a Form XObject being built. INK_Appearance_New starts
-// one; the Add functions name resources its content uses; INK_Annot_SetAppearance
-// installs it as an annotation's normal appearance, or INK_Appearance_AddForm
-// nests it in another. Install, nest or free every appearance before closing
-// its document. Every int result is 1 for success and 0 for failure.
+// one; the Add functions name resources its content uses;
+// INK_Annot_SetAppearance installs it as an annotation's normal appearance, or
+// INK_Appearance_AddForm nests it in another. Install, nest or free every
+// appearance before closing its document. Every int result is 1 for success
+// and 0 for failure.
+//
+// Resource names must match [A-Za-z0-9]+ and base font names [A-Za-z0-9-]+;
+// the Add functions fail for any other name.
+//
+// Nothing here deletes objects. A replaced appearance, replaced data, and the
+// fonts, images and page forms of an appearance freed without being installed
+// stay in the document as unreferenced objects. A full save leaves them out;
+// an incremental save carries them.
 
 #ifndef INKBAR_APPEARANCE_H_
 #define INKBAR_APPEARANCE_H_
@@ -63,7 +72,9 @@ int INK_Appearance_AddImage(INK_APPEARANCE* a,
 
 // /Resources /XObject /<name>: a Form XObject of the page's content and
 // resources, with the page box as /BBox. The document holds one per page,
-// shared by every appearance that names it.
+// shared by every appearance that names it. It is a copy of the page as it was
+// at the first INK_Appearance_AddPage for that page in that document, and does
+// not follow later changes to the page.
 int INK_Appearance_AddPage(INK_APPEARANCE* a, const char* name, int page_index);
 
 // /Resources /XObject /<name>: |child|'s stream. Takes |child| whether or not
@@ -76,8 +87,9 @@ int INK_Appearance_AddForm(INK_APPEARANCE* a,
 // Frees an appearance that was neither installed nor nested. NULL is a no-op.
 void INK_Appearance_Free(INK_APPEARANCE* a);
 
-// Sets the annotation's /AP to << /N stream >>, replacing any /AP it had, and
-// its /Rect to the appearance's box. Takes |a| whether or not it succeeds.
+// Sets the annotation's /AP to << /N stream >>, replacing any /AP it had,
+// removes its /AS (a stream /N has no states), and sets its /Rect to the
+// appearance's box. Takes |a| whether or not it succeeds.
 // Fails when the annotation belongs to another document than |a|.
 int INK_Annot_SetAppearance(FPDF_ANNOTATION annot, INK_APPEARANCE* a);
 
