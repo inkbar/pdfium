@@ -116,8 +116,9 @@ function pixelAt(doc, x, y) {
   return pixel
 }
 
-// A 2x2 RGBA PNG with one transparent pixel, so the image carries an /SMask.
-function tinyPng() {
+// A PNG of |width| x |height| 8-bit pixels: RGB (colour type 2) for 3
+// |channels| or RGBA (colour type 6) for 4. |pixel(x, y)| returns the channels.
+function makePng(width, height, channels, pixel) {
   const crcTable = Array.from({ length: 256 }, (_, n) => {
     let c = n
     for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
@@ -136,14 +137,32 @@ function tinyPng() {
     out.writeUInt32BE(crc(body), body.length + 4)
     return out
   }
-  const ihdr = Buffer.from([0, 0, 0, 2, 0, 0, 0, 2, 8, 6, 0, 0, 0])
-  const rows = Buffer.from([0, 255, 0, 0, 255, 0, 0, 255, 0, 0, 0, 255, 0, 0, 255, 0, 0, 255])
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(width, 0)
+  ihdr.writeUInt32BE(height, 4)
+  ihdr.set([8, channels === 4 ? 6 : 2, 0, 0, 0], 8)
+  const rows = []
+  for (let y = 0; y < height; y++) {
+    rows.push(0)
+    for (let x = 0; x < width; x++) rows.push(...pixel(x, y))
+  }
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     chunk('IHDR', ihdr),
-    chunk('IDAT', deflateSync(rows)),
+    chunk('IDAT', deflateSync(Buffer.from(rows))),
     chunk('IEND', Buffer.alloc(0)),
   ])
+}
+
+// A 2x2 RGBA PNG with transparent pixels, so the image carries an /SMask.
+function tinyPng() {
+  const pixels = [
+    [255, 0, 0, 255],
+    [0, 0, 255, 0],
+    [0, 255, 0, 0],
+    [255, 0, 0, 255],
+  ]
+  return makePng(2, 2, 4, (x, y) => pixels[y * 2 + x])
 }
 
 m._INK_Init()
@@ -382,9 +401,91 @@ m._EPDFForm_CloseModel(model)
 m._FPDF_CloseDocument(forms.doc)
 m._free(forms.buf)
 
+// Added images are marked /Interpolate true, image and soft mask alike, so an
+// enlarged one is smoothed as Inkbar's screen draws it. Two 4x4 PNGs with a
+// hard vertical edge between columns 1 and 2 are each stretched over 160 pt:
+// one RGB black and white, one black with opaque and transparent alpha (an
+// /SMask). A row through each is counted for distinct grey levels, in the saved
+// file and in a copy with every "/Interpolate true" blanked out.
+
+// The distinct grey levels (blue channel) in the bitmap row at |y| points, from
+// |x0| to |x1| points, rendering page 0 at |scale| pixels per point.
+function greyLevels(doc, scale, y, x0, x1) {
+  const page = m._FPDF_LoadPage(doc, 0)
+  assert.notEqual(page, 0)
+  const width = Math.round(m._FPDF_GetPageWidthF(page) * scale)
+  const height = Math.round(m._FPDF_GetPageHeightF(page) * scale)
+  const bitmap = m._FPDFBitmap_CreateEx(width, height, 4, 0, 0)
+  m._FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0xffffffff)
+  m._FPDF_RenderPageBitmap(bitmap, page, 0, 0, width, height, 0, FPDF_ANNOT)
+  const row = m._FPDFBitmap_GetBuffer(bitmap) + (height - 1 - Math.floor(y * scale)) * m._FPDFBitmap_GetStride(bitmap)
+  const levels = new Set()
+  for (let x = Math.ceil(x0 * scale); x < Math.floor(x1 * scale); x++) levels.add(m.HEAPU8[row + x * 4])
+  m._FPDFBitmap_Destroy(bitmap)
+  m._FPDF_ClosePage(page)
+  return levels.size
+}
+
+const edgeRgb = makePng(4, 4, 3, (x) => (x < 2 ? [0, 0, 0] : [255, 255, 255]))
+const edgeAlpha = makePng(4, 4, 4, (x) => [0, 0, 0, x < 2 ? 255 : 0])
+const third = load(original)
+const imagePage = m._FPDF_LoadPage(third.doc, 0)
+const imageAnnot = m._FPDFPage_CreateAnnot(imagePage, FPDF_ANNOT_SQUARE)
+assert.notEqual(imageAnnot, 0)
+// The page is 200 pt square. Rgb covers x 20..180, y 100..180; Alpha x 20..180, y 10..90.
+const images = newAppearance(
+  third.doc,
+  [0, 0, 200, 200],
+  'q 160 0 0 80 20 100 cm /Rgb Do Q q 160 0 0 80 20 10 cm /Alpha Do Q',
+  false,
+)
+for (const [name, png] of [
+  ['Rgb', edgeRgb],
+  ['Alpha', edgeAlpha],
+]) {
+  const ptr = heapBytes(png)
+  withStrings([name], (n) => assert.equal(m._INK_Appearance_AddImage(images, n, 0, ptr, png.length), 1))
+  m._free(ptr)
+}
+assert.equal(m._INK_Annot_SetAppearance(imageAnnot, images), 1)
+m._FPDFPage_CloseAnnot(imageAnnot)
+m._FPDF_ClosePage(imagePage)
+const imagesSaved = save(third.doc)
+m._FPDF_CloseDocument(third.doc)
+m._free(third.buf)
+const imagesText = imagesSaved.toString('latin1')
+assert.equal(count(imagesSaved, '/Interpolate true'), 3, 'two images and one soft mask are not all marked /Interpolate true')
+const smaskRef = /\/SMask\s+(\d+)\s+0\s+R/.exec(imagesText)
+assert.ok(smaskRef, 'the alpha PNG has no /SMask')
+assert.match(objectText(imagesText, smaskRef[1]), /\/Interpolate\s+true/, 'the soft mask lacks /Interpolate true')
+// Blanked to the same length, so the cross-reference offsets stay right.
+const entry = '/Interpolate true'
+const stripped = Buffer.from(imagesText.replaceAll(entry, ' '.repeat(entry.length)), 'latin1')
+const SCALE = 2
+const measured = {}
+for (const [label, bytes] of [
+  ['with', imagesSaved],
+  ['without', stripped],
+]) {
+  const opened = load(bytes)
+  measured[label] = {
+    rgb: greyLevels(opened.doc, SCALE, 140, 20, 180),
+    alpha: greyLevels(opened.doc, SCALE, 50, 20, 180),
+  }
+  m._FPDF_CloseDocument(opened.doc)
+  m._free(opened.buf)
+}
+console.log(`grey levels across the edge at ${SCALE}x: with ${JSON.stringify(measured.with)}, without ${JSON.stringify(measured.without)}`)
+// PDFium draws an enlarged image nearest-neighbour unless /Interpolate is set.
+assert.deepEqual(measured.without, { rgb: 2, alpha: 2 }, 'without /Interpolate the enlarged edge is not hard')
+assert.ok(measured.with.rgb > 2, 'with /Interpolate the enlarged image is not smoothed')
+assert.ok(measured.with.alpha > 2, 'with /Interpolate the enlarged soft mask is not smoothed')
+
 m._INK_Destroy()
-// SMOKE_OUT and SMOKE_FORM_OUT name files to receive the saved documents, for
-// qpdf --check: the appearance document and the text box, border and reply one.
+// SMOKE_OUT, SMOKE_FORM_OUT and SMOKE_IMAGE_OUT name files to receive the saved
+// documents, for qpdf --check: the appearance document, the text box, border
+// and reply one, and the enlarged images one.
 if (process.env.SMOKE_OUT) writeFileSync(process.env.SMOKE_OUT, saved)
 if (process.env.SMOKE_FORM_OUT) writeFileSync(process.env.SMOKE_FORM_OUT, replySaved, 'latin1')
+if (process.env.SMOKE_IMAGE_OUT) writeFileSync(process.env.SMOKE_IMAGE_OUT, imagesSaved)
 console.log('SMOKE_OK')

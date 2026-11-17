@@ -17,6 +17,7 @@
 #include "core/fpdfapi/page/cpdf_annotcontext.h"
 #include "core/fpdfapi/page/cpdf_image.h"
 #include "core/fpdfapi/page/ipdf_page.h"
+#include "core/fpdfapi/parser/cpdf_boolean.h"
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fpdfapi/parser/cpdf_document.h"
 #include "core/fpdfapi/parser/cpdf_name.h"
@@ -270,7 +271,25 @@ int INK_Appearance_AddImage(INK_APPEARANCE* a,
     return 0;
   }
   image->ConvertStreamToIndirectObject();
-  SetResource(a, "XObject", name, image->GetStream()->GetObjNum());
+  const uint32_t objnum = image->GetStream()->GetObjNum();
+  // Smoothed when enlarged, as Inkbar's screen draws it. The soft mask gets
+  // the entry too (ISO 32000-1 Table 145 allows it), so its edge matches.
+  RetainPtr<CPDF_Stream> stream =
+      ToStream(a->doc->GetMutableIndirectObject(objnum));
+  if (!stream) {
+    return 0;
+  }
+  RetainPtr<CPDF_Dictionary> dict = stream->GetMutableDict();
+  dict->SetNewFor<CPDF_Boolean>("Interpolate", true);
+  RetainPtr<const CPDF_Stream> smask = dict->GetStreamFor("SMask");
+  if (smask && smask->GetObjNum()) {
+    RetainPtr<CPDF_Stream> mask =
+        ToStream(a->doc->GetMutableIndirectObject(smask->GetObjNum()));
+    if (mask) {
+      mask->GetMutableDict()->SetNewFor<CPDF_Boolean>("Interpolate", true);
+    }
+  }
+  SetResource(a, "XObject", name, objnum);
   return 1;
 }
 

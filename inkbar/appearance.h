@@ -62,8 +62,10 @@ int INK_Appearance_AddOpacity(INK_APPEARANCE* a,
                               float stroke);
 
 // /Resources /XObject /<name>: an image XObject from PNG (|format| 0) or JPEG
-// (|format| 1) bytes. A PNG's alpha becomes an /SMask. Fails when the bytes
-// do not decode as the format.
+// (|format| 1) bytes. A PNG's alpha becomes an /SMask. The image, and its
+// /SMask when it has one, is marked /Interpolate true, so viewers that honour
+// the entry smooth it when enlarged. Images already in the document are left
+// alone. Fails when the bytes do not decode as the format.
 int INK_Appearance_AddImage(INK_APPEARANCE* a,
                             const char* name,
                             int format,
