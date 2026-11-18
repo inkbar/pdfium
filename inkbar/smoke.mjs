@@ -1153,6 +1153,24 @@ function nestedFormsPdf(levels) {
   })
 }
 
+// keeps a shading held directly in /Resources beside a mark: the rewritten
+// content names it, so the save must write it
+{
+  const source = onePagePdf('0 0 1 rg 50 50 100 100 re f q 200 50 100 100 re W n /Sh0 sh Q', {
+    resources:
+      '/Shading << /Sh0 << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [200 50 300 50] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>',
+  })
+  const applied = editPage(source, (doc, page) => {
+    const marks = [addMark(page, [80, 80, 120, 120])]
+    assert.equal(applyPage(doc, page, marks, false).result, 1)
+    marks.forEach((mark) => m._FPDFPage_CloseAnnot(mark))
+  })
+  withDoc(applied, (doc) => {
+    const [kept] = inspectPage(doc, 0, [[230, 80, 270, 120]])
+    assert.equal(kept.paths, 1, `the shading beside the mark is gone: ${JSON.stringify(kept)}`)
+  })
+}
+
 // counts a shading whose clip does not exclude the region
 {
   const shading = '/Shading << /Sh0 << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [200 50 300 50] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>'

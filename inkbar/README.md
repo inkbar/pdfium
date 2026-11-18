@@ -58,7 +58,7 @@ The checkout is mounted into the container. `scripts/embedpdf-runtime/build-targ
 
 The binary is single-threaded.
 
-Current size of `inkbar-pdfium.wasm`: 6,904,654 bytes raw, 2,918,250 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
+Current size of `inkbar-pdfium.wasm`: 6,904,725 bytes raw, 2,918,148 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
 
 ## The redaction check
 
@@ -103,6 +103,7 @@ Every change this fork's Inkbar commits make outside `inkbar/`. Update this list
 - `core/fpdfdoc/cpdf_interactiveform.cpp`, in `InitDict`: a created `/AcroForm` is given an empty `/Fields` array. ISO 32000 requires the entry, and without it Poppler reports "Can't get Fields array". The smoke check guards it.
 - `core/fpdfapi/edit/cpdf_image_redactor.{h,cpp}`: `RedactionHoleSamples()`, a public wrapper over the file's own `HoleSamples()` and `ColorSpaceOf()`, so the redaction check compares an image with the value the redaction fills it with. The smoke check guards it.
 - `core/fpdfapi/parser/cpdf_document.{h,cpp}`: `CPDF_Document::DropInfo()`, which `INK_Sanitize` calls so the next save writes no `/Info`. It caches a direct, empty `/Info` dictionary and removes `/Info` from the parser's trailer, so the save trailer names none and copies none, whether the file named an object or held a direct dictionary. A layer document shares its base's parser, so on a layer it changes only the cached `/Info` and leaves the base's trailer alone. The smoke check guards both cases.
+- `core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp`, in `RealizeResource`: a direct resource, such as a shading or pattern dictionary held inside `/Resources`, is copied into an object of its own before the rewritten content names it. Upstream writes a reference to object 0, which the save drops, so a shading beside a redaction disappeared from the page. The smoke check guards it.
 
 ## Taking upstream
 

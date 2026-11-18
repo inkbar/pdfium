@@ -1111,6 +1111,13 @@ ByteString CPDF_PageContentGenerator::RealizeResource(
   auto it = all_removed_resources_map.find(type);
   const CPDF_PageObjectHolder::RemovedResourceMap* removed_resource_map =
       it != all_removed_resources_map.end() ? &it->second : nullptr;
+  // Inkbar: a resource is written as a reference, so a direct one (a shading
+  // or pattern dictionary held inside /Resources) gets a copy of its own to
+  // refer to. A reference to object 0 is dropped on save.
+  uint32_t objnum = pResource->GetObjNum();
+  if (!objnum) {
+    objnum = document_->AddIndirectObject(pResource->Clone());
+  }
   ByteString name;
   int idnum = 1;
   while (true) {
@@ -1128,8 +1135,7 @@ ByteString CPDF_PageContentGenerator::RealizeResource(
       continue;
     }
 
-    resource_dict->SetNewFor<CPDF_Reference>(name, document_,
-                                             pResource->GetObjNum());
+    resource_dict->SetNewFor<CPDF_Reference>(name, document_, objnum);
     return name;
   }
 }
