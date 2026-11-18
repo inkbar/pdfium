@@ -58,7 +58,7 @@ The checkout is mounted into the container. `scripts/embedpdf-runtime/build-targ
 
 The binary is single-threaded.
 
-Current size of `inkbar-pdfium.wasm`: 6,924,929 bytes raw, 2,927,301 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
+Current size of `inkbar-pdfium.wasm`: 6,924,735 bytes raw, 2,927,143 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
 
 ## The redaction check
 
@@ -97,13 +97,13 @@ The apply removes text, blanks image samples and cuts paths. It does not enter a
 - `patterns`: filled, stroked or shown (text) with a tiling pattern, whatever its cell holds;
 - `shadings`: a function-based or mesh shading (types 1 and 4 to 7) painted with `sh`, or an object painted with such a shading pattern, when the shading's own box also meets the region or cannot be read. Axial and radial shadings do not count;
 - `maskGroups`: under a soft mask whose group holds anything whose box meets the region when placed by the mask's matrix. A group whose place is not finite counts;
-- `glyphs`: text in a Type 3 font with a shown glyph whose procedure's bounds meet the region though its declared box does not (the text redactor goes by the declared box), or whose procedure holds an image, a shading, a form or a pattern use and meets the region either way.
+- `glyphs`: text in a Type 3 font with a shown glyph whose procedure's bounds meet the region though its declared box does not. The text redactor goes by the declared box, so a glyph whose box meets the region is removed with its text, and its procedure with it when nothing else shows that glyph, whatever the procedure holds: an image (bitmap fonts draw every glyph so), a pattern or a shading. Such text is not counted.
 
 The engine refuses an apply over a region with any count above zero. NULL means it could not look: no such page, a bad quad, a nesting limit or the work budget spent. Forms tagged as an earlier apply's overlay and loupe page copies are not read. Parsing a mask group, a pattern cell or a glyph procedure is charged to the work budget by the bytes of its stream as the file holds them and by its objects.
 
 `INK_Inspect_Page` verifies what an apply removed. It is not the gate for these carriers: after an apply forced over a pattern fill that reaches past the mark, no object paints with the pattern in the region any more, and the check reads nothing there. The smoke check pins this. A shading painted with `sh` is the exception and still counts after an apply.
 
-Limits of both: they answer what is under the mark. They do not find content hidden elsewhere in the file, such as a second use of a form that is clipped away, covered or off the page, the span of a gradient that no object shows, or definitions shared with other pages. The painted-area test reads each clip and the object's shape against the region separately, and takes text that clips to let everything through, so it can count an object that a combination of clips keeps out of the region. Type 3 glyph procedures that hold images are common in files with bitmap fonts, and an apply over such text is refused.
+Limits of both: they answer what is under the mark. They do not find content hidden elsewhere in the file, such as a second use of a form that is clipped away, covered or off the page, the span of a gradient that no object shows, or definitions shared with other pages. The painted-area test reads each clip and the object's shape against the region separately, and takes text that clips to let everything through, so it can count an object that a combination of clips keeps out of the region.
 
 When the only use of a resource lies wholly under a mark, the apply removes the object, upstream's content generation drops the page's resource entry, and the rewrite does not write the definition. The smoke check reads the saved file for each kind: an image and a form holding text (each leaves a blank copy in place, without the samples or the text), a tiling pattern, a mesh shading, a shading pattern, a soft mask group holding text, and an image named by resources the page inherits from its parent. The smoke check also pins what an apply leaves of other content painted through a reference. Gone from the saved file: a Type 3 glyph procedure used only under the mark, text in a transparency group form, text on a hidden layer, replacement text (`/ActualText`, `/Alt`) on a span, in `/Properties` and on a structure element, a field's value, a note and its popup, an attached file, an image's alternate, metadata and private data, a page's thumbnail and private data, and text used as a clip. Kept, because the page still shows it beside the mark: a glyph procedure, a form or an appearance stream that has another use there.
 
