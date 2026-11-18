@@ -1032,82 +1032,141 @@ enum class Scope {
   kPageCopy,    // A page copy in an annotation, in the page's coordinates.
 };
 
-// The points of a path in page space, its segments sampled at most 1 pt
-// apart, for |visit|. Stops when |visit| returns true; returns whether it did.
+// The part of segment |a|-|b| inside |clip|, or nullopt (Liang-Barsky).
+std::optional<std::pair<CFX_PointF, CFX_PointF>> ClipSegment(
+    const CFX_PointF& a,
+    const CFX_PointF& b,
+    const CFX_FloatRect& clip) {
+  float t0 = 0;
+  float t1 = 1;
+  const float dx = b.x - a.x;
+  const float dy = b.y - a.y;
+  const float p[4] = {-dx, dx, -dy, dy};
+  const float q[4] = {a.x - clip.left, clip.right - a.x, a.y - clip.bottom,
+                      clip.top - a.y};
+  for (int i = 0; i < 4; ++i) {
+    if (p[i] == 0) {
+      if (q[i] < 0) {
+        return std::nullopt;
+      }
+      continue;
+    }
+    const float t = q[i] / p[i];
+    if (p[i] < 0) {
+      t0 = std::max(t0, t);
+    } else {
+      t1 = std::min(t1, t);
+    }
+    if (t0 > t1) {
+      return std::nullopt;
+    }
+  }
+  return std::make_pair(CFX_PointF(a.x + dx * t0, a.y + dy * t0),
+                        CFX_PointF(a.x + dx * t1, a.y + dy * t1));
+}
+
+// Points along a path in page space for |visit|: its vertices, and every
+// segment sampled at most 1 pt apart where it passes through |clip| (no point
+// outside |clip| can matter). Curves are split until each piece is under
+// 1 pt across or misses |clip|. Stops when |visit| returns true; returns
+// whether it did.
 template <typename Visit>
-bool SamplePath(const CPDF_Path& path, const CFX_Matrix& to_page, Visit visit) {
-  const std::vector<CFX_Path::Point>& points = path.GetPoints();
-  auto line = [&](const CFX_PointF& a, const CFX_PointF& b) {
-    const float length = std::hypot(b.x - a.x, b.y - a.y);
-    const int steps = std::clamp(static_cast<int>(std::ceil(length)), 1,
-                                 1 << 20);
-    for (int i = 0; i <= steps; ++i) {
-      const float t = static_cast<float>(i) / steps;
-      if (visit(CFX_PointF(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t))) {
+class PathSampler {
+ public:
+  PathSampler(const CFX_FloatRect& clip, Visit visit)
+      : clip_(clip), visit_(std::move(visit)) {}
+
+  bool Run(const CPDF_Path& path, const CFX_Matrix& to_page) {
+    const std::vector<CFX_Path::Point>& points = path.GetPoints();
+    CFX_PointF start;
+    CFX_PointF current;
+    for (size_t i = 0; i < points.size(); ++i) {
+      const CFX_Path::Point& point = points[i];
+      const CFX_PointF p = to_page.Transform(point.point_);
+      if (point.type_ == CFX_Path::Point::Type::kMove) {
+        start = current = p;
+        if (visit_(p)) {
+          return true;
+        }
+      } else if (point.type_ == CFX_Path::Point::Type::kLine) {
+        if (Line(current, p)) {
+          return true;
+        }
+        current = p;
+      } else {
+        if (i + 2 >= points.size()) {
+          return false;
+        }
+        const CFX_PointF end = to_page.Transform(points[i + 2].point_);
+        if (Curve(current, p, to_page.Transform(points[i + 1].point_), end,
+                  0)) {
+          return true;
+        }
+        current = end;
+        i += 2;
+      }
+      if (points[i].close_figure_ && Line(current, start)) {
         return true;
       }
     }
     return false;
-  };
-  CFX_PointF start;
-  CFX_PointF current;
-  for (size_t i = 0; i < points.size(); ++i) {
-    const CFX_Path::Point& point = points[i];
-    const CFX_PointF p = to_page.Transform(point.point_);
-    switch (point.type_) {
-      case CFX_Path::Point::Type::kMove:
-        start = current = p;
-        if (visit(p)) {
-          return true;
-        }
-        break;
-      case CFX_Path::Point::Type::kLine:
-        if (line(current, p)) {
-          return true;
-        }
-        current = p;
-        break;
-      case CFX_Path::Point::Type::kBezier: {
-        if (i + 2 >= points.size()) {
-          return false;
-        }
-        const CFX_PointF c1 = p;
-        const CFX_PointF c2 = to_page.Transform(points[i + 1].point_);
-        const CFX_PointF end = to_page.Transform(points[i + 2].point_);
-        // The control polygon is never shorter than the curve.
-        const float length = std::hypot(c1.x - current.x, c1.y - current.y) +
-                             std::hypot(c2.x - c1.x, c2.y - c1.y) +
-                             std::hypot(end.x - c2.x, end.y - c2.y);
-        const int steps = std::clamp(static_cast<int>(std::ceil(length)), 1,
-                                     1 << 20);
-        CFX_PointF previous = current;
-        for (int k = 1; k <= steps; ++k) {
-          const float t = static_cast<float>(k) / steps;
-          const float u = 1 - t;
-          const CFX_PointF q(
-              u * u * u * current.x + 3 * u * u * t * c1.x +
-                  3 * u * t * t * c2.x + t * t * t * end.x,
-              u * u * u * current.y + 3 * u * u * t * c1.y +
-                  3 * u * t * t * c2.y + t * t * t * end.y);
-          if (line(previous, q)) {
-            return true;
-          }
-          previous = q;
-        }
-        current = end;
-        i += 2;
-        if (points[i].close_figure_ && line(current, start)) {
-          return true;
-        }
-        continue;
-      }
-    }
-    if (point.close_figure_ && line(current, start)) {
+  }
+
+ private:
+  bool Line(const CFX_PointF& a, const CFX_PointF& b) {
+    if (visit_(b)) {
       return true;
     }
+    std::optional<std::pair<CFX_PointF, CFX_PointF>> part =
+        ClipSegment(a, b, clip_);
+    if (!part.has_value()) {
+      return false;
+    }
+    const CFX_PointF& from = part->first;
+    const CFX_PointF& to = part->second;
+    const int steps = std::max(
+        1, static_cast<int>(std::ceil(std::hypot(to.x - from.x,
+                                                  to.y - from.y))));
+    for (int k = 0; k <= steps; ++k) {
+      const float t = static_cast<float>(k) / steps;
+      if (visit_(CFX_PointF(from.x + (to.x - from.x) * t,
+                            from.y + (to.y - from.y) * t))) {
+        return true;
+      }
+    }
+    return false;
   }
-  return false;
-}
+
+  bool Curve(const CFX_PointF& p0,
+             const CFX_PointF& p1,
+             const CFX_PointF& p2,
+             const CFX_PointF& p3,
+             int depth) {
+    CFX_FloatRect hull(p0);
+    hull.UpdateRect(p1);
+    hull.UpdateRect(p2);
+    hull.UpdateRect(p3);
+    if (hull.right < clip_.left || hull.left > clip_.right ||
+        hull.top < clip_.bottom || hull.bottom > clip_.top) {
+      return visit_(p3);
+    }
+    // A piece under 1 pt across is its chord to within that; 2^24 pieces are
+    // finer than a float can tell apart.
+    if (std::max(hull.Width(), hull.Height()) <= 1 || depth >= 24) {
+      return Line(p0, p3);
+    }
+    const CFX_PointF a((p0.x + p1.x) / 2, (p0.y + p1.y) / 2);
+    const CFX_PointF b((p1.x + p2.x) / 2, (p1.y + p2.y) / 2);
+    const CFX_PointF c((p2.x + p3.x) / 2, (p2.y + p3.y) / 2);
+    const CFX_PointF ab((a.x + b.x) / 2, (a.y + b.y) / 2);
+    const CFX_PointF bc((b.x + c.x) / 2, (b.y + c.y) / 2);
+    const CFX_PointF mid((ab.x + bc.x) / 2, (ab.y + bc.y) / 2);
+    return Curve(p0, a, ab, mid, depth + 1) || Curve(mid, bc, c, p3, depth + 1);
+  }
+
+  const CFX_FloatRect clip_;
+  Visit visit_;
+};
 
 class Walker {
  public:
@@ -1169,10 +1228,7 @@ class Walker {
         }
       } else if (CPDF_PathObject* path = object->AsPath()) {
         if (page && (PathCrosses(*redactor_, *path, to_page) ||
-                     SamplePath(path->path(), path->matrix() * to_page,
-                                [this](const CFX_PointF& p) {
-                                  return PointInsideAny(p, entry_->second);
-                                }))) {
+                     PathSampleInside(*path, to_page))) {
           ++entry_->counts.paths;
         }
       } else if (CPDF_ShadingObject* shading = object->AsShading()) {
@@ -1185,6 +1241,33 @@ class Walker {
   }
 
  private:
+  // The second test for a path: a vertex or a sampled point of it strictly
+  // inside a shrunk region. Paths whose box misses the regions are skipped.
+  bool PathSampleInside(const CPDF_PathObject& path,
+                        const CFX_Matrix& to_page) {
+    CFX_FloatRect box = to_page.TransformRect(path.GetRect());
+    box.Normalize();
+    std::optional<CFX_FloatRect> clip;
+    for (const RedactRegion& region : entry_->second) {
+      if (!Intersects(box, region.bbox)) {
+        continue;
+      }
+      if (clip.has_value()) {
+        clip->Union(region.bbox);
+      } else {
+        clip = region.bbox;
+      }
+    }
+    if (!clip.has_value()) {
+      return false;
+    }
+    auto inside = [this](const CFX_PointF& p) {
+      return PointInsideAny(p, entry_->second);
+    };
+    PathSampler<decltype(inside)> sampler(*clip, inside);
+    return sampler.Run(path.path(), path.matrix() * to_page);
+  }
+
   bool Before(const CPDF_PageObject* object) const {
     auto it = context_->index.order.find(object);
     return it == context_->index.order.end() || it->second < entry_->before;
