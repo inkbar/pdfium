@@ -1189,6 +1189,48 @@ const sanitizedSaved = withDoc(sanitizeSource, (doc) => {
   })
 }
 
+// sanitises a direct /Info, XFA, javascript: links and every embedded file, each counted once
+{
+  const source = buildPdf(
+    [
+      '<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(a.txt) 7 0 R] >> >> /AcroForm << /Fields [] /XFA 9 0 R >> >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [10 0 R 11 0 R 12 0 R] >>',
+      streamObject('', textContent),
+      '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+      '<< >>',
+      '<< /Type /Filespec /F (a.txt) /EF << /F 8 0 R >> >>',
+      streamObject('/Type /EmbeddedFile', 'SHARED-SECRET', true),
+      streamObject('', '<xdp:xdp>XFA-SECRET</xdp:xdp>', true),
+      '<< /Type /Annot /Subtype /FileAttachment /Rect [0 0 20 20] /FS 7 0 R >>',
+      '<< /Type /Annot /Subtype /Link /Rect [20 0 40 20] /A << /S /GoToE /T << /R /C /N (x) >> /F 13 0 R >> >>',
+      '<< /Type /Annot /Subtype /Link /Rect [40 0 60 20] /A << /S /URI /URI (  JavaScript:app.alert\\(1\\)) >> >>',
+      '<< /Type /Filespec /F (b.pdf) /EF << /F 14 0 R >> >>',
+      streamObject('/Type /EmbeddedFile', 'GOTOE-SECRET', true),
+    ],
+    '/Info << /Title (DIRECT-INFO) >>',
+  )
+  const facts = { revisions: 1, info: true, xmp: false, attachments: 2, scripts: true, hiddenLayers: false, signed: false }
+  const saved = withDoc(source, (doc) => {
+    assert.deepEqual(inspectFile(doc, source), facts)
+    const out = m._malloc(8)
+    assert.equal(m._INK_Sanitize(doc, out, out + 4), 1)
+    const flags = m.HEAPU32[out / 4]
+    const attachments = m.HEAPU32[out / 4 + 1]
+    m._free(out)
+    assert.equal(flags, 1 | 2 | 4, `sanitise flags ${flags}`)
+    assert.equal(attachments, 2, 'the shared file is one attachment')
+    return save(doc)
+  })
+  const inflated = inflateStreams(saved)
+  for (const text of ['/Info', 'DIRECT-INFO', '/XFA', 'XFA-SECRET', 'SHARED-SECRET', 'GOTOE-SECRET', 'JavaScript:', '/EF']) {
+    assert.ok(!inflated.includes(text), `the sanitised file holds ${text}`)
+  }
+  withDoc(saved, (doc) => {
+    assert.deepEqual(inspectFile(doc, saved), { ...facts, info: false, attachments: 0, scripts: false })
+  })
+}
+
 // reports file facts
 {
   const FPDF_INCREMENTAL = 1

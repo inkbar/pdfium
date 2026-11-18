@@ -50,6 +50,7 @@
 #include "core/fpdfapi/parser/cpdf_array.h"
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fpdfapi/parser/cpdf_document.h"
+#include "core/fpdfapi/parser/cpdf_parser.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
 #include "core/fpdftext/cpdf_textpage.h"
 #include "core/fpdfdoc/cpdf_annot.h"
@@ -1424,7 +1425,14 @@ char* INK_Inspect_File(FPDF_DOCUMENT doc,
   auto boolean = [](bool value) { return value ? "true" : "false"; };
   std::string out = "{\"revisions\":" + std::to_string(revisions);
   out += ",\"info\":";
-  out += boolean(info && info->size() > 0);
+  // The trailer's /Info may be a direct dictionary, which GetInfo() does not
+  // read.
+  const CPDF_Parser* parser = pdf->GetParser();
+  const CPDF_Dictionary* trailer = parser ? parser->GetTrailer() : nullptr;
+  RetainPtr<const CPDF_Dictionary> trailer_info =
+      trailer ? trailer->GetDictFor("Info") : nullptr;
+  out += boolean((info && info->size() > 0) ||
+                 (trailer_info && trailer_info->size() > 0));
   out += ",\"xmp\":";
   out += boolean(!!root->GetStreamFor("Metadata"));
   out += ",\"attachments\":" + std::to_string(attachments);

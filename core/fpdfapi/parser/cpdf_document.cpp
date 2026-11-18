@@ -906,9 +906,18 @@ RetainPtr<CPDF_Dictionary> CPDF_Document::GetOrCreateInfo() {
 }
 
 // Inkbar: a direct dictionary has no object number, so the save trailer
-// names no /Info and drops the one it read (CPDF_SaveTrailer).
+// names no /Info of its own (CPDF_SaveTrailer). The parser's trailer loses
+// its /Info too, so the save copies none, whether it was a reference or a
+// direct dictionary.
 void CPDF_Document::DropInfo() {
   SetCachedInfoDict(pdfium::MakeRetain<CPDF_Dictionary>());
+  if (CPDF_Parser* parser = GetParser()) {
+    if (const CPDF_Dictionary* trailer = parser->GetTrailer()) {
+      // The parser holds its trailer as a mutable dictionary and hands it out
+      // read-only; nothing else reads /Info from it after this.
+      const_cast<CPDF_Dictionary*>(trailer)->RemoveFor("Info");
+    }
+  }
 }
 
 // EmbedPDF(layer-seam, annot-appearance): a layer reads its base's parser. A

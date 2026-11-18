@@ -18,8 +18,8 @@
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fpdfapi/parser/cpdf_document.h"
 #include "core/fpdfapi/parser/cpdf_object.h"
+#include "core/fpdfapi/parser/cpdf_parser.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
-#include "core/fpdfdoc/cpdf_nametree.h"
 #include "core/fxcrt/bytestring.h"
 #include "core/fxcrt/retain_ptr.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
@@ -33,14 +33,31 @@ constexpr int kMaxDepth = 256;
 
 class Sanitizer {
  public:
-  Sanitizer(CPDF_Document* doc, bool remove) : doc_(doc), remove_(remove) {}
+  explicit Sanitizer(CPDF_Document* doc) : doc_(doc) {}
 
-  void Run() {
+  // Finds what there is, and with |remove| then removes it. The finding pass
+  // runs first so that each embedded file is counted once, wherever it is
+  // referred from, before any reference to it goes.
+  void Run(bool remove) {
+    Pass();
+    if (remove) {
+      remove_ = true;
+      Pass();
+    }
+  }
+
+  unsigned found() const { return found_; }
+  unsigned attachments() const {
+    return static_cast<unsigned>(embedded_.size()) + unembedded_;
+  }
+
+ private:
+  void Pass() {
     Catalog();
     const uint32_t last = doc_->GetLastObjNum();
     for (uint32_t objnum = 1; objnum <= last; ++objnum) {
       // On a document that is not a layer the mutable object is the one the
-      // document holds; a scan that finds without removing changes nothing.
+      // document holds; the finding pass changes nothing.
       RetainPtr<CPDF_Object> object = doc_->GetMutableIndirectObject(objnum);
       if (object) {
         Visit(object.Get(), 0);
@@ -48,21 +65,15 @@ class Sanitizer {
     }
   }
 
-  unsigned found() const { return found_; }
-  unsigned attachments() const { return attachments_; }
-
- private:
   void Catalog() {
     RetainPtr<CPDF_Dictionary> root = doc_->GetMutableRoot();
     if (!root) {
       return;
     }
     if (RetainPtr<CPDF_Dictionary> names = root->GetMutableDictFor("Names")) {
+      // Its files are counted where their file specifications are visited.
       if (names->KeyExist("EmbeddedFiles")) {
         found_ |= INK_SANITIZE_ATTACHMENTS;
-        std::unique_ptr<CPDF_NameTree> tree =
-            CPDF_NameTree::CreateForReading(doc_, "EmbeddedFiles");
-        attachments_ += tree ? static_cast<unsigned>(tree->GetCount()) : 0;
         Drop(names.Get(), "EmbeddedFiles");
       }
       if (names->KeyExist("JavaScript")) {
@@ -74,7 +85,15 @@ class Sanitizer {
       found_ |= INK_SANITIZE_ATTACHMENTS;
       Drop(root.Get(), "Collection");
     }
-    if (doc_->GetInfo()) {
+    if (RetainPtr<CPDF_Dictionary> form = root->GetMutableDictFor("AcroForm")) {
+      // An XFA form carries its own scripts.
+      DropIfPresent(form.Get(), "XFA", INK_SANITIZE_SCRIPTS);
+    }
+    // The trailer's /Info may be a direct dictionary, which has no object
+    // number and which GetInfo() does not read.
+    const CPDF_Parser* parser = doc_->GetParser();
+    const CPDF_Dictionary* trailer = parser ? parser->GetTrailer() : nullptr;
+    if (doc_->GetInfo() || (trailer && trailer->KeyExist("Info"))) {
       found_ |= INK_SANITIZE_METADATA;
       if (remove_) {
         doc_->DropInfo();
@@ -117,6 +136,10 @@ class Sanitizer {
     if (action->GetNameFor("S") == "JavaScript" || action->KeyExist("JS")) {
       return true;
     }
+    if (action->GetNameFor("S") == "URI" &&
+        IsScriptUri(action->GetByteStringFor("URI"))) {
+      return true;
+    }
     return HasScript(action->GetDirectObjectFor("Next").Get(), depth + 1);
   }
 
@@ -157,7 +180,11 @@ class Sanitizer {
         continue;
       }
       found_ |= INK_SANITIZE_ATTACHMENTS;
-      ++attachments_;
+      RetainPtr<const CPDF_Dictionary> spec = annot->GetDictFor("FS");
+      if (!remove_ && (!spec || EmbeddedStreams(spec.Get()).empty())) {
+        // A file named but not embedded is still an attachment.
+        ++unembedded_;
+      }
       if (remove_) {
         // Also off the annotation itself, in case something else still
         // refers to it.
@@ -181,6 +208,15 @@ class Sanitizer {
     DropIfPresent(dict, "PieceInfo", INK_SANITIZE_PRIVATE_DATA);
     DropIfPresent(dict, "OPI", INK_SANITIZE_PRIVATE_DATA);
     DropIfPresent(dict, "AF", INK_SANITIZE_ATTACHMENTS);
+    // Any file specification's embedded files: attachments, and the targets
+    // of GoToE, Launch, RichMedia, Screen and Sound alike.
+    if (dict->KeyExist("EF")) {
+      found_ |= INK_SANITIZE_ATTACHMENTS;
+      for (const CPDF_Object* stream : EmbeddedStreams(dict)) {
+        embedded_.insert(stream);
+      }
+      Drop(dict, "EF");
+    }
     Actions(dict);
     Annotations(dict);
     for (const ByteString& key : dict->GetKeys()) {
@@ -210,10 +246,40 @@ class Sanitizer {
     }
   }
 
+  // The embedded file streams a file specification's /EF names.
+  static std::vector<const CPDF_Object*> EmbeddedStreams(
+      const CPDF_Dictionary* spec) {
+    std::vector<const CPDF_Object*> streams;
+    RetainPtr<const CPDF_Dictionary> files = spec->GetDictFor("EF");
+    if (!files) {
+      return streams;
+    }
+    CPDF_DictionaryLocker locker(files);
+    for (const auto& [key, value] : locker) {
+      RetainPtr<const CPDF_Object> stream = value->GetDirect();
+      if (stream && stream->IsStream()) {
+        streams.push_back(stream.Get());
+      }
+    }
+    return streams;
+  }
+
+  // A URI that runs script when followed: javascript:, in any case, after
+  // leading white space.
+  static bool IsScriptUri(const ByteString& uri) {
+    ByteString trimmed = uri;
+    trimmed.TrimWhitespaceFront();
+    trimmed.MakeLower();
+    return trimmed.First(11) == "javascript:";
+  }
+
   CPDF_Document* const doc_;
-  const bool remove_;
+  bool remove_ = false;
   unsigned found_ = 0;
-  unsigned attachments_ = 0;
+  // The embedded files found, each once. The document holds them for the
+  // whole run, so their addresses name them.
+  std::set<const CPDF_Object*> embedded_;
+  unsigned unembedded_ = 0;
 };
 
 }  // namespace
@@ -221,8 +287,8 @@ class Sanitizer {
 namespace inkbar {
 
 unsigned FindSanitizable(CPDF_Document* doc, unsigned* out_attachment_count) {
-  Sanitizer scan(doc, /*remove=*/false);
-  scan.Run();
+  Sanitizer scan(doc);
+  scan.Run(/*remove=*/false);
   if (out_attachment_count) {
     *out_attachment_count = scan.attachments();
   }
@@ -247,8 +313,8 @@ int INK_Sanitize(FPDF_DOCUMENT doc,
   if (!pdf) {
     return 0;
   }
-  Sanitizer sanitizer(pdf, /*remove=*/true);
-  sanitizer.Run();
+  Sanitizer sanitizer(pdf);
+  sanitizer.Run(/*remove=*/true);
   if (out_removed) {
     *out_removed = sanitizer.found();
   }
