@@ -107,6 +107,8 @@ constexpr float kPageMargin = 10.0f;
 // A ceiling on the steps of any sampling loop, so the arithmetic stays in
 // range whatever a file holds. Regions held to the page never reach it.
 constexpr double kMaxSteps = 1 << 20;
+// A shading's curved clips are flattened to within this many points.
+constexpr float kCurveTolerance = 0.25f;
 // Patterns painted with patterns, more deeply nested than this, fail the
 // inspection rather than going unread.
 constexpr int kMaxPatternChain = 64;
@@ -801,9 +803,43 @@ bool ShadingCrosses(const CPDF_PathRedactor& redactor,
   return true;
 }
 
-// The subpaths of |path| as closed polygons, its curves cut into 16 lines
-// each, in the path's own space.
-std::vector<std::vector<CFX_PointF>> Polygons(const CPDF_Path& path) {
+// Appends the cubic |p0| .. |p3| to |polygon| as lines, split until every
+// line lies within |tolerance| of the curve.
+void FlattenCubic(const CFX_PointF& p0,
+                  const CFX_PointF& p1,
+                  const CFX_PointF& p2,
+                  const CFX_PointF& p3,
+                  float tolerance,
+                  int depth,
+                  std::vector<CFX_PointF>* polygon) {
+  // The control points' distance from the chord bounds the curve's.
+  const CFX_PointF chord = p3 - p0;
+  const float length = std::hypot(chord.x, chord.y);
+  auto away = [&](const CFX_PointF& q) {
+    if (length == 0) {
+      return std::hypot(q.x - p0.x, q.y - p0.y);
+    }
+    return std::fabs(chord.x * (q.y - p0.y) - chord.y * (q.x - p0.x)) /
+           length;
+  };
+  if ((away(p1) <= tolerance && away(p2) <= tolerance) || depth >= 20) {
+    polygon->push_back(p3);
+    return;
+  }
+  const CFX_PointF a((p0.x + p1.x) / 2, (p0.y + p1.y) / 2);
+  const CFX_PointF b((p1.x + p2.x) / 2, (p1.y + p2.y) / 2);
+  const CFX_PointF c((p2.x + p3.x) / 2, (p2.y + p3.y) / 2);
+  const CFX_PointF ab((a.x + b.x) / 2, (a.y + b.y) / 2);
+  const CFX_PointF bc((b.x + c.x) / 2, (b.y + c.y) / 2);
+  const CFX_PointF mid((ab.x + bc.x) / 2, (ab.y + bc.y) / 2);
+  FlattenCubic(p0, a, ab, mid, tolerance, depth + 1, polygon);
+  FlattenCubic(mid, bc, c, p3, tolerance, depth + 1, polygon);
+}
+
+// The subpaths of |path| as closed polygons, in the path's own space, its
+// curves cut into lines within |tolerance| of them.
+std::vector<std::vector<CFX_PointF>> Polygons(const CPDF_Path& path,
+                                              float tolerance) {
   std::vector<std::vector<CFX_PointF>> polygons;
   const std::vector<CFX_Path::Point>& points = path.GetPoints();
   for (size_t i = 0; i < points.size(); ++i) {
@@ -821,18 +857,8 @@ std::vector<std::vector<CFX_PointF>> Polygons(const CPDF_Path& path) {
     if (i + 2 >= points.size()) {
       break;
     }
-    const CFX_PointF p0 = polygon.back();
-    const CFX_PointF& c1 = point.point_;
-    const CFX_PointF& c2 = points[i + 1].point_;
-    const CFX_PointF& end = points[i + 2].point_;
-    for (int k = 1; k <= 16; ++k) {
-      const float t = k / 16.0f;
-      const float u = 1 - t;
-      polygon.emplace_back(u * u * u * p0.x + 3 * u * u * t * c1.x +
-                               3 * u * t * t * c2.x + t * t * t * end.x,
-                           u * u * u * p0.y + 3 * u * u * t * c1.y +
-                               3 * u * t * t * c2.y + t * t * t * end.y);
-    }
+    FlattenCubic(polygon.back(), point.point_, points[i + 1].point_,
+                 points[i + 2].point_, tolerance, 0, &polygon);
     i += 2;
   }
   return polygons;
@@ -874,12 +900,31 @@ bool ShadingPaintsSample(const CPDF_ShadingObject& shading,
   CFX_FloatRect page_box = to_page.TransformRect(box);
   page_box.Normalize();
   const CFX_Matrix to_holder = to_page.GetInverse();
-  std::vector<std::pair<std::vector<std::vector<CFX_PointF>>,
-                        CFX_FillRenderOptions::FillType>>
-      clips;
+  // Curves are flattened to within a quarter point on the page.
+  const float stretch = std::max({std::hypot(to_page.a, to_page.b),
+                                  std::hypot(to_page.c, to_page.d), 1e-6f});
+  const float tolerance = kCurveTolerance / stretch;
+  struct Clip {
+    std::vector<std::vector<CFX_PointF>> polygons;
+    CFX_FillRenderOptions::FillType fill;
+    CFX_FloatRect box;  // Nothing outside it is covered.
+  };
+  std::vector<Clip> clips;
   const CPDF_ClipPath& clip = shading.clip_path();
   for (size_t i = 0; clip.HasRef() && i < clip.GetPathCount(); ++i) {
-    clips.emplace_back(Polygons(clip.GetPath(i)), clip.GetClipType(i));
+    Clip entry{Polygons(clip.GetPath(i), tolerance), clip.GetClipType(i), {}};
+    bool first = true;
+    for (const std::vector<CFX_PointF>& polygon : entry.polygons) {
+      for (const CFX_PointF& point : polygon) {
+        if (first) {
+          entry.box = CFX_FloatRect(point);
+          first = false;
+        } else {
+          entry.box.UpdateRect(point);
+        }
+      }
+    }
+    clips.push_back(std::move(entry));
   }
   for (const RedactRegion& region : regions) {
     CFX_FloatRect area = region.bbox;
@@ -902,9 +947,11 @@ bool ShadingPaintsSample(const CPDF_ShadingObject& shading,
             p.y > box.top) {
           continue;
         }
+        // Painted when every clip covers it; the first that does not ends it.
         bool painted = true;
-        for (const auto& [polygons, fill] : clips) {
-          if (!Covers(polygons, fill, p)) {
+        for (const Clip& c : clips) {
+          if (p.x < c.box.left || p.x > c.box.right || p.y < c.box.bottom ||
+              p.y > c.box.top || !Covers(c.polygons, c.fill, p)) {
             painted = false;
             break;
           }

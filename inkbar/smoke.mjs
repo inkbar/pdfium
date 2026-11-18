@@ -1142,6 +1142,19 @@ function nestedFormsPdf(levels) {
   assert.equal(wrong.paths, 1, `a shading whose clip keeps the region: ${JSON.stringify(wrong)}`)
 }
 
+// samples a shading's curved clip to within a quarter point of the curve
+{
+  // One cubic arch over 0..400, its top at y 300. The region lies between the
+  // arch and the chord a flattening into 16 lines would draw at x 181, about
+  // 1.2 pt below the arch there: inside the clip.
+  const source = onePagePdf('0 0 m 0 400 400 400 400 0 c h W n /Sh0 sh', {
+    mediaBox: '[0 0 400 400]',
+    resources: '/Shading << /Sh0 << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 400 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>',
+  })
+  const [region] = withDoc(source, (doc) => inspectPage(doc, 0, [[180.5, 297.95, 182, 298.55]]))
+  assert.equal(region.paths, 1, `a shading under a curved clip: ${JSON.stringify(region)}`)
+}
+
 // a region too small to shrink still counts the path under it
 {
   const source = onePagePdf('0 0 1 rg 50 50 100 100 re f')
