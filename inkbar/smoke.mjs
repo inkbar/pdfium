@@ -846,6 +846,54 @@ const textContent = 'BT /F1 20 Tf 50 100 Td (SECRET-ALPHA) Tj 200 0 Td (KEEP-BET
   })
 }
 
+// inspects an inline image, a JPEG and text in a nested form under a region
+{
+  const inline = Buffer.alloc(4 * 4 * 3)
+  for (let i = 0; i < 16; i++) inline.set([i * 16, 255 - i * 16, 64], i * 3)
+  const jpeg = readFileSync(new URL('../testing/resources/mona_lisa.jpg', import.meta.url))
+  const content = Buffer.concat([
+    Buffer.from('q 100 0 0 100 20 50 cm BI /W 4 /H 4 /CS /RGB /BPC 8 ID '),
+    inline,
+    Buffer.from(' EI Q q 120 0 0 120 140 40 cm /Jp Do Q /Fm0 Do'),
+  ])
+  const source = onePagePdf(
+    content,
+    { resources: '/XObject << /Jp 6 0 R /Fm0 7 0 R >>' },
+    [
+      streamObject('/Type /XObject /Subtype /Image /Width 120 /Height 120 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode', jpeg, true),
+      streamObject('/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Resources << /XObject << /Fm1 8 0 R >> >>', '/Fm1 Do'),
+      streamObject('/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Resources << /Font << /F1 5 0 R >> >>', 'BT /F1 10 Tf 300 100 Td (NESTED) Tj ET'),
+    ],
+  )
+  const regions = [
+    [40, 70, 80, 110],
+    [170, 70, 230, 130],
+    [295, 95, 345, 115],
+  ]
+  const before = withDoc(source, (doc) => inspectPage(doc, 0, regions))
+  assert.deepEqual(
+    [before[0].imagesNotBlank, before[1].imagesNotBlank, before[2].textChars > 0],
+    [1, 1, true],
+    `content under the regions: ${JSON.stringify(before)}`,
+  )
+  const applied = editPage(source, (doc, page) => {
+    const marks = regions.map((r) => addMark(page, r))
+    assert.equal(applyPage(doc, page, marks, false).result, 1)
+    marks.forEach((mark) => m._FPDFPage_CloseAnnot(mark))
+  })
+  assert.ok(applied.toString('latin1').includes('/DCTDecode'), 'the JPEG is no longer a JPEG')
+  const after = withDoc(applied, (doc) => inspectPage(doc, 0, regions))
+  assert.deepEqual(
+    after.map((r) => [r.imagesNotBlank, r.textChars]),
+    [
+      [0, 0],
+      [0, 0],
+      [0, 0],
+    ],
+    `content left under the marks: ${JSON.stringify(after)}`,
+  )
+}
+
 // inspects an image whose shape is only in its masks
 {
   const black = Buffer.alloc(16 * 16 * 3)

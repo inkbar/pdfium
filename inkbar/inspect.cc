@@ -80,6 +80,10 @@ constexpr float kSecondInset = 1.0f;
 // this many levels of one value, per 8-bit channel: 0 when the image's last
 // filter is lossless, this many either way after DCT or JPX.
 constexpr int kLossyTolerance = 12;
+// After DCT or JPX, samples this close to the edge of the blanked area may
+// stray twice as far: the apply re-encodes the 8 x 8 blocks the edge crosses
+// with the kept content beside the hole, and that content rings into it.
+constexpr int kLossyEdge = 8;
 // Filled boxes that count as candidates in the page content.
 constexpr float kBoxMinSize = 4.0f;
 constexpr float kBoxDarkBelow = 0.2f;
@@ -400,20 +404,30 @@ bool SamplesFlat(const Samples& samples,
   const int height = dib->GetHeight();
   const std::vector<GridBox> boxes =
       GridBoxes(image_to_page, width, height, regions);
-  Band band(samples.tolerance);
+  // |band| holds every sample; |inner| those away from a lossy edge.
+  const bool lossy = samples.tolerance > 0;
+  Band band(lossy ? 2 * samples.tolerance : 0);
+  Band inner(samples.tolerance);
   const bool mask = dib->IsMaskFormat();
   const bool one_bit = dib->GetBPP() == 1;
   const size_t bytes = mask ? 1 : dib->GetBPP() / 8;
   for (const GridBox& b : boxes) {
-    for (int y = b.y0; y < b.y1 && band.flat(); ++y) {
+    for (int y = b.y0; y < b.y1 && band.flat() && inner.flat(); ++y) {
       pdfium::span<const uint8_t> row = dib->GetScanline(height - 1 - y);
       for (int x = b.x0; x < b.x1; ++x) {
+        const bool edge =
+            lossy && std::min({x - b.x0, b.x1 - 1 - x, y - b.y0,
+                               b.y1 - 1 - y}) < kLossyEdge;
         if (mask) {
           const size_t at = one_bit ? x / 8 : x;
           if (at >= row.size()) {
             return false;
           }
-          band.Add(0, one_bit ? (row[at] >> (7 - x % 8)) & 1 : row[at]);
+          const int value = one_bit ? (row[at] >> (7 - x % 8)) & 1 : row[at];
+          band.Add(0, value);
+          if (!edge) {
+            inner.Add(0, value);
+          }
           continue;
         }
         const size_t at = static_cast<size_t>(x) * bytes;
@@ -422,11 +436,14 @@ bool SamplesFlat(const Samples& samples,
         }
         for (int c = 0; c < 3; ++c) {
           band.Add(c, row[at + c]);
+          if (!edge) {
+            inner.Add(c, row[at + c]);
+          }
         }
       }
     }
   }
-  return band.flat();
+  return band.flat() && inner.flat();
 }
 
 // Whether an image is blank under the regions: its own samples, and those of
