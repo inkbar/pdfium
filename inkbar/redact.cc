@@ -109,20 +109,27 @@ std::vector<std::array<float, 8>> MarkQuads(const CPDF_Dictionary* dict) {
 // tells its overlay from content. A mark without /RO gets the overlay
 // upstream would synthesise from its /IC and overlay text
 // (CPDF_AppearanceGenerator::BuildRedactOverlayForm, as epdf_redact.cpp
-// uses); one with an /RO has that stream tagged. A mark for which no overlay
-// can be built is left without one.
+// uses). One with an untagged /RO gets a tagged copy of it: the file may use
+// that stream elsewhere too, as another annotation's appearance or a form the
+// page draws, and a tag on it would hide those uses from the check. A mark
+// for which no overlay can be built is left without one.
 void TagOverlay(CPDF_Document* doc, CPDF_AnnotContext* context) {
   RetainPtr<CPDF_Dictionary> dict = context->GetMutableAnnotDict();
   if (!dict) {
     return;
   }
-  RetainPtr<CPDF_Stream> overlay = dict->GetMutableStreamFor("RO");
-  if (!overlay) {
-    overlay =
-        CPDF_AppearanceGenerator::BuildRedactOverlayForm(doc, dict.Get());
-    if (!overlay) {
+  RetainPtr<CPDF_Stream> overlay;
+  if (RetainPtr<const CPDF_Stream> own = dict->GetStreamFor("RO")) {
+    if (own->GetObjNum() && own->GetDict()->GetBooleanFor(kOverlayKey, false)) {
       return;
     }
+    overlay = ToStream(own->CloneForHolder(doc));
+  } else {
+    overlay =
+        CPDF_AppearanceGenerator::BuildRedactOverlayForm(doc, dict.Get());
+  }
+  if (!overlay) {
+    return;
   }
   overlay->GetMutableDict()->SetNewFor<CPDF_Boolean>(kOverlayKey, true);
   // Indirect, so the flattened page draws this very stream and keeps the tag.
