@@ -294,7 +294,7 @@ class Sanitizer {
   }
 
   // A URI that runs script when followed, read as a browser reads it: a
-  // UTF-16BE string (with its byte order mark) decoded, leading control
+  // UTF-16BE or UTF-16LE string (with its byte order mark) decoded, leading control
   // characters and spaces stripped, tabs and line breaks dropped wherever
   // they are, and the scheme compared without regard to case.
   static bool IsScriptUri(const ByteString& uri) {
@@ -303,6 +303,11 @@ class Sanitizer {
     if (bytes.size() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
       for (size_t i = 2; i + 1 < bytes.size(); i += 2) {
         units.push_back((bytes[i] << 8) | bytes[i + 1]);
+      }
+    } else if (bytes.size() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE) {
+      // UTF-16LE, which PDFium's text decoding also reads.
+      for (size_t i = 2; i + 1 < bytes.size(); i += 2) {
+        units.push_back(bytes[i] | (bytes[i + 1] << 8));
       }
     } else {
       size_t from = 0;

@@ -1494,7 +1494,7 @@ const sanitizedSaved = withDoc(sanitizeSource, (doc) => {
     [
       '<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(ext.txt) 7 0 R (other.txt) 12 0 R] >> >> >>',
       '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [8 0 R 9 0 R 10 0 R 11 0 R] >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [8 0 R 9 0 R 10 0 R 11 0 R 14 0 R] >>',
       streamObject('', textContent),
       '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
       '<< >>',
@@ -1505,6 +1505,7 @@ const sanitizedSaved = withDoc(sanitizeSource, (doc) => {
       '<< /Type /Annot /Subtype /Link /Rect [60 0 80 20] /A << /S /URI /URI (java\\nscript:x) >> >>',
       '<< /Type /Filespec /F (other.txt) >>',
       '<< /Title (ONCE-INFO) >>',
+      '<< /Type /Annot /Subtype /Link /Rect [80 0 100 20] /A << /S /URI /URI <FFFE6A006100760061007300630072006900700074003A007800> >> >>',
     ],
     '/Info 13 0 R',
   )
