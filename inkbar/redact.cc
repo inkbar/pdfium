@@ -149,8 +149,12 @@ int INK_Redact_ApplyPage(FPDF_DOCUMENT doc,
   }
 
   uint32_t removed = 0;
-  if (!EPDFPage_ApplyRedactions(page, apply.data(),
-                                static_cast<int>(apply.size()), &removed)) {
+  const bool applied = EPDFPage_ApplyRedactions(
+      page, apply.data(), static_cast<int>(apply.size()), &removed);
+  // The page changed, or may have on failure: a later page copy must not be
+  // the one cached from before.
+  inkbar::ForgetPageCopy(view.Get(), pdf_page->GetDict()->GetObjNum());
+  if (!applied) {
     return -1;
   }
   if (!FPDFPage_GenerateContent(page)) {

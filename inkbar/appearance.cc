@@ -191,6 +191,14 @@ RetainPtr<CPDF_Stream> AppearanceStream(const INK_APPEARANCE* a) {
   return a ? a->stream : nullptr;
 }
 
+void ForgetPageCopy(CPDF_Document* doc, uint32_t page_objnum) {
+  auto& caches = Caches();
+  auto it = caches.find(doc);
+  if (it != caches.end()) {
+    it->second->pages.erase(page_objnum);
+  }
+}
+
 }  // namespace inkbar
 
 extern "C" {

@@ -532,7 +532,10 @@ class Walker {
           continue;
         }
         if (FormHas(form, kPageCopyKey) && !page) {
-          Holder(form, CFX_Matrix(), Scope::kPageCopy, true, depth + 1);
+          // The copy's /Matrix is the page matrix (rotation and box origin),
+          // and its content is parsed through it: undo it for page space.
+          Holder(form, form->GetDict()->GetMatrixFor("Matrix").GetInverse(),
+                 Scope::kPageCopy, true, depth + 1);
           continue;
         }
         Holder(form, form_object->form_matrix() * to_page, scope, counted,

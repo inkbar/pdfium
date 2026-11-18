@@ -683,15 +683,15 @@ function streamObject(dict, data, plain = false) {
   ])
 }
 
-// One 400 x 200 pt page drawing |content| with Helvetica as /F1. Objects 1 to
+// One page, 400 x 200 pt unless |mediaBox| says otherwise, drawing |content| with Helvetica as /F1. Objects 1 to
 // 5 are the catalog, the page tree, the page, its content and the font;
 // |extra| objects follow from 6.
-function onePagePdf(content, { resources = '', catalog = '', page = '', trailer = '' } = {}, extra = []) {
+function onePagePdf(content, { resources = '', catalog = '', page = '', trailer = '', mediaBox = '[0 0 400 200]' } = {}, extra = []) {
   return buildPdf(
     [
       `<< /Type /Catalog /Pages 2 0 R ${catalog} >>`,
       '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
-      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> ${resources} >> ${page} >>`,
+      `<< /Type /Page /Parent 2 0 R /MediaBox ${mediaBox} /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> ${resources} >> ${page} >>`,
       streamObject('', content),
       '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
       ...extra,
@@ -961,6 +961,36 @@ const overlaySaved = editPage(onePagePdf(textContent), (doc, page) => {
     assert.ok(region.annotationText > 4, `annotation text under the region: ${JSON.stringify(region)}`)
     const [away] = inspectPage(doc, 0, [[0, 0, 40, 40]])
     assert.equal(away.annotationText, 0, `annotation text away from everything: ${JSON.stringify(away)}`)
+  })
+}
+
+// reads a loupe's page copy in page space, and a fresh copy after an apply
+for (const [label, mediaBox, rotate, at, region, lens] of [
+  ['rotated', '[0 0 400 200]', 90, [50, 100], SECRET_RECT, [300, 0, 400, 50]],
+  ['offset', '[100 100 500 300]', 0, [150, 200], [145, 195, 330, 225], [400, 100, 500, 150]],
+]) {
+  const source = onePagePdf(`BT /F1 20 Tf ${at[0]} ${at[1]} Td (SECRET-ALPHA) Tj ET`, { mediaBox, page: `/Rotate ${rotate}` })
+  withDoc(source, (doc) => {
+    const page = m._FPDF_LoadPage(doc, 0)
+    const loupe = m._FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE)
+    const lensAppearance = () => {
+      const a = newAppearance(doc, lens, `q 0.25 0 0 0.25 ${lens[0]} ${lens[1]} cm /P0 Do Q`, false)
+      withStrings(['P0'], (name) => assert.equal(m._INK_Appearance_AddPage(a, name, 0), 1))
+      return a
+    }
+    assert.equal(m._INK_Annot_SetAppearance(loupe, lensAppearance()), 1)
+    const [before] = inspectPage(doc, 0, [region])
+    assert.ok(before.textChars > 0, `${label}: page text under the region: ${JSON.stringify(before)}`)
+    assert.ok(before.annotationText > 0, `${label}: the loupe's page copy under the region: ${JSON.stringify(before)}`)
+    const mark = addMark(page, region)
+    assert.equal(applyPage(doc, page, [mark], false).result, 1)
+    m._FPDFPage_CloseAnnot(mark)
+    // A loupe drawn after the apply copies the redacted page.
+    assert.equal(m._INK_Annot_SetAppearance(loupe, lensAppearance()), 1)
+    const [after] = inspectPage(doc, 0, [region])
+    assert.deepEqual([after.textChars, after.annotationText], [0, 0], `${label}: text left after the apply: ${JSON.stringify(after)}`)
+    m._FPDFPage_CloseAnnot(loupe)
+    m._FPDF_ClosePage(page)
   })
 }
 

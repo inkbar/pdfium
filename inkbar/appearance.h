@@ -107,6 +107,8 @@ int INK_Annot_SetData(FPDF_ANNOTATION annot,
 #endif
 
 #ifdef __cplusplus
+#include <stdint.h>
+
 #include "core/fxcrt/retain_ptr.h"
 
 class CPDF_Document;
@@ -117,6 +119,9 @@ class CPDF_Stream;
 namespace inkbar {
 CPDF_Document* AppearanceDocument(const INK_APPEARANCE* a);
 RetainPtr<CPDF_Stream> AppearanceStream(const INK_APPEARANCE* a);
+// Makes the next INK_Appearance_AddPage for the page with object number
+// |page_objnum| copy the page afresh, after its content has changed.
+void ForgetPageCopy(CPDF_Document* doc, uint32_t page_objnum);
 }  // namespace inkbar
 #endif
 
