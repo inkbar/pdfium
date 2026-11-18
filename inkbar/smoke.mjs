@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 75)
+assert.equal(names.length, 77)
 
 const m = await createModule()
 for (const name of names) {
@@ -481,11 +481,100 @@ assert.deepEqual(measured.without, { rgb: 2, alpha: 2 }, 'without /Interpolate t
 assert.ok(measured.with.rgb > 2, 'with /Interpolate the enlarged image is not smoothed')
 assert.ok(measured.with.alpha > 2, 'with /Interpolate the enlarged soft mask is not smoothed')
 
+// A redact annotation removes the text under its quad and keeps the text beside it.
+function buildTextPdf(content) {
+  const stream = deflateSync(Buffer.from(content, 'latin1'))
+  const objects = [
+    Buffer.from('<< /Type /Catalog /Pages 2 0 R >>'),
+    Buffer.from('<< /Type /Pages /Kids [3 0 R] /Count 1 >>'),
+    Buffer.from('<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>'),
+    Buffer.concat([
+      Buffer.from(`<< /Length ${stream.length} /Filter /FlateDecode >>\nstream\n`),
+      stream,
+      Buffer.from('\nendstream'),
+    ]),
+    Buffer.from('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'),
+  ]
+  const parts = [Buffer.from('%PDF-1.7\n')]
+  const offsets = []
+  let length = parts[0].length
+  objects.forEach((body, i) => {
+    offsets.push(length)
+    const piece = Buffer.concat([Buffer.from(`${i + 1} 0 obj\n`), body, Buffer.from('\nendobj\n')])
+    parts.push(piece)
+    length += piece.length
+  })
+  const xref = [`xref\n0 ${objects.length + 1}\n`, '0000000000 65535 f \n']
+  for (const offset of offsets) xref.push(`${String(offset).padStart(10, '0')} 00000 n \n`)
+  xref.push(`trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${length}\n%%EOF\n`)
+  parts.push(Buffer.from(xref.join('')))
+  return Buffer.concat(parts)
+}
+
+// The bytes of |pdf| with every Flate stream inflated in place of its data.
+function inflateStreams(pdf) {
+  const text = pdf.toString('latin1')
+  const out = [text]
+  let from = 0
+  for (;;) {
+    const start = /(?<!end)stream\r?\n/g
+    start.lastIndex = from
+    const found = start.exec(text)
+    if (!found) break
+    const begin = found.index + found[0].length
+    const end = text.indexOf('endstream', begin)
+    if (end < 0) break
+    try {
+      out.push(inflateSync(pdf.subarray(begin, end)).toString('latin1'))
+    } catch {
+      // Not a Flate stream.
+    }
+    from = end
+  }
+  return out.join('\n')
+}
+
+const redactSource = buildTextPdf('BT /F1 20 Tf 50 100 Td (SECRET-ALPHA) Tj 200 0 Td (KEEP-BETA) Tj ET')
+const redactBefore = inflateStreams(redactSource)
+assert.ok(redactBefore.includes('SECRET-ALPHA') && redactBefore.includes('KEEP-BETA'), 'the setup lost its text')
+const redactOpened = load(redactSource)
+const redactPage = m._FPDF_LoadPage(redactOpened.doc, 0)
+assert.notEqual(redactPage, 0)
+const FPDF_ANNOT_REDACT = 28
+const mark = m._FPDFPage_CreateAnnot(redactPage, FPDF_ANNOT_REDACT)
+assert.notEqual(mark, 0, 'no redact annotation')
+// FS_RECTF: left, top, right, bottom. FS_QUADPOINTSF: top-left, top-right, bottom-left, bottom-right.
+const markRect = m._malloc(16)
+m.HEAPF32.set([45, 125, 195, 95], markRect / 4)
+assert.equal(m._FPDFAnnot_SetRect(mark, markRect), 1)
+m._free(markRect)
+const markQuad = m._malloc(32)
+m.HEAPF32.set([45, 125, 195, 125, 45, 95, 195, 95], markQuad / 4)
+assert.equal(m._FPDFAnnot_AppendAttachmentPoints(mark, markQuad), 1)
+m._free(markQuad)
+const removedPtr = m._malloc(4)
+assert.equal(m._EPDFPage_ApplyRedactions(redactPage, 0, 0, removedPtr), 1, 'no redaction applied')
+assert.equal(m.HEAPU32[removedPtr / 4], 0, 'the redaction removed other annotations')
+m._free(removedPtr)
+m._FPDFPage_CloseAnnot(mark)
+assert.equal(m._FPDFPage_GenerateContent(redactPage), 1)
+m._FPDF_ClosePage(redactPage)
+const redactSaved = save(redactOpened.doc)
+m._FPDF_CloseDocument(redactOpened.doc)
+m._free(redactOpened.buf)
+const redactAfter = inflateStreams(redactSaved)
+// PDFium rewrites the surviving text as a hex string, so look for both spellings.
+const shows = (text, word) => text.includes(word) || text.toUpperCase().includes(Buffer.from(word, 'latin1').toString('hex').toUpperCase())
+assert.ok(shows(redactAfter, 'KEEP-BETA'), 'the text beside the mark was removed')
+assert.ok(!shows(redactAfter, 'SECRET-ALPHA'), 'the text under the mark survived')
+assert.ok(!redactAfter.includes('/Redact'), 'the redact annotation survived')
+
 m._INK_Destroy()
 // SMOKE_OUT, SMOKE_FORM_OUT and SMOKE_IMAGE_OUT name files to receive the saved
 // documents, for qpdf --check: the appearance document, the text box, border
-// and reply one, and the enlarged images one.
+// and reply one, the enlarged images one, and SMOKE_REDACT_OUT the redacted one.
 if (process.env.SMOKE_OUT) writeFileSync(process.env.SMOKE_OUT, saved)
 if (process.env.SMOKE_FORM_OUT) writeFileSync(process.env.SMOKE_FORM_OUT, replySaved, 'latin1')
 if (process.env.SMOKE_IMAGE_OUT) writeFileSync(process.env.SMOKE_IMAGE_OUT, imagesSaved)
+if (process.env.SMOKE_REDACT_OUT) writeFileSync(process.env.SMOKE_REDACT_OUT, redactSaved)
 console.log('SMOKE_OK')

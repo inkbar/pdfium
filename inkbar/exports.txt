@@ -73,3 +73,5 @@ EPDFForm_SetFieldSelectedIndices
 EPDFForm_SetFieldWidgetsChecked
 EPDFForm_RedrawFieldWidgets
 EPDFForm_SetFieldAppearanceText
+EPDFPage_ApplyRedactions
+FPDFPage_GenerateContent
