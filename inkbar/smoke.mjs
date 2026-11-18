@@ -1217,6 +1217,121 @@ function nestedFormsPdf(levels) {
   assert.equal(region.paths, 1, `a shading the sampler cannot finish: ${JSON.stringify(region)}`)
 }
 
+const axialShading =
+  '/Shading << /Sh0 << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 400 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>'
+
+// A closed path of |points| points around the whole page: an ellipse about
+// its middle.
+function roundPath(points) {
+  const parts = []
+  for (let i = 0; i < points; i++) {
+    const angle = (2 * Math.PI * i) / points
+    parts.push(`${(200 + 300 * Math.cos(angle)).toFixed(3)} ${(100 + 160 * Math.sin(angle)).toFixed(3)} ${i ? 'l' : 'm'}`)
+  }
+  return `${parts.join(' ')} h`
+}
+
+// Nearly the whole page, and two clips that keep a shading out of it: a path
+// of |points| points that covers it, then the page with a hole (even-odd)
+// that holds it. The shading paints nothing in the region, and the redactor's
+// test says so from the second clip alone, so only the sampler reads the
+// first.
+const WIDE_RECT = [5, 5, 395, 195]
+const clippedAway = (points) => `${roundPath(points)} W n 0 0 400 200 re 3 3 394 194 re W* n /Sh0 sh`
+
+// samples a shading painted again and again under one clip once
+{
+  const source = onePagePdf(`q ${clippedAway(3000)} ${'/Sh0 sh '.repeat(2000)}Q`, { resources: axialShading })
+  const started = Date.now()
+  const [region] = withDoc(source, (doc) => inspectPage(doc, 0, [WIDE_RECT]))
+  assert.ok(Date.now() - started < 5000, 'the inspection took more than 5 s')
+  assert.equal(region.paths, 0, `shadings clipped away from the region: ${JSON.stringify(region)}`)
+}
+
+// returns NULL when a page needs more work than one inspection allows
+{
+  // The region comes from the file, as a redact annotation. The form is
+  // parsed afresh each time the page draws it, so each of its shadings has
+  // clip paths of its own and is sampled again.
+  const form = streamObject(`/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Resources << ${axialShading} >>`, clippedAway(64))
+  const [l, b, r, t] = WIDE_RECT
+  const source = onePagePdf('/Fm Do '.repeat(8000), { resources: '/XObject << /Fm 6 0 R >>', page: '/Annots [7 0 R]' }, [
+    form,
+    `<< /Type /Annot /Subtype /Redact /Rect [${l} ${b} ${r} ${t}] >>`,
+  ])
+  const started = Date.now()
+  const pointer = withDoc(source, (doc) => inspectPointer(doc, 0, []))
+  assert.ok(Date.now() - started < 10000, 'the inspection took more than 10 s')
+  assert.equal(pointer, 0, 'an inspection past its work budget returned a report')
+  // A page the budget covers still gets its report.
+  const few = onePagePdf('/Fm Do '.repeat(100), { resources: '/XObject << /Fm 6 0 R >>', page: '/Annots [7 0 R]' }, [
+    form,
+    `<< /Type /Annot /Subtype /Redact /Rect [${l} ${b} ${r} ${t}] >>`,
+  ])
+  const [mark] = withDoc(few, (doc) => inspectPage(doc, 0, []))
+  assert.equal(mark.paths, 0, `shadings clipped away from the mark: ${JSON.stringify(mark)}`)
+}
+
+// counts a shading under a strip too long to sample a point apart
+{
+  const e29 = `1${'0'.repeat(29)}.0`
+  const e28 = `1${'0'.repeat(28)}.0`
+  // As above, the shading paints nothing in the hole that holds the region.
+  // The strip is 1e27 pt long and 1 pt high: within the cap on points, but
+  // only when they lie far more than 1 pt apart.
+  const source = onePagePdf(`q 0 0 ${e29} ${e29} re 100 100 ${e28} ${e28} re W* n /Sh0 sh Q`, {
+    mediaBox: `[0 0 ${e29} ${e29}]`,
+    resources: axialShading,
+  })
+  const [region] = withDoc(source, (doc) => inspectPage(doc, 0, [[200, 200, 1e27, 201]]))
+  assert.equal(region.paths, 1, `a shading under a strip the sampler cannot cover: ${JSON.stringify(region)}`)
+  // A line through the first quad of a mark whose second quad lies 5e26 pt
+  // away: sampled over the box of both, its points would fall far apart.
+  const e26 = `5${'0'.repeat(26)}.0`
+  const e27 = `1${'0'.repeat(27)}.0`
+  const marked = onePagePdf(`0 205 m ${e28} 205 l ${e28} 305 l S`, { mediaBox: `[0 0 ${e29} ${e29}]`, page: '/Annots [6 0 R]' }, [
+    `<< /Type /Annot /Subtype /Redact /Rect [200 200 ${e27} 310] /QuadPoints [200 210 210 210 200 200 210 200 ${e26} 310 ${e27} 310 ${e26} 300 ${e27} 300] >>`,
+  ])
+  const [mark] = withDoc(marked, (doc) => inspectPage(doc, 0, []))
+  assert.equal(mark.paths, 1, `a line through one quad of a mark with two far apart: ${JSON.stringify(mark)}`)
+}
+
+// counts a shading whose place on the page is not finite
+{
+  // The matrix the form is drawn under is finite and so are the clip's
+  // points, but their products overflow one way and the other, and the sum
+  // is not a number: the clip has no box on the page.
+  const e30 = `1${'0'.repeat(30)}.0`
+  const e15 = `1${'0'.repeat(15)}.0`
+  const form = streamObject(
+    `/Type /XObject /Subtype /Form /BBox [-${e30} -${e30} ${e30} ${e30}] /Resources << ${axialShading} >>`,
+    `-${e30} -${e30} m ${e30} -${e30} l ${e30} ${e30} l -${e30} ${e30} l h W n /Sh0 sh`,
+  )
+  const source = onePagePdf(`q ${e15} 0 ${e15} ${e15} 0 0 cm /Fm Do Q`, { resources: '/XObject << /Fm 6 0 R >>' }, [form])
+  const [region] = withDoc(source, (doc) => inspectPage(doc, 0, [[180, 80, 220, 120]]))
+  assert.equal(region.paths, 1, `a shading under a matrix that overflows: ${JSON.stringify(region)}`)
+}
+
+// tags a copy of an overlay the file shares with the page
+{
+  const [l, b, r, t] = SECRET_RECT
+  // The own mark's /RO is also drawn by the page, where it shows the text
+  // beside the mark. Tagging the shared stream would hide that text from
+  // the check.
+  const source = onePagePdf(`${textContent.replace('(KEEP-BETA) Tj', '')} /Fm Do`, { page: '/Annots [6 0 R]', resources: '/XObject << /Fm 8 0 R >>' }, [
+    `<< /Type /Annot /Subtype /Redact /Rect [${l} ${b} ${r} ${t}] /QuadPoints [${quadOf(SECRET_RECT).join(' ')}] /RO 8 0 R /INKB_Gloss 7 0 R >>`,
+    streamObject('', '{"v":1}'),
+    streamObject('/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Resources << /Font << /F1 5 0 R >> >>', 'BT /F1 20 Tf 250 100 Td (KEEP-BETA) Tj ET'),
+  ])
+  const [shown] = withDoc(source, (doc) => inspectPage(doc, 0, [BETA_RECT]))
+  assert.ok(shown.textChars > 0, `the shared form's text before the apply: ${JSON.stringify(shown)}`)
+  const applied = editPage(source, (doc, page) => {
+    assert.equal(applyPage(doc, page, [], true).result, 1)
+  })
+  const [beside] = withDoc(applied, (doc) => inspectPage(doc, 0, [BETA_RECT]))
+  assert.ok(beside.textChars > 0, `the shared form's text is hidden from the check: ${JSON.stringify(beside)}`)
+}
+
 // a region too small to shrink still counts the path under it
 {
   const source = onePagePdf('0 0 1 rg 50 50 100 100 re f')

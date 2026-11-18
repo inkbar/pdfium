@@ -104,8 +104,9 @@ constexpr float kBoxLightAbove = 0.98f;
 constexpr int kFormLevelLimit = 40;
 // Regions are cut to the page grown by this much on every side.
 constexpr float kPageMargin = 10.0f;
-// A ceiling on the steps of one sampling loop, so the arithmetic stays in
-// range whatever a file holds; a page can be as large as its MediaBox says.
+// A ceiling on the steps of one sampling loop; a page can be as large as its
+// MediaBox says. A length that needs more cannot be sampled a point apart,
+// and what is sampled along it counts as present.
 constexpr double kMaxSteps = 1 << 20;
 // A ceiling on the points sampled for one object under one region. Meeting it
 // counts the object as present: the check fails closed.
@@ -120,6 +121,27 @@ constexpr size_t kMaxClipPoints = 1 << 16;
 // Patterns painted with patterns, more deeply nested than this, fail the
 // inspection rather than going unread.
 constexpr int kMaxPatternChain = 64;
+// What the sampling tests of one INK_Inspect_Page call may do, over every
+// object and region: one unit for each point they try, each clip edge they
+// test against a row of points, and each point they flatten or read. About a
+// nanosecond a unit, so a call stops within a few seconds. Past it the call
+// fails rather than report what it did not look at.
+constexpr uint64_t kWorkBudget = uint64_t{1} << 30;
+
+struct Work {
+  // Takes |units| from the budget. False once the budget has run out.
+  bool Spend(uint64_t units) {
+    if (spent || units > left) {
+      spent = true;
+      return false;
+    }
+    left -= units;
+    return true;
+  }
+
+  uint64_t left = kWorkBudget;
+  bool spent = false;
+};
 
 // -- Geometry, as cpdf_text_redactor.cpp tests glyphs ------------------------
 
@@ -200,12 +222,16 @@ bool RectMeetsAnyBBox(const CFX_FloatRect& rect,
   return false;
 }
 
-// Steps of at most 1 pt over |length|, at least one, at most kMaxSteps.
+// Steps of at most 1 pt over |length|, at least one. Zero when |length| needs
+// more than kMaxSteps or is not finite: it cannot be sampled.
 int Steps(double length) {
+  if (!std::isfinite(length) || length > kMaxSteps) {
+    return 0;
+  }
   if (!(length > 1)) {
     return 1;
   }
-  return static_cast<int>(std::min(std::ceil(length), kMaxSteps));
+  return static_cast<int>(std::ceil(length));
 }
 
 // |region| shrunk by |amount| on every side, or nullopt when nothing is
@@ -903,55 +929,99 @@ std::optional<std::vector<std::vector<CFX_PointF>>> Polygons(
   return polygons;
 }
 
-// Whether a fill of |polygons| under |fill| covers |p|: the nonzero winding
-// rule, or the even-odd rule.
-bool Covers(const std::vector<std::vector<CFX_PointF>>& polygons,
-            CFX_FillRenderOptions::FillType fill,
-            const CFX_PointF& p) {
-  int winding = 0;
-  int crossings = 0;
-  for (const std::vector<CFX_PointF>& polygon : polygons) {
-    for (size_t i = 0; i < polygon.size(); ++i) {
-      const CFX_PointF& a = polygon[i];
-      const CFX_PointF& b = polygon[(i + 1) % polygon.size()];
-      if ((a.y <= p.y) == (b.y <= p.y)) {
-        continue;
-      }
-      const float x = a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y);
-      if (x > p.x) {
-        ++crossings;
-        winding += b.y > a.y ? 1 : -1;
+bool Finite(const CFX_FloatRect& r) {
+  return std::isfinite(r.left) && std::isfinite(r.bottom) &&
+         std::isfinite(r.right) && std::isfinite(r.top);
+}
+
+bool Finite(const CFX_Matrix& m) {
+  return std::isfinite(m.a) && std::isfinite(m.b) && std::isfinite(m.c) &&
+         std::isfinite(m.d) && std::isfinite(m.e) && std::isfinite(m.f);
+}
+
+// A clip of a shading in page space, as the edges a row of points can cross.
+struct ClipEdges {
+  struct Edge {
+    CFX_PointF a;
+    CFX_PointF b;
+  };
+
+  // Adds the closed |polygon|, given in the holder's space. False when a
+  // point of it is not finite on the page.
+  bool Add(const std::vector<CFX_PointF>& polygon, const CFX_Matrix& to_page) {
+    std::vector<CFX_PointF> points;
+    points.reserve(polygon.size());
+    for (const CFX_PointF& point : polygon) {
+      points.push_back(to_page.Transform(point));
+      if (!Finite(points.back())) {
+        return false;
       }
     }
+    for (size_t i = 0; i < points.size(); ++i) {
+      const CFX_PointF& a = points[i];
+      const CFX_PointF& b = points[(i + 1) % points.size()];
+      if (edges.empty()) {
+        bottom = top = a.y;
+      }
+      bottom = std::min({bottom, a.y, b.y});
+      top = std::max({top, a.y, b.y});
+      edges.push_back({a, b});
+    }
+    return true;
   }
-  return fill == CFX_FillRenderOptions::FillType::kEvenOdd ? crossings % 2
-                                                           : winding != 0;
-}
+
+  std::vector<Edge> edges;
+  CFX_FillRenderOptions::FillType fill =
+      CFX_FillRenderOptions::FillType::kWinding;
+  // No point below |bottom| or above |top| is covered.
+  float bottom = 0;
+  float top = 0;
+};
 
 // The second test for a shading: points sampled at most 1 pt apart inside
 // the shrunk regions, each tested against the shading's box and every clip
-// path with its fill rule. Whether the shading still paints one of them.
+// path with its fill rule (the nonzero winding rule, or the even-odd rule).
+// Whether the shading still paints one of them.
+//
+// The points are taken a row at a time. Each clip's edges are crossed with
+// the row's line once, and the crossings, in order, say which of the row's
+// points the clip covers: the cost is rows times edges plus points, taken
+// from |work|. True when |work| runs out; the inspection has then failed.
 bool ShadingPaintsSample(const CPDF_ShadingObject& shading,
                          const CFX_Matrix& to_page,
-                         const std::vector<RedactRegion>& regions) {
+                         const std::vector<RedactRegion>& regions,
+                         Work* work) {
   CFX_FloatRect box = shading.GetRect();
   box.Normalize();
   CFX_FloatRect page_box = to_page.TransformRect(box);
   page_box.Normalize();
+  // A shading whose place on the page is not finite cannot be told from the
+  // regions: finite numbers can overflow under the matrix.
+  if (!Finite(to_page) || !Finite(page_box)) {
+    return true;
+  }
   // The part of each region the shading's box can paint; nothing else is
   // sampled, and nothing is flattened when there is none.
-  std::vector<std::pair<const RedactRegion*, CFX_FloatRect>> areas;
+  struct Area {
+    const RedactRegion* region;
+    CFX_FloatRect rect;
+    int columns;
+    int rows;
+  };
+  std::vector<Area> areas;
   for (const RedactRegion& region : regions) {
     CFX_FloatRect area = region.bbox;
     area.Intersect(page_box);
     if (area.IsEmpty()) {
       continue;
     }
-    if (static_cast<double>(Steps(area.Width())) * Steps(area.Height()) >
-        kMaxSamples) {
+    const int columns = Steps(area.Width());
+    const int rows = Steps(area.Height());
+    if (!columns || !rows ||
+        static_cast<double>(columns) * rows > kMaxSamples) {
       return true;
     }
-    areas.emplace_back(&region, area);
+    areas.push_back({&region, area, columns, rows});
   }
   if (areas.empty()) {
     return false;
@@ -966,6 +1036,9 @@ bool ShadingPaintsSample(const CPDF_ShadingObject& shading,
     if (points.empty()) {
       return false;
     }
+    if (!work->Spend(points.size())) {
+      return true;
+    }
     CFX_FloatRect hull(points[0].point_);
     for (const CFX_Path::Point& point : points) {
       if (!Finite(point.point_)) {
@@ -975,9 +1048,12 @@ bool ShadingPaintsSample(const CPDF_ShadingObject& shading,
     }
     CFX_FloatRect page_hull = to_page.TransformRect(hull);
     page_hull.Normalize();
+    if (!Finite(page_hull)) {
+      return true;
+    }
     bool meets = false;
-    for (const auto& [region, area] : areas) {
-      meets |= Intersects(page_hull, area);
+    for (const Area& area : areas) {
+      meets |= Intersects(page_hull, area.rect);
     }
     if (!meets) {
       return false;
@@ -993,61 +1069,108 @@ bool ShadingPaintsSample(const CPDF_ShadingObject& shading,
   if (!std::isfinite(tolerance) || !(tolerance > 0)) {
     return true;
   }
-  struct Clip {
-    std::vector<std::vector<CFX_PointF>> polygons;
-    CFX_FillRenderOptions::FillType fill;
-    CFX_FloatRect box;  // Nothing outside it is covered.
-  };
-  std::vector<Clip> clips;
+  // The shading's box first, as a clip of four edges, then its clip paths.
+  std::vector<ClipEdges> clips(1);
+  if (!clips[0].Add({CFX_PointF(box.left, box.bottom),
+                     CFX_PointF(box.right, box.bottom),
+                     CFX_PointF(box.right, box.top),
+                     CFX_PointF(box.left, box.top)},
+                    to_page)) {
+    return true;
+  }
   for (size_t i : matter) {
     std::optional<std::vector<std::vector<CFX_PointF>>> polygons =
         Polygons(clip.GetPath(i), tolerance);
     if (!polygons.has_value()) {
       return true;
     }
-    Clip entry{std::move(*polygons), clip.GetClipType(i), {}};
-    bool first = true;
-    for (const std::vector<CFX_PointF>& polygon : entry.polygons) {
-      for (const CFX_PointF& point : polygon) {
-        if (first) {
-          entry.box = CFX_FloatRect(point);
-          first = false;
-        } else {
-          entry.box.UpdateRect(point);
-        }
+    ClipEdges entry;
+    entry.fill = clip.GetClipType(i);
+    for (const std::vector<CFX_PointF>& polygon : *polygons) {
+      if (!work->Spend(polygon.size()) || !entry.Add(polygon, to_page)) {
+        return true;
       }
     }
     clips.push_back(std::move(entry));
   }
-  const CFX_Matrix to_holder = to_page.GetInverse();
-  for (const auto& [region, area] : areas) {
-    const int columns = Steps(area.Width());
-    const int rows = Steps(area.Height());
-    for (int r = 0; r < rows; ++r) {
-      for (int c = 0; c < columns; ++c) {
-        const CFX_PointF page_point(
-            area.left + (c + 0.5f) * area.Width() / columns,
-            area.bottom + (r + 0.5f) * area.Height() / rows);
-        if (!PointInside(page_point, *region)) {
-          continue;
+
+  struct Crossing {
+    float x;
+    int direction;
+  };
+  std::vector<Crossing> crossings;
+  std::vector<uint8_t> painted;
+  for (const Area& area : areas) {
+    const auto x_of = [&area](int c) {
+      return area.rect.left + (c + 0.5f) * area.rect.Width() / area.columns;
+    };
+    painted.resize(area.columns);
+    for (int r = 0; r < area.rows; ++r) {
+      const float y =
+          area.rect.bottom + (r + 0.5f) * area.rect.Height() / area.rows;
+      if (!work->Spend(area.columns)) {
+        return true;
+      }
+      // The row's points inside the region; each clip then takes away the
+      // ones it does not cover, and the first that leaves none ends the row.
+      int left = 0;
+      for (int c = 0; c < area.columns; ++c) {
+        painted[c] = PointInside(CFX_PointF(x_of(c), y), *area.region);
+        left += painted[c];
+      }
+      for (const ClipEdges& entry : clips) {
+        if (!left) {
+          break;
         }
-        const CFX_PointF p = to_holder.Transform(page_point);
-        if (p.x < box.left || p.x > box.right || p.y < box.bottom ||
-            p.y > box.top) {
-          continue;
+        if (entry.edges.empty() || y < entry.bottom || y > entry.top) {
+          left = 0;
+          break;
         }
-        // Painted when every clip covers it; the first that does not ends it.
-        bool painted = true;
-        for (const Clip& c : clips) {
-          if (p.x < c.box.left || p.x > c.box.right || p.y < c.box.bottom ||
-              p.y > c.box.top || !Covers(c.polygons, c.fill, p)) {
-            painted = false;
-            break;
-          }
-        }
-        if (painted) {
+        if (!work->Spend(entry.edges.size() + area.columns)) {
           return true;
         }
+        crossings.clear();
+        int winding = 0;
+        for (const ClipEdges::Edge& edge : entry.edges) {
+          const CFX_PointF& a = edge.a;
+          const CFX_PointF& b = edge.b;
+          if ((a.y <= y) == (b.y <= y)) {
+            continue;
+          }
+          const float x = a.x + (y - a.y) * (b.x - a.x) / (b.y - a.y);
+          if (!std::isfinite(x)) {
+            return true;
+          }
+          const int direction = b.y > a.y ? 1 : -1;
+          crossings.push_back({x, direction});
+          winding += direction;
+        }
+        // Sorting n crossings takes about n log n steps, and a clip has at
+        // most 2^16 points.
+        if (!work->Spend(crossings.size() * 16)) {
+          return true;
+        }
+        std::sort(crossings.begin(), crossings.end(),
+                  [](const Crossing& p, const Crossing& q) { return p.x < q.x; });
+        // A point is covered by what the crossings to its right add up to.
+        size_t passed = 0;
+        left = 0;
+        for (int c = 0; c < area.columns; ++c) {
+          const float x = x_of(c);
+          while (passed < crossings.size() && crossings[passed].x <= x) {
+            winding -= crossings[passed].direction;
+            ++passed;
+          }
+          const bool covered =
+              entry.fill == CFX_FillRenderOptions::FillType::kEvenOdd
+                  ? (crossings.size() - passed) % 2
+                  : winding != 0;
+          painted[c] = painted[c] && covered;
+          left += painted[c];
+        }
+      }
+      if (left) {
+        return true;
       }
     }
   }
@@ -1155,6 +1278,8 @@ struct Context {
   // Without regions the tag is not trusted.
   const bool strict;
   bool failed = false;
+  // What the sampling tests may still do. Once spent, the inspection fails.
+  Work work;
 };
 
 void IndexHolder(CPDF_PageObjectHolder* holder,
@@ -1228,13 +1353,13 @@ std::optional<std::pair<CFX_PointF, CFX_PointF>> ClipSegment(
 template <typename Visit>
 class PathSampler {
  public:
-  PathSampler(const CFX_FloatRect& clip, Visit visit)
-      : clip_(clip), visit_(std::move(visit)) {}
+  PathSampler(const CFX_FloatRect& clip, Visit visit, Work* work)
+      : clip_(clip), visit_(std::move(visit)), work_(work) {}
 
-  // Whether |p| counts, and true once kMaxSamples points have been tried:
-  // the path then counts as present.
+  // Whether |p| counts, and true once kMaxSamples points have been tried,
+  // when the path counts as present, or once |work_| has run out.
   bool Try(const CFX_PointF& p) {
-    if (++samples_ > kMaxSamples) {
+    if (++samples_ > kMaxSamples || !work_->Spend(1)) {
       return true;
     }
     return visit_(p);
@@ -1289,6 +1414,9 @@ class PathSampler {
     const CFX_PointF& from = part->first;
     const CFX_PointF& to = part->second;
     const int steps = Steps(std::hypot(to.x - from.x, to.y - from.y));
+    if (!steps) {
+      return true;
+    }
     for (int k = 0; k <= steps; ++k) {
       const float t = static_cast<float>(k) / steps;
       if (Try(CFX_PointF(from.x + (to.x - from.x) * t,
@@ -1328,6 +1456,7 @@ class PathSampler {
 
   const CFX_FloatRect clip_;
   Visit visit_;
+  Work* const work_;
   double samples_ = 0;
 };
 
@@ -1347,6 +1476,9 @@ class Walker {
     }
     const bool page = scope == Scope::kPage;
     for (auto it = holder->begin(); it != holder->end(); ++it) {
+      if (context_->work.spent) {
+        return;
+      }
       CPDF_PageObject* object = it->get();
       if (!object->IsActive() || object == entry_->own_object) {
         continue;
@@ -1395,8 +1527,7 @@ class Walker {
           ++entry_->counts.paths;
         }
       } else if (CPDF_ShadingObject* shading = object->AsShading()) {
-        if (page && (ShadingCrosses(*redactor_, *shading, to_page) ||
-                     ShadingPaintsSample(*shading, to_page, entry_->second))) {
+        if (page && ShadingCounts(*shading, to_page)) {
           ++entry_->counts.paths;
         }
       }
@@ -1427,8 +1558,44 @@ class Walker {
     auto inside = [this](const CFX_PointF& p) {
       return PointInsideAny(p, entry_->second);
     };
-    PathSampler<decltype(inside)> sampler(*clip, inside);
+    PathSampler<decltype(inside)> sampler(*clip, inside, &context_->work);
     return sampler.Run(path.path(), path.matrix() * to_page);
+  }
+
+  // Whether a shading counts: either test finds it. Both tests read only the
+  // shading's box, its clip paths and the matrix, so shadings alike in all
+  // three, such as one painted again and again under one clip, are tested
+  // once.
+  bool ShadingCounts(const CPDF_ShadingObject& shading,
+                     const CFX_Matrix& to_page) {
+    const CPDF_ClipPath& clip = shading.clip_path();
+    const size_t paths = clip.HasRef() ? clip.GetPathCount() : 0;
+    if (!context_->work.Spend(1 + paths)) {
+      return true;
+    }
+    const CFX_FloatRect rect = shading.GetRect();
+    const float numbers[10] = {rect.left, rect.bottom, rect.right, rect.top,
+                               to_page.a, to_page.b,   to_page.c,  to_page.d,
+                               to_page.e, to_page.f};
+    ShadingKey key;
+    // By their bits: a number that is not finite has no order.
+    memcpy(key.first.data(), numbers, sizeof(numbers));
+    for (size_t i = 0; i < paths; ++i) {
+      key.second.emplace_back(clip.GetPath(i).GetObject(),
+                              static_cast<int>(clip.GetClipType(i)));
+    }
+    auto it = shadings_.find(key);
+    if (it != shadings_.end()) {
+      return it->second.second;
+    }
+    const bool counts =
+        ShadingCrosses(*redactor_, shading, to_page) ||
+        ShadingPaintsSample(shading, to_page, entry_->second, &context_->work);
+    if (!context_->work.spent) {
+      // The clip is kept, so its paths' addresses stay its own.
+      shadings_.emplace(std::move(key), std::make_pair(clip, counts));
+    }
+    return counts;
   }
 
   bool Before(const CPDF_PageObject* object) const {
@@ -1585,9 +1752,15 @@ class Walker {
                        context_->strict);
   }
 
+  // A shading's box and matrix, and its clip paths with their fill rules.
+  using ShadingKey =
+      std::pair<std::array<uint32_t, 10>,
+                std::vector<std::pair<const CFX_Path*, int>>>;
+
   Entry* const entry_;
   const CPDF_PathRedactor* const redactor_;
   Context* const context_;
+  std::map<ShadingKey, std::pair<CPDF_ClipPath, bool>> shadings_;
 };
 
 // The second test for page text: the boxes PDFium's text extraction gives
@@ -1832,6 +2005,11 @@ void Inspect(Context* context, Entry* entry) {
           CFX_FloatRect(0, 0, size.width, size.height));
   page_box.Normalize();
   page_box.Inflate(kPageMargin, kPageMargin);
+  if (!Finite(page_box)) {
+    // No region can be held to it, and none may be dropped for missing it.
+    context->failed = true;
+    return;
+  }
   std::vector<RedactRegion> held;
   for (const RedactRegion& region : entry->regions) {
     if (!Intersects(region.bbox, page_box)) {
@@ -1864,6 +2042,10 @@ void Inspect(Context* context, Entry* entry) {
   }
   Walker walker(entry, redactor.get(), context);
   walker.Holder(page, CFX_Matrix(), Scope::kPage, true, 0);
+  if (context->work.spent) {
+    context->failed = true;
+    return;
+  }
   entry->counts.text_chars_second = ExtractedChars(context, *entry);
 
   const size_t content = context->index.content_count;
@@ -2151,6 +2333,11 @@ char* INK_Inspect_Page(FPDF_DOCUMENT doc,
     }
     for (Entry& entry : entries) {
       Inspect(&context, &entry);
+      if (context.work.spent) {
+        // Out of work: the rest goes unread, and the call fails.
+        context.failed = true;
+        break;
+      }
     }
     if (!context.failed) {
       report = PageReport(entries);
