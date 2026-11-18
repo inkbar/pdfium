@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -31,6 +32,7 @@
 #include "core/fpdfapi/page/cpdf_clippath.h"
 #include "core/fpdfapi/page/cpdf_color.h"
 #include "core/fpdfapi/page/cpdf_colorstate.h"
+#include "core/fpdfapi/page/cpdf_dib.h"
 #include "core/fpdfapi/page/cpdf_form.h"
 #include "core/fpdfapi/page/cpdf_formobject.h"
 #include "core/fpdfapi/page/cpdf_generalstate.h"
@@ -278,59 +280,87 @@ class Band {
   int max_[3] = {0, 0, 0};
 };
 
-// Whether the samples of |image| the regions cover are one value. An image
-// that cannot be decoded is not blank.
-bool ImageBlank(const CPDF_ImageObject* object,
-                const CFX_Matrix& to_page,
-                const std::vector<RedactRegion>& regions) {
-  RetainPtr<CPDF_Image> image = object->GetImage();
-  RetainPtr<const CPDF_Dictionary> dict = image ? image->GetDict() : nullptr;
-  if (!dict) {
-    return false;
+// An image's or a mask's samples, decoded once per inspection: BGR (three or
+// four bytes a pixel), or a mask format (1 or 8 bits a sample).
+struct Samples {
+  RetainPtr<const CFX_DIBBase> dib;  // Null when it could not be decoded.
+  int tolerance = 0;
+};
+
+class SampleCache {
+ public:
+  explicit SampleCache(CPDF_Document* doc) : doc_(doc) {}
+
+  const Samples& Get(RetainPtr<const CPDF_Stream> stream) {
+    auto it = cache_.find(stream.Get());
+    if (it != cache_.end()) {
+      return it->second;
+    }
+    Samples samples;
+    samples.tolerance = Tolerance(stream->GetDict().Get());
+    samples.dib = Decode(stream);
+    // The cache holds the stream, so its address names it for the call.
+    streams_.push_back(stream);
+    return cache_.emplace(stream.Get(), std::move(samples)).first->second;
   }
-  RetainPtr<CFX_DIBBase> dib = image->LoadDIBBase();
+
+ private:
+  RetainPtr<const CFX_DIBBase> Decode(RetainPtr<const CPDF_Stream> stream) {
+    auto dib = pdfium::MakeRetain<CPDF_DIB>(doc_, std::move(stream));
+    if (!dib->Load()) {
+      return nullptr;
+    }
+    if (dib->IsJBigImage()) {
+      CPDF_DIB::LoadState state = CPDF_DIB::LoadState::kContinue;
+      while (state == CPDF_DIB::LoadState::kContinue) {
+        state = dib->ContinueLoadDIBBase(nullptr);
+      }
+      if (state != CPDF_DIB::LoadState::kSuccess) {
+        return nullptr;
+      }
+    }
+    const FXDIB_Format format = dib->GetFormat();
+    if (dib->IsMaskFormat() || format == FXDIB_Format::kBgr ||
+        format == FXDIB_Format::kBgrx || format == FXDIB_Format::kBgra) {
+      return dib->Realize();
+    }
+    return dib->ConvertTo(FXDIB_Format::kBgr);
+  }
+
+  CPDF_Document* const doc_;
+  std::vector<RetainPtr<const CPDF_Stream>> streams_;
+  std::map<const CPDF_Stream*, Samples> cache_;
+};
+
+// Whether the samples of |samples| over the regions, on its own grid, are
+// one value. Samples that could not be decoded are not.
+bool SamplesFlat(const Samples& samples,
+                 const CFX_Matrix& image_to_page,
+                 const std::vector<RedactRegion>& regions) {
+  const CFX_DIBBase* dib = samples.dib.Get();
   if (!dib) {
     return false;
   }
   const int width = dib->GetWidth();
   const int height = dib->GetHeight();
   const std::vector<GridBox> boxes =
-      GridBoxes(object->matrix() * to_page, width, height, regions);
-  if (boxes.empty()) {
-    return true;
-  }
-  Band band(Tolerance(dict.Get()));
-  if (dib->IsMaskFormat()) {
-    const bool one_bit = dib->GetBPP() == 1;
-    for (const GridBox& b : boxes) {
-      for (int y = b.y0; y < b.y1 && band.flat(); ++y) {
-        pdfium::span<const uint8_t> row = dib->GetScanline(height - 1 - y);
-        for (int x = b.x0; x < b.x1; ++x) {
+      GridBoxes(image_to_page, width, height, regions);
+  Band band(samples.tolerance);
+  const bool mask = dib->IsMaskFormat();
+  const bool one_bit = dib->GetBPP() == 1;
+  const size_t bytes = mask ? 1 : dib->GetBPP() / 8;
+  for (const GridBox& b : boxes) {
+    for (int y = b.y0; y < b.y1 && band.flat(); ++y) {
+      pdfium::span<const uint8_t> row = dib->GetScanline(height - 1 - y);
+      for (int x = b.x0; x < b.x1; ++x) {
+        if (mask) {
           const size_t at = one_bit ? x / 8 : x;
           if (at >= row.size()) {
             return false;
           }
           band.Add(0, one_bit ? (row[at] >> (7 - x % 8)) & 1 : row[at]);
+          continue;
         }
-      }
-    }
-    return band.flat();
-  }
-  // Colour samples as BGR, three or four bytes a pixel.
-  RetainPtr<const CFX_DIBBase> rgb = dib;
-  const FXDIB_Format format = dib->GetFormat();
-  if (format != FXDIB_Format::kBgr && format != FXDIB_Format::kBgrx &&
-      format != FXDIB_Format::kBgra) {
-    rgb = dib->ConvertTo(FXDIB_Format::kBgr);
-    if (!rgb) {
-      return false;
-    }
-  }
-  const size_t bytes = rgb->GetBPP() / 8;
-  for (const GridBox& b : boxes) {
-    for (int y = b.y0; y < b.y1 && band.flat(); ++y) {
-      pdfium::span<const uint8_t> row = rgb->GetScanline(height - 1 - y);
-      for (int x = b.x0; x < b.x1; ++x) {
         const size_t at = static_cast<size_t>(x) * bytes;
         if (at + 2 >= row.size()) {
           return false;
@@ -342,6 +372,31 @@ bool ImageBlank(const CPDF_ImageObject* object,
     }
   }
   return band.flat();
+}
+
+// Whether an image is blank under the regions: its own samples, and those of
+// its /SMask and of a stream /Mask, each on its own grid.
+bool ImageBlank(SampleCache* cache,
+                const CPDF_ImageObject* object,
+                const CFX_Matrix& to_page,
+                const std::vector<RedactRegion>& regions) {
+  RetainPtr<CPDF_Image> image = object->GetImage();
+  RetainPtr<const CPDF_Stream> stream = image ? image->GetStream() : nullptr;
+  if (!stream) {
+    return false;
+  }
+  const CFX_Matrix image_to_page = object->matrix() * to_page;
+  if (!SamplesFlat(cache->Get(stream), image_to_page, regions)) {
+    return false;
+  }
+  RetainPtr<const CPDF_Dictionary> dict = stream->GetDict();
+  for (const char* key : {"SMask", "Mask"}) {
+    RetainPtr<const CPDF_Stream> mask = dict->GetStreamFor(key);
+    if (mask && !SamplesFlat(cache->Get(mask), image_to_page, regions)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // -- Paths -------------------------------------------------------------------
@@ -486,8 +541,8 @@ enum class Scope {
 
 class Walker {
  public:
-  Walker(Entry* entry, const CPDF_PathRedactor* redactor)
-      : entry_(entry), redactor_(redactor) {}
+  Walker(Entry* entry, const CPDF_PathRedactor* redactor, SampleCache* samples)
+      : entry_(entry), redactor_(redactor), samples_(samples) {}
 
   void Holder(CPDF_PageObjectHolder* holder,
               const CFX_Matrix& to_page,
@@ -609,7 +664,7 @@ class Walker {
     if (!RectMeetsAnyBBox(box, entry_->regions)) {
       return false;
     }
-    return !ImageBlank(&image, to_page, entry_->regions);
+    return !ImageBlank(samples_, &image, to_page, entry_->regions);
   }
 
   // Characters and images anywhere in a pattern's content.
@@ -635,6 +690,7 @@ class Walker {
 
   Entry* const entry_;
   const CPDF_PathRedactor* const redactor_;
+  SampleCache* const samples_;
 };
 
 // The appearance of an annotation, parsed, and the matrix that places it on
@@ -787,7 +843,7 @@ std::vector<Entry> FindCandidates(CPDF_Page* page) {
   return entries;
 }
 
-void Inspect(CPDF_Page* page, Entry* entry) {
+void Inspect(CPDF_Page* page, Entry* entry, SampleCache* samples) {
   std::vector<RedactRegion> inset;
   for (const RedactRegion& region : entry->regions) {
     std::optional<RedactRegion> shrunk = Inset(region);
@@ -802,7 +858,7 @@ void Inspect(CPDF_Page* page, Entry* entry) {
       redactor.reset();
     }
   }
-  Walker walker(entry, redactor.get());
+  Walker walker(entry, redactor.get(), samples);
   walker.Holder(page, CFX_Matrix(), Scope::kPage, true, 0);
 
   RetainPtr<const CPDF_Array> annots = page->GetAnnotsArray();
@@ -977,8 +1033,9 @@ char* INK_Inspect_Page(FPDF_DOCUMENT doc,
     if (count == 0) {
       entries = FindCandidates(page);
     }
+    SampleCache samples(page->GetDocument());
     for (Entry& entry : entries) {
-      Inspect(page, &entry);
+      Inspect(page, &entry, &samples);
     }
     report = PageReport(entries);
   }

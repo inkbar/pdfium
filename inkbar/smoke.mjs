@@ -846,6 +846,40 @@ const textContent = 'BT /F1 20 Tf 50 100 Td (SECRET-ALPHA) Tj 200 0 Td (KEEP-BET
   })
 }
 
+// inspects an image whose shape is only in its masks
+{
+  const black = Buffer.alloc(16 * 16 * 3)
+  const shape = Buffer.alloc(16 * 16)
+  for (let i = 0; i < 256; i++) shape[i] = (i % 16) * 16
+  // A 1-bit stencil mask: a checkerboard of 2-sample squares, 2 bytes a row.
+  const stencil = Buffer.alloc(16 * 2)
+  for (let y = 0; y < 16; y++) stencil.fill(Math.floor(y / 2) % 2 ? 0x33 : 0xcc, y * 2, y * 2 + 2)
+  const rgb = '/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8'
+  const source = onePagePdf(
+    'q 100 0 0 100 50 50 cm /Im0 Do Q q 100 0 0 100 250 50 cm /Im1 Do Q',
+    { resources: '/XObject << /Im0 6 0 R /Im1 8 0 R >>' },
+    [
+      streamObject(`${rgb} /SMask 7 0 R`, black),
+      streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 8', shape),
+      streamObject(`${rgb} /Mask 9 0 R`, black),
+      streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ImageMask true /BitsPerComponent 1', stencil),
+    ],
+  )
+  const regions = [
+    [60, 60, 100, 100],
+    [260, 60, 300, 100],
+  ]
+  const before = withDoc(source, (doc) => inspectPage(doc, 0, regions))
+  assert.deepEqual(before.map((r) => r.imagesNotBlank), [1, 1], `masks under the regions: ${JSON.stringify(before)}`)
+  const applied = editPage(source, (doc, page) => {
+    const marks = regions.map((r) => addMark(page, r))
+    assert.equal(applyPage(doc, page, marks, false).result, 1)
+    marks.forEach((mark) => m._FPDFPage_CloseAnnot(mark))
+  })
+  const after = withDoc(applied, (doc) => inspectPage(doc, 0, regions))
+  assert.deepEqual(after.map((r) => r.imagesNotBlank), [0, 0], `mask samples left under the marks: ${JSON.stringify(after)}`)
+}
+
 // inspects a path under a region
 {
   const source = onePagePdf('0 0 1 rg 50 50 100 100 re f q 200 50 100 100 re W n /Sh0 sh Q', {
