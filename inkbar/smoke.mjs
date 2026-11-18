@@ -1181,6 +1181,42 @@ function nestedFormsPdf(levels) {
   assert.equal(region.paths, 1, `a shading under a curved clip: ${JSON.stringify(region)}`)
 }
 
+// gives up on a shading clip too large to flatten, and counts the shading
+{
+  const big = `1${'0'.repeat(20)}.0`
+  // Under a cm scaling by 1e15, three hundred curves out to 1e20 and back,
+  // each looping through the region.
+  const loops = Array.from({ length: 300 }, () => `${big} ${big} -${big} -${big} 0.0000000000002 0.0000000000001 c`).join(' ')
+  const source = onePagePdf(
+    `q 1000000000000000.0 0 0 1000000000000000.0 0 0 cm 0.0000000000002 0.0000000000001 m ${loops} h W n /Sh0 sh Q`,
+    {
+      resources:
+        '/Shading << /Sh0 << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 1 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>',
+    },
+  )
+  const started = Date.now()
+  const [region] = withDoc(source, (doc) => inspectPage(doc, 0, [[180, 80, 220, 120]]))
+  assert.ok(Date.now() - started < 5000, 'the inspection took more than 5 s')
+  assert.ok(region.paths > 0, `a shading under huge curved clips: ${JSON.stringify(region)}`)
+}
+
+// caps the samples under a region on an enormous page, and counts what it cannot finish
+{
+  const e29 = `1${'0'.repeat(29)}.0`
+  const e28 = `1${'0'.repeat(28)}.0`
+  // A shading over the whole page, clipped to the page with a hole cut out
+  // (even-odd) that holds the region: it paints nothing there, but proving
+  // that would take far more samples than the cap allows.
+  const source = onePagePdf(`q 0 0 ${e29} ${e29} re W n 0 0 ${e29} ${e29} re 100 100 ${e28} ${e28} re W* n /Sh0 sh Q`, {
+    mediaBox: `[0 0 ${e29} ${e29}]`,
+    resources: '/Shading << /Sh0 << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 1 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>',
+  })
+  const started = Date.now()
+  const [region] = withDoc(source, (doc) => inspectPage(doc, 0, [[200, 200, 1e27, 1e27]]))
+  assert.ok(Date.now() - started < 5000, 'the inspection took more than 5 s')
+  assert.equal(region.paths, 1, `a shading the sampler cannot finish: ${JSON.stringify(region)}`)
+}
+
 // a region too small to shrink still counts the path under it
 {
   const source = onePagePdf('0 0 1 rg 50 50 100 100 re f')

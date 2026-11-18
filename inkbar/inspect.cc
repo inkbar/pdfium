@@ -104,11 +104,19 @@ constexpr float kBoxLightAbove = 0.98f;
 constexpr int kFormLevelLimit = 40;
 // Regions are cut to the page grown by this much on every side.
 constexpr float kPageMargin = 10.0f;
-// A ceiling on the steps of any sampling loop, so the arithmetic stays in
-// range whatever a file holds. Regions held to the page never reach it.
+// A ceiling on the steps of one sampling loop, so the arithmetic stays in
+// range whatever a file holds; a page can be as large as its MediaBox says.
 constexpr double kMaxSteps = 1 << 20;
-// A shading's curved clips are flattened to within this many points.
+// A ceiling on the points sampled for one object under one region. Meeting it
+// counts the object as present: the check fails closed.
+constexpr double kMaxSamples = 1 << 22;
+// A shading's curved clips are flattened to within this many points, each
+// curve split at most kMaxCurveDepth times and each clip into at most
+// kMaxClipPoints points. Meeting either limit, or a coordinate that is not
+// finite, counts the shading as painting the region.
 constexpr float kCurveTolerance = 0.25f;
+constexpr int kMaxCurveDepth = 8;
+constexpr size_t kMaxClipPoints = 1 << 16;
 // Patterns painted with patterns, more deeply nested than this, fail the
 // inspection rather than going unread.
 constexpr int kMaxPatternChain = 64;
@@ -803,15 +811,24 @@ bool ShadingCrosses(const CPDF_PathRedactor& redactor,
   return true;
 }
 
+bool Finite(const CFX_PointF& p) {
+  return std::isfinite(p.x) && std::isfinite(p.y);
+}
+
 // Appends the cubic |p0| .. |p3| to |polygon| as lines, split until every
-// line lies within |tolerance| of the curve.
-void FlattenCubic(const CFX_PointF& p0,
+// line lies within |tolerance| of the curve. False when that needs more than
+// kMaxCurveDepth splits or kMaxClipPoints points, or meets a coordinate that
+// is not finite.
+bool FlattenCubic(const CFX_PointF& p0,
                   const CFX_PointF& p1,
                   const CFX_PointF& p2,
                   const CFX_PointF& p3,
                   float tolerance,
                   int depth,
                   std::vector<CFX_PointF>* polygon) {
+  if (!Finite(p0) || !Finite(p1) || !Finite(p2) || !Finite(p3)) {
+    return false;
+  }
   // The control points' distance from the chord bounds the curve's.
   const CFX_PointF chord = p3 - p0;
   const float length = std::hypot(chord.x, chord.y);
@@ -822,9 +839,20 @@ void FlattenCubic(const CFX_PointF& p0,
     return std::fabs(chord.x * (q.y - p0.y) - chord.y * (q.x - p0.x)) /
            length;
   };
-  if ((away(p1) <= tolerance && away(p2) <= tolerance) || depth >= 20) {
+  const float d1 = away(p1);
+  const float d2 = away(p2);
+  if (!std::isfinite(d1) || !std::isfinite(d2)) {
+    return false;
+  }
+  if (d1 <= tolerance && d2 <= tolerance) {
+    if (polygon->size() >= kMaxClipPoints) {
+      return false;
+    }
     polygon->push_back(p3);
-    return;
+    return true;
+  }
+  if (depth >= kMaxCurveDepth) {
+    return false;
   }
   const CFX_PointF a((p0.x + p1.x) / 2, (p0.y + p1.y) / 2);
   const CFX_PointF b((p1.x + p2.x) / 2, (p1.y + p2.y) / 2);
@@ -832,34 +860,45 @@ void FlattenCubic(const CFX_PointF& p0,
   const CFX_PointF ab((a.x + b.x) / 2, (a.y + b.y) / 2);
   const CFX_PointF bc((b.x + c.x) / 2, (b.y + c.y) / 2);
   const CFX_PointF mid((ab.x + bc.x) / 2, (ab.y + bc.y) / 2);
-  FlattenCubic(p0, a, ab, mid, tolerance, depth + 1, polygon);
-  FlattenCubic(mid, bc, c, p3, tolerance, depth + 1, polygon);
+  return FlattenCubic(p0, a, ab, mid, tolerance, depth + 1, polygon) &&
+         FlattenCubic(mid, bc, c, p3, tolerance, depth + 1, polygon);
 }
 
 // The subpaths of |path| as closed polygons, in the path's own space, its
-// curves cut into lines within |tolerance| of them.
-std::vector<std::vector<CFX_PointF>> Polygons(const CPDF_Path& path,
-                                              float tolerance) {
+// curves cut into lines within |tolerance| of them. Nullopt when a limit of
+// FlattenCubic() is met.
+std::optional<std::vector<std::vector<CFX_PointF>>> Polygons(
+    const CPDF_Path& path,
+    float tolerance) {
   std::vector<std::vector<CFX_PointF>> polygons;
+  size_t total = 0;
   const std::vector<CFX_Path::Point>& points = path.GetPoints();
   for (size_t i = 0; i < points.size(); ++i) {
     const CFX_Path::Point& point = points[i];
+    if (!Finite(point.point_)) {
+      return std::nullopt;
+    }
     if (point.type_ == CFX_Path::Point::Type::kMove || polygons.empty()) {
       polygons.emplace_back();
       polygons.back().push_back(point.point_);
-      continue;
+    } else if (point.type_ == CFX_Path::Point::Type::kLine) {
+      polygons.back().push_back(point.point_);
+    } else {
+      if (i + 2 >= points.size()) {
+        break;
+      }
+      std::vector<CFX_PointF>& polygon = polygons.back();
+      const size_t before = polygon.size();
+      if (!FlattenCubic(polygon.back(), point.point_, points[i + 1].point_,
+                        points[i + 2].point_, tolerance, 0, &polygon)) {
+        return std::nullopt;
+      }
+      total += polygon.size() - before;
+      i += 2;
     }
-    std::vector<CFX_PointF>& polygon = polygons.back();
-    if (point.type_ == CFX_Path::Point::Type::kLine) {
-      polygon.push_back(point.point_);
-      continue;
+    if (++total > kMaxClipPoints) {
+      return std::nullopt;
     }
-    if (i + 2 >= points.size()) {
-      break;
-    }
-    FlattenCubic(polygon.back(), point.point_, points[i + 1].point_,
-                 points[i + 2].point_, tolerance, 0, &polygon);
-    i += 2;
   }
   return polygons;
 }
@@ -899,20 +938,74 @@ bool ShadingPaintsSample(const CPDF_ShadingObject& shading,
   box.Normalize();
   CFX_FloatRect page_box = to_page.TransformRect(box);
   page_box.Normalize();
-  const CFX_Matrix to_holder = to_page.GetInverse();
-  // Curves are flattened to within a quarter point on the page.
-  const float stretch = std::max({std::hypot(to_page.a, to_page.b),
-                                  std::hypot(to_page.c, to_page.d), 1e-6f});
+  // The part of each region the shading's box can paint; nothing else is
+  // sampled, and nothing is flattened when there is none.
+  std::vector<std::pair<const RedactRegion*, CFX_FloatRect>> areas;
+  for (const RedactRegion& region : regions) {
+    CFX_FloatRect area = region.bbox;
+    area.Intersect(page_box);
+    if (area.IsEmpty()) {
+      continue;
+    }
+    if (static_cast<double>(Steps(area.Width())) * Steps(area.Height()) >
+        kMaxSamples) {
+      return true;
+    }
+    areas.emplace_back(&region, area);
+  }
+  if (areas.empty()) {
+    return false;
+  }
+  // A clip whose control points' box misses every area keeps the shading
+  // off all of them; only clips that can matter are flattened.
+  const CPDF_ClipPath& clip = shading.clip_path();
+  std::vector<size_t> matter;
+  for (size_t i = 0; clip.HasRef() && i < clip.GetPathCount(); ++i) {
+    const CPDF_Path path = clip.GetPath(i);
+    const std::vector<CFX_Path::Point>& points = path.GetPoints();
+    if (points.empty()) {
+      return false;
+    }
+    CFX_FloatRect hull(points[0].point_);
+    for (const CFX_Path::Point& point : points) {
+      if (!Finite(point.point_)) {
+        return true;
+      }
+      hull.UpdateRect(point.point_);
+    }
+    CFX_FloatRect page_hull = to_page.TransformRect(hull);
+    page_hull.Normalize();
+    bool meets = false;
+    for (const auto& [region, area] : areas) {
+      meets |= Intersects(page_hull, area);
+    }
+    if (!meets) {
+      return false;
+    }
+    matter.push_back(i);
+  }
+  // Curves are flattened to within a quarter point on the page; the
+  // matrix's Frobenius norm bounds how far it can stretch a distance.
+  const float stretch =
+      std::sqrt(to_page.a * to_page.a + to_page.b * to_page.b +
+                to_page.c * to_page.c + to_page.d * to_page.d);
   const float tolerance = kCurveTolerance / stretch;
+  if (!std::isfinite(tolerance) || !(tolerance > 0)) {
+    return true;
+  }
   struct Clip {
     std::vector<std::vector<CFX_PointF>> polygons;
     CFX_FillRenderOptions::FillType fill;
     CFX_FloatRect box;  // Nothing outside it is covered.
   };
   std::vector<Clip> clips;
-  const CPDF_ClipPath& clip = shading.clip_path();
-  for (size_t i = 0; clip.HasRef() && i < clip.GetPathCount(); ++i) {
-    Clip entry{Polygons(clip.GetPath(i), tolerance), clip.GetClipType(i), {}};
+  for (size_t i : matter) {
+    std::optional<std::vector<std::vector<CFX_PointF>>> polygons =
+        Polygons(clip.GetPath(i), tolerance);
+    if (!polygons.has_value()) {
+      return true;
+    }
+    Clip entry{std::move(*polygons), clip.GetClipType(i), {}};
     bool first = true;
     for (const std::vector<CFX_PointF>& polygon : entry.polygons) {
       for (const CFX_PointF& point : polygon) {
@@ -926,12 +1019,8 @@ bool ShadingPaintsSample(const CPDF_ShadingObject& shading,
     }
     clips.push_back(std::move(entry));
   }
-  for (const RedactRegion& region : regions) {
-    CFX_FloatRect area = region.bbox;
-    area.Intersect(page_box);
-    if (area.IsEmpty()) {
-      continue;
-    }
+  const CFX_Matrix to_holder = to_page.GetInverse();
+  for (const auto& [region, area] : areas) {
     const int columns = Steps(area.Width());
     const int rows = Steps(area.Height());
     for (int r = 0; r < rows; ++r) {
@@ -939,7 +1028,7 @@ bool ShadingPaintsSample(const CPDF_ShadingObject& shading,
         const CFX_PointF page_point(
             area.left + (c + 0.5f) * area.Width() / columns,
             area.bottom + (r + 0.5f) * area.Height() / rows);
-        if (!PointInside(page_point, region)) {
+        if (!PointInside(page_point, *region)) {
           continue;
         }
         const CFX_PointF p = to_holder.Transform(page_point);
@@ -1142,6 +1231,15 @@ class PathSampler {
   PathSampler(const CFX_FloatRect& clip, Visit visit)
       : clip_(clip), visit_(std::move(visit)) {}
 
+  // Whether |p| counts, and true once kMaxSamples points have been tried:
+  // the path then counts as present.
+  bool Try(const CFX_PointF& p) {
+    if (++samples_ > kMaxSamples) {
+      return true;
+    }
+    return visit_(p);
+  }
+
   bool Run(const CPDF_Path& path, const CFX_Matrix& to_page) {
     const std::vector<CFX_Path::Point>& points = path.GetPoints();
     CFX_PointF start;
@@ -1151,7 +1249,7 @@ class PathSampler {
       const CFX_PointF p = to_page.Transform(point.point_);
       if (point.type_ == CFX_Path::Point::Type::kMove) {
         start = current = p;
-        if (visit_(p)) {
+        if (Try(p)) {
           return true;
         }
       } else if (point.type_ == CFX_Path::Point::Type::kLine) {
@@ -1180,7 +1278,7 @@ class PathSampler {
 
  private:
   bool Line(const CFX_PointF& a, const CFX_PointF& b) {
-    if (visit_(b)) {
+    if (Try(b)) {
       return true;
     }
     std::optional<std::pair<CFX_PointF, CFX_PointF>> part =
@@ -1193,7 +1291,7 @@ class PathSampler {
     const int steps = Steps(std::hypot(to.x - from.x, to.y - from.y));
     for (int k = 0; k <= steps; ++k) {
       const float t = static_cast<float>(k) / steps;
-      if (visit_(CFX_PointF(from.x + (to.x - from.x) * t,
+      if (Try(CFX_PointF(from.x + (to.x - from.x) * t,
                             from.y + (to.y - from.y) * t))) {
         return true;
       }
@@ -1212,7 +1310,7 @@ class PathSampler {
     hull.UpdateRect(p3);
     if (hull.right < clip_.left || hull.left > clip_.right ||
         hull.top < clip_.bottom || hull.bottom > clip_.top) {
-      return visit_(p3);
+      return Try(p3);
     }
     // A piece under 1 pt across is its chord to within that; 2^24 pieces are
     // finer than a float can tell apart.
@@ -1230,6 +1328,7 @@ class PathSampler {
 
   const CFX_FloatRect clip_;
   Visit visit_;
+  double samples_ = 0;
 };
 
 class Walker {
