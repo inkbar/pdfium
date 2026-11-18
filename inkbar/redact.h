@@ -78,8 +78,8 @@ int INK_Redact_OwnLockedQuads(FPDF_DOCUMENT doc,
 //     with sh or as a shading pattern;
 //   maskGroups: under a soft mask whose group holds anything in the region;
 //   glyphs: text in a Type 3 font with a glyph whose procedure paints in
-//     the region outside the box it declares, or holds an image, a shading,
-//     a form or a pattern use.
+//     the region though the box it declares does not meet it. A glyph whose
+//     box meets the region is removed with its text and is not counted.
 //
 // { "regions": [ { "index": 0, "patterns": 0, "shadings": 0,
 //     "maskGroups": 0, "glyphs": 0 } ] }

@@ -1681,7 +1681,7 @@ class Walker {
         if (counted) {
           // A Type 3 glyph may draw outside the box it declares.
           const unsigned chars =
-              TextChars(*text, to_page) + Type3Reach(*text, to_page, nullptr);
+              TextChars(*text, to_page) + Type3Reach(*text, to_page);
           if (page) {
             entry_->counts.text_chars += chars;
             if (in_group_) {
@@ -1752,9 +1752,7 @@ class Walker {
         continue;
       }
       if (CPDF_TextObject* text = object->AsText()) {
-        bool carrier = false;
-        const unsigned reach = Type3Reach(*text, to_page, &carrier);
-        if ((reach || carrier) && ClipsReach(object, to_page, clips)) {
+        if (Type3Reach(*text, to_page) && ClipsReach(object, to_page, clips)) {
           ++entry_->glyphs;
         }
       }
@@ -2281,13 +2279,10 @@ class Walker {
   }
 
   // The glyphs of Type 3 |text| whose procedure paints in a region though
-  // the box the glyph declares does not meet it: the text redactor goes by
-  // the declared box. With |carrier|, sets it when a glyph that reaches a
-  // region either way has a procedure holding an image, a shading, a form
-  // or a pattern use, which the text redactor does not rewrite.
-  unsigned Type3Reach(CPDF_TextObject& text,
-                      const CFX_Matrix& to_page,
-                      bool* carrier) {
+  // the box the glyph declares does not meet it. The text redactor goes by
+  // the declared box: a glyph whose box meets a region is removed with its
+  // text, whatever its procedure holds, and is not counted here.
+  unsigned Type3Reach(CPDF_TextObject& text, const CFX_Matrix& to_page) {
     RetainPtr<CPDF_Font> font = text.GetFont();
     CPDF_Type3Font* type3 = font ? font->AsType3Font() : nullptr;
     if (!type3) {
@@ -2311,9 +2306,8 @@ class Walker {
       if (context_->glyphs_charged.emplace(font.Get(), item.char_code_).second) {
         SpendParse(form->GetStream().Get(), form);
       }
-      // The procedure's own bounds, and what kinds of object it holds.
+      // The procedure's own bounds.
       std::optional<CFX_FloatRect> bounds;
-      bool holds = false;
       for (auto it = form->begin(); it != form->end(); ++it) {
         const CPDF_PageObject* object = it->get();
         if (!object->IsActive()) {
@@ -2324,13 +2318,6 @@ class Walker {
         } else {
           bounds = object->GetRect();
         }
-        const CPDF_ColorState& colors = object->color_state();
-        holds = holds || object->AsImage() || object->AsShading() ||
-                object->AsForm() ||
-                (colors.HasRef() &&
-                 ((colors.GetFillColor() && colors.GetFillColor()->IsPattern()) ||
-                  (colors.GetStrokeColor() &&
-                   colors.GetStrokeColor()->IsPattern())));
       }
       if (!bounds.has_value()) {
         continue;
@@ -2357,9 +2344,6 @@ class Walker {
           drawn.right * size + item.origin_.x, drawn.top * size + item.origin_.y));
       if (reaches && !declared) {
         ++count;
-      }
-      if (carrier && holds && (reaches || declared)) {
-        *carrier = true;
       }
     }
     return count;

@@ -1608,6 +1608,37 @@ const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, 
   assert.equal(under(type3Page('300 80 Td (b) Tj')).textChars, 0, 'an ordinary glyph beside the region')
 }
 
+// leaves bitmap-font text to the text redactor
+{
+  // Each glyph is an image in a Type 3 procedure, as older TeX output draws
+  // text. A glyph whose box meets the mark is removed with its text, and its
+  // procedure with it when nothing else shows it, so it is not refused.
+  const bitmap = (hex) => streamObject('', `1000 0 0 0 1000 1000 d1 q 1000 0 0 1000 0 0 cm BI /IM true /W 8 /H 8 /BPC 1 /D [1 0] /F /AHx ID ${hex}> EI Q`, true)
+  const font = (procs, resources = '') =>
+    `<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << ${procs} >> /Encoding << /Type /Encoding /Differences [97 /a /b] >> /FirstChar 97 /LastChar 98 /Widths [1000 1000] ${resources} >>`
+  const page = (objects) => onePagePdf('BT /T3 40 Tf 180 80 Td (a) Tj ET BT /T3 40 Tf 300 80 Td (b) Tj ET BT /F1 12 Tf 20 20 Td (KEEP) Tj ET', { resources: '/Font << /T3 6 0 R >>' }, objects)
+  const source = page([font('/a 7 0 R /b 8 0 R'), bitmap('8142241818244281'), bitmap('FF818181818181FF')])
+  assert.deepEqual(unremovable(source, [PATTERN_MARK, [290, 70, 350, 130]]), [[0, 0, 0, 0], [0, 0, 0, 0]], 'bitmap-font text under a mark')
+  const saved = inflateStreams(forceApply(source))
+  assert.ok(inflateStreams(source).includes('8142241818244281'))
+  assert.ok(!saved.includes('8142241818244281'), 'the image of the glyph under the mark is still in the file')
+  assert.ok(!/(\(a\)|<61>)\s*Tj/.test(saved), 'the text under the mark is still shown')
+  assert.ok(saved.includes('FF818181818181FF') && /(\(b\)|<62>)\s*Tj/.test(saved), 'the glyph beside the mark is gone')
+  // The same for a glyph whose procedure paints with a pattern or a shading
+  // and is shown only under the mark: the apply removes the procedure.
+  for (const [name, proc, resources, extra, trace] of [
+    ['a pattern', '1000 0 d0 /Pattern cs /P0 scn 0 0 987.5 1000 re f', '/Resources << /Pattern << /P0 9 0 R >> >>', tiling([0, 0, 10, 10], 10, 10, '0 G 1 w 0 0 m 9.75 10 l S'), '9.75 10 l'],
+    ['a shading', '1000 0 d0 q 0 0 987.5 1000 re W n /Sh0 sh Q', '/Resources << /Shading << /Sh0 9 0 R >> >>', meshShading, '/BitsPerFlag'],
+  ]) {
+    const carrying = page([font('/a 7 0 R /b 8 0 R', resources), streamObject('', proc, true), bitmap('FF818181818181FF'), extra])
+    assert.ok(inflateStreams(carrying).includes(trace) && inflateStreams(carrying).includes('987.5'))
+    assert.deepEqual(unremovable(carrying), [[0, 0, 0, 0]], `a glyph painting with ${name} under a mark`)
+    const after = inflateStreams(forceApply(carrying))
+    assert.ok(!after.includes('987.5'), `the procedure painting with ${name} is still in the file`)
+    assert.ok(!after.includes(trace), `${name} of a glyph shown only under the mark is still in the file`)
+  }
+}
+
 // Other content defined once and painted through a reference: what an apply
 // over it leaves in the saved file, and what the check then counts.
 {
