@@ -1106,6 +1106,98 @@ OwnBox ShadingOwnBox(const CPDF_ShadingPattern& pattern, Work* work) {
   return {true, *box};
 }
 
+// Whether |function| is an exponential function (type 2): one colour run.
+bool Exponential(const CPDF_Object* function) {
+  RetainPtr<const CPDF_Dictionary> dict = function ? function->GetDict() : nullptr;
+  return dict && dict->GetIntegerFor("FunctionType") == 2;
+}
+
+// Whether |function| draws a plain ramp: an exponential function, or a
+// stitch of at most 8 of them.
+bool PlainFunction(const CPDF_Object* function) {
+  if (Exponential(function)) {
+    return true;
+  }
+  RetainPtr<const CPDF_Dictionary> dict = function ? function->GetDict() : nullptr;
+  if (!dict || dict->GetIntegerFor("FunctionType") != 3) {
+    return false;
+  }
+  RetainPtr<const CPDF_Array> pieces = dict->GetArrayFor("Functions");
+  if (!pieces || pieces->size() == 0 || pieces->size() > 8) {
+    return false;
+  }
+  for (size_t i = 0; i < pieces->size(); ++i) {
+    if (!Exponential(pieces->GetDirectObjectAt(i).Get())) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Whether a shading is a plain colour ramp, which the part an apply leaves
+// in view shows all of: axial or radial, its function plain. A sampled or
+// calculated function, or a long stitch, can hold a picture along the ramp.
+bool Ramp(const CPDF_ShadingPattern* pattern) {
+  if (!pattern || (pattern->GetShadingType() != kAxialShading &&
+                   pattern->GetShadingType() != kRadialShading)) {
+    return false;
+  }
+  RetainPtr<const CPDF_Object> object = pattern->GetShadingObject();
+  RetainPtr<const CPDF_Dictionary> dict = object ? object->GetDict() : nullptr;
+  RetainPtr<const CPDF_Object> function =
+      dict ? dict->GetDirectObjectFor("Function") : nullptr;
+  if (!function) {
+    return false;
+  }
+  if (const CPDF_Array* functions = function->AsArray()) {
+    for (size_t i = 0; i < functions->size(); ++i) {
+      if (!PlainFunction(functions->GetDirectObjectAt(i).Get())) {
+        return false;
+      }
+    }
+    return functions->size() > 0;
+  }
+  return PlainFunction(function.Get());
+}
+
+// Charges the parsing of |stream| to |work| before it is parsed: a unit a
+// byte of its decoded length. Sets |fell_back| when PDFium could not decode
+// the stream and hands back the bytes it holds instead: its filters left
+// every byte as it was. A stream of 16 bytes or fewer is not asked; an empty
+// stream compressed is that small, and nothing can be drawn in so little.
+// A parse that then finds no object did not read the stream (see
+// Unreadable()). False for no stream.
+bool ChargeStream(Work* work, const CPDF_Stream* stream, bool* fell_back) {
+  *fell_back = false;
+  if (!stream) {
+    return false;
+  }
+  auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(pdfium::WrapRetain(stream));
+  acc->LoadAllDataFiltered();
+  const size_t size = acc->GetSize();
+  work->Spend(size + 1);
+  const size_t raw = stream->GetRawSize();
+  if (raw <= 16 || !stream->GetDict()->KeyExist("Filter") || size != raw) {
+    return true;
+  }
+  if (!stream->IsMemoryBased()) {
+    *fell_back = true;
+    return true;
+  }
+  pdfium::span<const uint8_t> stored = stream->GetInMemoryRawData();
+  pdfium::span<const uint8_t> decoded = acc->GetSpan();
+  *fell_back = std::equal(decoded.begin(), decoded.end(), stored.begin(),
+                          stored.end());
+  return true;
+}
+
+// Whether a stream that was parsed into |holder| was not read: PDFium could
+// not decode it and found no object in the bytes it fell back on. Another
+// reader may decode it, or part of it, so it counts as holding content.
+bool Unreadable(bool fell_back, const CPDF_PageObjectHolder& holder) {
+  return fell_back && holder.GetPageObjectCount() == 0;
+}
+
 // The second test for a shading: points sampled at most 1 pt apart inside
 // the shrunk regions, each tested against the shading's box and every clip
 // path with its fill rule (the nonzero winding rule, or the even-odd rule).
@@ -1412,8 +1504,13 @@ struct Context {
   // Regions given: forms tagged /INKB_Overlay are an apply's own drawing.
   // Without regions the tag is not trusted.
   const bool strict;
-  // The Type 3 glyph procedures whose parsing was charged to |work|.
-  std::set<std::pair<const CPDF_Font*, uint32_t>> glyphs_charged;
+  // Each Type 3 glyph procedure read so far: whether it could be read, and
+  // the bounds of what it draws, in glyph space.
+  struct Glyph {
+    bool readable = false;
+    std::optional<CFX_FloatRect> bounds;
+  };
+  std::map<std::pair<const CPDF_Font*, uint32_t>, Glyph> glyphs;
   // Where each shading read so far can paint, by its shading object.
   std::map<const CPDF_Object*, OwnBox> shading_boxes;
   bool failed = false;
@@ -1607,6 +1704,16 @@ struct ClipInEffect {
 };
 using Clips = std::vector<ClipInEffect>;
 
+// The soft mask a form object is painted under, which its content inherits:
+// the mask, the matrix it was set under, and what places that matrix on the
+// page. A mask lies where it was set, not where the form's matrix would put
+// it again.
+struct MaskScope {
+  const CPDF_Dictionary* mask = nullptr;
+  CFX_Matrix matrix;
+  CFX_Matrix to_page;
+};
+
 class Walker {
  public:
   Walker(Entry* entry, const CPDF_PathRedactor* redactor, Context* context)
@@ -1619,7 +1726,8 @@ class Walker {
               Scope scope,
               bool counted,
               int depth,
-              const Clips& clips) {
+              const Clips& clips,
+              const MaskScope* inherited) {
     if (depth > kFormLevelLimit) {
       context_->failed = true;
       return;
@@ -1642,18 +1750,19 @@ class Walker {
           // The copy's /Matrix is the page matrix (rotation and box origin),
           // and its content is parsed through it: undo it for page space.
           Holder(form, form->GetDict()->GetMatrixFor("Matrix").GetInverse(),
-                 Scope::kPageCopy, true, depth + 1, Clips());
+                 Scope::kPageCopy, true, depth + 1, Clips(), nullptr);
           continue;
         }
         if ((!page || Before(object)) && PaintsIn(object, to_page, clips)) {
-          Group(object, to_page, scope, counted, depth);
+          Group(object, to_page, inherited, scope, counted, depth);
         }
         Clips inner = clips;
         if (form_object->clip_path().HasRef()) {
           inner.push_back({form_object->clip_path(), to_page});
         }
+        MaskScope mask;
         Holder(form, form_object->form_matrix() * to_page, scope, counted,
-               depth + 1, inner);
+               depth + 1, inner, MaskOn(object, to_page, inherited, &mask));
         continue;
       }
       if (page && !Before(object)) {
@@ -1662,7 +1771,7 @@ class Walker {
       // What an object carries with it (a mask's group, a pattern's cell, a
       // shading pattern) counts when the object itself paints in a region.
       if (Carries(object) && PaintsIn(object, to_page, clips)) {
-        Group(object, to_page, scope, counted, depth);
+        Group(object, to_page, inherited, scope, counted, depth);
         if (counted || page) {
           std::set<const CPDF_Object*> chain;
           const Found found = CellsOf(object, &chain);
@@ -1716,11 +1825,15 @@ class Walker {
   }
 
   // What INK_Redact_Unremovable counts in |holder|: the objects that paint
-  // in a region and carry what the apply cannot rewrite.
+  // in a region and carry what the apply cannot rewrite. Forms are read
+  // whatever tags they carry: before an apply none is ours to trust. An
+  // object whose own shape lies wholly inside a region is not counted: the
+  // apply removes it outright, and what it carries leaves the file with it.
   void Unremovable(CPDF_PageObjectHolder* holder,
                    const CFX_Matrix& to_page,
                    int depth,
-                   const Clips& clips) {
+                   const Clips& clips,
+                   const MaskScope* inherited) {
     if (depth > kFormLevelLimit) {
       context_->failed = true;
       return;
@@ -1735,20 +1848,21 @@ class Walker {
       }
       if (CPDF_FormObject* form_object = object->AsForm()) {
         CPDF_Form* form = form_object->form();
-        // An overlay an earlier apply drew, and a loupe's copy of the page,
-        // which the engine draws again after an apply.
-        if (!form || FormHas(form, kOverlayKey) || FormHas(form, kPageCopyKey)) {
+        if (!form) {
           continue;
         }
-        if (PaintsIn(object, to_page, clips) && GroupHolds(object, to_page, 0)) {
+        // A form is emptied, not removed, and keeps its mask: no exemption.
+        if (PaintsIn(object, to_page, clips) &&
+            GroupHolds(object, to_page, inherited, 0)) {
           ++entry_->mask_groups;
         }
         Clips inner = clips;
         if (form_object->clip_path().HasRef()) {
           inner.push_back({form_object->clip_path(), to_page});
         }
+        MaskScope mask;
         Unremovable(form, form_object->form_matrix() * to_page, depth + 1,
-                    inner);
+                    inner, MaskOn(object, to_page, inherited, &mask));
         continue;
       }
       if (CPDF_TextObject* text = object->AsText()) {
@@ -1756,7 +1870,8 @@ class Walker {
           ++entry_->glyphs;
         }
       }
-      if (!Carries(object) || !PaintsIn(object, to_page, clips)) {
+      if (!Carries(object) || !PaintsIn(object, to_page, clips) ||
+          WhollyInside(object, to_page)) {
         continue;
       }
       if (PaintsWithTiling(object)) {
@@ -1768,7 +1883,14 @@ class Walker {
           PictureShadingPattern(object, to_page)) {
         ++entry_->shadings;
       }
-      if (GroupHolds(object, to_page, 0)) {
+      // A mask the object inherits is counted once, at the form object it
+      // comes through, which stays on the page with its mask.
+      const CPDF_GeneralState& state = object->general_state();
+      const bool own_mask =
+          !inherited || !state.HasRef() ||
+          state.GetSoftMask().Get() != inherited->mask ||
+          !state.GetSMaskMatrix() || !(*state.GetSMaskMatrix() == inherited->matrix);
+      if (own_mask && GroupHolds(object, to_page, inherited, 0)) {
         ++entry_->mask_groups;
       }
     }
@@ -1844,10 +1966,12 @@ class Walker {
   }
 
   // The group of the soft mask in effect on |object|, and where its content
-  // lies on the page: through the matrix in effect when the mask was set.
-  // False when the object has no such group.
+  // lies on the page: through the matrix in effect when the mask was set. A
+  // mask the object inherits from the form object it is painted through lies
+  // where that form object's does. False when the object has no such group.
   bool GroupOf(const CPDF_PageObject* object,
                const CFX_Matrix& to_page,
+               const MaskScope* inherited,
                RetainPtr<CPDF_Stream>* stream,
                CFX_Matrix* placed) {
     const CPDF_GeneralState& state = object->general_state();
@@ -1861,27 +1985,51 @@ class Walker {
     }
     // The form only reads the stream; it takes a mutable one for its type.
     *stream = pdfium::WrapRetain(const_cast<CPDF_Stream*>(group.Get()));
-    const CFX_Matrix* matrix = state.GetSMaskMatrix();
-    *placed = (matrix ? *matrix : CFX_Matrix()) * to_page;
+    const CFX_Matrix* set_under = state.GetSMaskMatrix();
+    const CFX_Matrix matrix = set_under ? *set_under : CFX_Matrix();
+    const bool same = inherited && inherited->mask == mask.Get() &&
+                      inherited->matrix == matrix;
+    *placed = matrix * (same ? inherited->to_page : to_page);
     return true;
   }
 
-  // Charges parsing |stream| into |holder| to the work budget: a unit a
-  // byte of the stream as the file holds it, and one an object.
-  void SpendParse(const CPDF_Stream* stream,
-                  const CPDF_PageObjectHolder* holder) {
-    context_->work.Spend((stream ? stream->GetRawSize() : 0) + 1 +
-                         holder->GetPageObjectCount());
+  // The mask scope for the content of form object |object|: its own mask,
+  // placed as GroupOf() places it. Null when it has none.
+  const MaskScope* MaskOn(const CPDF_PageObject* object,
+                          const CFX_Matrix& to_page,
+                          const MaskScope* inherited,
+                          MaskScope* scope) {
+    const CPDF_GeneralState& state = object->general_state();
+    RetainPtr<const CPDF_Dictionary> mask =
+        state.HasRef() ? state.GetSoftMask() : nullptr;
+    if (!mask) {
+      return nullptr;
+    }
+    const CFX_Matrix* set_under = state.GetSMaskMatrix();
+    scope->mask = mask.Get();
+    scope->matrix = set_under ? *set_under : CFX_Matrix();
+    const bool same = inherited && inherited->mask == scope->mask &&
+                      inherited->matrix == scope->matrix;
+    scope->to_page = same ? inherited->to_page : to_page;
+    return scope;
   }
 
-  // A mask's group, parsed.
+  // A mask's group, parsed, its decoded bytes charged before the parse and
+  // its objects after. Null when the stream could not be read.
   std::unique_ptr<CPDF_Form> ParseGroup(RetainPtr<CPDF_Stream> stream) {
-    const CPDF_Stream* id = stream.Get();
+    bool fell_back = false;
+    if (!ChargeStream(&context_->work, stream.Get(), &fell_back) ||
+        context_->work.spent) {
+      return nullptr;
+    }
     auto form = std::make_unique<CPDF_Form>(
         context_->page->GetDocument(), context_->page->GetMutableResources(),
         std::move(stream));
     form->ParseContent();
-    SpendParse(id, form.get());
+    context_->work.Spend(form->GetPageObjectCount());
+    if (Unreadable(fell_back, *form)) {
+      return nullptr;
+    }
     return form;
   }
 
@@ -1889,15 +2037,16 @@ class Walker {
   // regions, as content of the holder the object lies in. The caller has
   // found that the object paints in a region. A group in effect on many
   // objects through one matrix is read once. A group whose place is not
-  // finite counts.
+  // finite, or that cannot be decoded, counts.
   void Group(const CPDF_PageObject* object,
              const CFX_Matrix& to_page,
+             const MaskScope* inherited,
              Scope scope,
              bool counted,
              int depth) {
     RetainPtr<CPDF_Stream> stream;
     CFX_Matrix placed;
-    if (!GroupOf(object, to_page, &stream, &placed)) {
+    if (!GroupOf(object, to_page, inherited, &stream, &placed)) {
       return;
     }
     const float numbers[6] = {placed.a, placed.b, placed.c,
@@ -1910,33 +2059,71 @@ class Walker {
     if (!groups_.insert(key).second || group_stack_.count(stream.Get())) {
       return;
     }
-    if (!Finite(placed)) {
+    const CPDF_Stream* id = stream.Get();
+    std::unique_ptr<CPDF_Form> form =
+        Finite(placed) ? ParseGroup(std::move(stream)) : nullptr;
+    if (context_->work.spent) {
+      return;
+    }
+    if (!form) {
       ++(scope == Scope::kPage ? entry_->counts.paths
                                : entry_->counts.annotation_text);
       return;
     }
-    const CPDF_Stream* id = stream.Get();
-    std::unique_ptr<CPDF_Form> form = ParseGroup(std::move(stream));
-    if (context_->work.spent) {
-      return;
-    }
     group_stack_.insert(id);
     ++in_group_;
-    Holder(form.get(), placed, scope, counted, depth + 1, Clips());
+    Holder(form.get(), placed, scope, counted, depth + 1, Clips(), nullptr);
     --in_group_;
     group_stack_.erase(id);
   }
 
+  // Whether a group draws nothing but a fade: plain ramps and filled
+  // axis-aligned rectangles, which is how gradient transparency is drawn.
+  // Text, an image, any other path, a shading that can hold a picture, a
+  // pattern, a form or a mask of its own makes it more than that.
+  bool FadeOnly(const CPDF_Form& form) {
+    for (auto it = form.begin(); it != form.end(); ++it) {
+      const CPDF_PageObject* object = it->get();
+      if (!object->IsActive()) {
+        continue;
+      }
+      const CPDF_GeneralState& state = object->general_state();
+      if (state.HasRef() && state.GetSoftMask()) {
+        return false;
+      }
+      if (const CPDF_ShadingObject* shading = object->AsShading()) {
+        if (!Ramp(shading->pattern())) {
+          return false;
+        }
+        continue;
+      }
+      const CPDF_PathObject* path = object->AsPath();
+      if (!path || path->has_no_filltype() || path->stroke() ||
+          !path->path().GetRectOppositeCorner().has_value()) {
+        return false;
+      }
+      const CFX_Matrix& m = path->matrix();
+      const CPDF_Color* fill = path->color_state().GetFillColor();
+      if (!((m.b == 0 && m.c == 0) || (m.a == 0 && m.d == 0)) || !fill ||
+          fill->IsPattern()) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   // Whether the group of a soft mask on |object| holds anything in a
   // region: an object of the group, or of a group masking one of those,
-  // whose box meets one when placed by the mask's matrix. True when the
-  // place cannot be worked out. False without a group.
+  // whose box meets one when placed by the mask's matrix. A group that only
+  // draws a fade holds nothing. True when the place cannot be worked out or
+  // the group cannot be decoded. False without a group.
   bool GroupHolds(const CPDF_PageObject* object,
                   const CFX_Matrix& to_page,
+                  const MaskScope* inherited,
                   int depth) {
     RetainPtr<CPDF_Stream> stream;
     CFX_Matrix placed;
-    if (!GroupOf(object, to_page, &stream, &placed)) {
+    if (!GroupOf(object, to_page, inherited, &stream, &placed)) {
       return false;
     }
     if (!Finite(placed) || depth > kFormLevelLimit) {
@@ -1959,27 +2146,30 @@ class Walker {
     if (context_->work.spent) {
       return true;
     }
-    bool holds = false;
-    group_stack_.insert(id);
-    for (auto item = form->begin(); item != form->end() && !holds; ++item) {
-      const CPDF_PageObject* inner = item->get();
-      if (!inner->IsActive()) {
-        continue;
+    bool holds = !form;
+    if (form && !FadeOnly(*form)) {
+      group_stack_.insert(id);
+      for (auto item = form->begin(); item != form->end() && !holds; ++item) {
+        const CPDF_PageObject* inner = item->get();
+        if (!inner->IsActive()) {
+          continue;
+        }
+        CFX_FloatRect box = placed.TransformRect(inner->GetRect());
+        box.Normalize();
+        holds = !Finite(box) || RectMeetsAnyBBox(box, entry_->inset) ||
+                GroupHolds(inner, placed, nullptr, depth + 1);
       }
-      CFX_FloatRect box = placed.TransformRect(inner->GetRect());
-      box.Normalize();
-      holds = !Finite(box) || RectMeetsAnyBBox(box, entry_->inset) ||
-              GroupHolds(inner, placed, depth + 1);
+      group_stack_.erase(id);
     }
-    group_stack_.erase(id);
     if (!context_->work.spent) {
       group_holds_.emplace(key, holds);
     }
     return holds;
   }
 
-  // Whether a shading that can hold a picture (type 1 or 4 to 7; any type
-  // but axial and radial, to fail closed) lies under the regions: its own
+  // Whether a shading that can hold a picture (anything but a plain ramp:
+  // type 1, types 4 to 7, an axial or radial shading whose function is not
+  // plain, and any other type, to fail closed) lies under the regions: its own
   // box, placed by |to_page| from the shading's space, meets one. Clips do
   // not count, since the apply's own clip would hide what it left in the
   // file. True when the shading's geometry cannot be read.
@@ -1988,20 +2178,10 @@ class Walker {
     if (!pattern) {
       return true;
     }
-    const ShadingType type = pattern->GetShadingType();
-    if (type == kAxialShading || type == kRadialShading) {
+    if (Ramp(pattern)) {
       return false;
     }
-    RetainPtr<const CPDF_Object> key = pattern->GetShadingObject();
-    auto it = context_->shading_boxes.find(key.Get());
-    if (it == context_->shading_boxes.end()) {
-      const OwnBox own = ShadingOwnBox(*pattern, &context_->work);
-      if (context_->work.spent) {
-        return true;
-      }
-      it = context_->shading_boxes.emplace(key.Get(), own).first;
-    }
-    const OwnBox& own = it->second;
+    const OwnBox own = OwnBoxOf(*pattern);
     if (!own.known) {
       return true;
     }
@@ -2011,6 +2191,21 @@ class Walker {
     CFX_FloatRect box = to_page.TransformRect(own.box);
     box.Normalize();
     return !Finite(box) || RectMeetsAnyBBox(box, entry_->inset);
+  }
+
+  // Where |pattern| can paint, clips aside, read once in a call. Not known
+  // when it cannot be read or the work ran out.
+  OwnBox OwnBoxOf(const CPDF_ShadingPattern& pattern) {
+    RetainPtr<const CPDF_Object> key = pattern.GetShadingObject();
+    auto it = context_->shading_boxes.find(key.Get());
+    if (it == context_->shading_boxes.end()) {
+      const OwnBox own = ShadingOwnBox(pattern, &context_->work);
+      if (context_->work.spent) {
+        return {};
+      }
+      it = context_->shading_boxes.emplace(key.Get(), own).first;
+    }
+    return it->second;
   }
 
   // Whether |object| paints with a shading pattern that can hold a picture
@@ -2052,13 +2247,117 @@ class Walker {
     bool drawing = false;  // A path, a shading or a pattern of its own.
   };
 
-  // Whether |object| paints with its fill colour, or with its stroke colour.
-  // Only a path says which; anything else is taken to use both.
+  // Whether |object| paints with its fill colour, or with its stroke colour:
+  // a path as it is filled and stroked, text as its rendering mode says, an
+  // image only when it is a stencil mask, which the fill colour paints.
   static bool Paints(const CPDF_PageObject* object, bool stroke) {
     if (const CPDF_PathObject* path = object->AsPath()) {
       return stroke ? path->stroke() : !path->has_no_filltype();
     }
-    return true;
+    if (const CPDF_TextObject* text = object->AsText()) {
+      switch (text->GetTextRenderMode()) {
+        case TextRenderingMode::MODE_FILL:
+        case TextRenderingMode::MODE_FILL_CLIP:
+          return !stroke;
+        case TextRenderingMode::MODE_STROKE:
+        case TextRenderingMode::MODE_STROKE_CLIP:
+          return stroke;
+        case TextRenderingMode::MODE_FILL_STROKE:
+        case TextRenderingMode::MODE_FILL_STROKE_CLIP:
+          return true;
+        case TextRenderingMode::MODE_INVISIBLE:
+        case TextRenderingMode::MODE_CLIP:
+          return false;
+        case TextRenderingMode::MODE_UNKNOWN:
+          return true;
+      }
+    }
+    if (const CPDF_ImageObject* image = object->AsImage()) {
+      RetainPtr<CPDF_Image> stencil = image->GetImage();
+      return !stroke && stencil && stencil->IsMask();
+    }
+    return false;
+  }
+
+  // How far the stroke of |object| reaches past its outline on the page, at
+  // most: half its line width under the largest stretch in effect. Zero for
+  // an object that is not stroked.
+  static float StrokeReach(const CPDF_PageObject* object,
+                           const CFX_Matrix& to_page) {
+    CFX_Matrix matrix = to_page;
+    if (const CPDF_TextObject* text = object->AsText()) {
+      if (!Paints(object, true)) {
+        return 0;
+      }
+      matrix = text->GetTextMatrix() * to_page;
+    } else if (const CPDF_PathObject* path = object->AsPath()) {
+      if (!path->stroke()) {
+        return 0;
+      }
+      matrix = path->matrix() * to_page;
+    } else {
+      return 0;
+    }
+    const auto stretch = [](const CFX_Matrix& m) {
+      return std::sqrt(m.a * m.a + m.b * m.b + m.c * m.c + m.d * m.d);
+    };
+    return object->graph_state().GetLineWidth() / 2 *
+           std::max(stretch(to_page), stretch(matrix));
+  }
+
+  // The box of |object|'s own shape on the page, clips aside, its stroke
+  // included.
+  static CFX_FloatRect ShapeBox(const CPDF_PageObject* object,
+                                const CFX_Matrix& to_page) {
+    CFX_FloatRect box = to_page.TransformRect(object->GetRect());
+    box.Normalize();
+    const float reach = StrokeReach(object, to_page);
+    box.Inflate(reach, reach);
+    return box;
+  }
+
+  // Whether |object|'s own shape lies wholly inside one region, a hundredth
+  // of a point clear of its edge: the apply then removes the object
+  // outright, and what it carries is no longer named by the page. Clips do
+  // not help: a shape that reaches outside a region and is clipped to the
+  // inside is cut, not removed. For a shading painted with sh the shape is
+  // the shading's own box. A form is emptied and stays, and an image is
+  // blanked and stays, so neither is ever wholly inside.
+  bool WhollyInside(const CPDF_PageObject* object, const CFX_Matrix& to_page) {
+    if (object->AsForm() || object->AsImage()) {
+      return false;
+    }
+    CFX_FloatRect box;
+    if (const CPDF_ShadingObject* shading = object->AsShading()) {
+      const CPDF_ShadingPattern* pattern = shading->pattern();
+      const OwnBox own = pattern ? OwnBoxOf(*pattern) : OwnBox();
+      if (!own.known) {
+        return false;
+      }
+      box = (shading->matrix() * to_page).TransformRect(own.box);
+      box.Normalize();
+    } else {
+      box = ShapeBox(object, to_page);
+    }
+    if (!Finite(box)) {
+      return false;
+    }
+    for (const RedactRegion& region : entry_->inset) {
+      if (!region.bbox.Contains(box)) {
+        continue;
+      }
+      if (!region.has_quad) {
+        return true;
+      }
+      bool inside = true;
+      for (const CFX_PointF& corner : QuadFromRect(box)) {
+        inside = inside && PointInside(corner, region);
+      }
+      if (inside) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // Whether |object| paints with a pattern colour: a tiling pattern, or
@@ -2094,9 +2393,7 @@ class Walker {
       return true;
     }
     if (const CPDF_ShadingObject* shading = object->AsShading()) {
-      const CPDF_ShadingPattern* pattern = shading->pattern();
-      if (!pattern || (pattern->GetShadingType() != kAxialShading &&
-                       pattern->GetShadingType() != kRadialShading)) {
+      if (!Ramp(shading->pattern())) {
         return true;
       }
     }
@@ -2168,8 +2465,7 @@ class Walker {
   bool PaintsIn(CPDF_PageObject* object,
                 const CFX_Matrix& to_page,
                 const Clips& clips) {
-    CFX_FloatRect box = to_page.TransformRect(object->GetRect());
-    box.Normalize();
+    const CFX_FloatRect box = ShapeBox(object, to_page);
     if (!Finite(box)) {
       return true;
     }
@@ -2182,7 +2478,10 @@ class Walker {
              PathSampleInside(*path, to_page);
     }
     if (CPDF_TextObject* text = object->AsText()) {
-      return TextChars(*text, to_page) > 0 || AdvanceChars(*text, to_page) > 0;
+      // Stroked text paints past its glyphs' boxes by its stroke: its box,
+      // grown by that, decides.
+      return StrokeReach(object, to_page) > 0 ||
+             TextChars(*text, to_page) > 0 || AdvanceChars(*text, to_page) > 0;
     }
     if (CPDF_ImageObject* image = object->AsImage()) {
       return QuadMeetsAny(Transformed(CFX_FloatRect(0, 0, 1, 1),
@@ -2197,7 +2496,8 @@ class Walker {
   // The redaction does not enter a pattern's stream, so the caller counts
   // this for an object that paints in a region. Patterns used inside a cell
   // are followed; |chain| holds the patterns being read, so a pattern that
-  // paints with itself ends. A pattern's cell is read once.
+  // paints with itself ends. A pattern's cell is read once in a call,
+  // wherever it is used, and nothing is parsed once the work has run out.
   Found CellsOf(CPDF_PageObject* object, std::set<const CPDF_Object*>* chain) {
     Found found;
     const CPDF_ColorState& colors = object->color_state();
@@ -2219,23 +2519,33 @@ class Walker {
         context_->failed = true;
         return found;
       }
-      const bool top = chain->empty();
-      auto it = top ? cells_.find(tiling->pattern_obj().Get()) : cells_.end();
+      auto it = cells_.find(tiling->pattern_obj().Get());
       if (it != cells_.end()) {
         found.Add(it->second.first);
         continue;
       }
+      // A cell that could not be read counts as holding both.
       Found cell_found;
-      chain->insert(tiling->pattern_obj().Get());
-      // A pattern's content is parsed on its own, from level 0.
-      std::unique_ptr<CPDF_Form> cell = tiling->Load(object);
-      if (cell) {
-        SpendParse(ToStream(tiling->pattern_obj().Get()), cell.get());
-        cell_found.content = PatternContent(cell.get(), chain, 0);
-        cell_found.drawing = HasDrawing(cell.get(), 0);
+      cell_found.content = 1;
+      cell_found.drawing = true;
+      bool fell_back = false;
+      if (ChargeStream(&context_->work, ToStream(tiling->pattern_obj().Get()),
+                       &fell_back) &&
+          !context_->work.spent) {
+        chain->insert(tiling->pattern_obj().Get());
+        // A pattern's content is parsed on its own, from level 0.
+        std::unique_ptr<CPDF_Form> cell = tiling->Load(object);
+        if (cell && !Unreadable(fell_back, *cell)) {
+          context_->work.Spend(cell->GetPageObjectCount());
+          cell_found.content = PatternContent(cell.get(), chain, 0);
+          cell_found.drawing = HasDrawing(cell.get(), 0);
+        }
+        chain->erase(tiling->pattern_obj().Get());
       }
-      chain->erase(tiling->pattern_obj().Get());
-      if (top && !context_->work.spent) {
+      if (context_->work.spent) {
+        return found;
+      }
+      {
         // The pattern is kept, so its object's address stays its own.
         cells_.emplace(tiling->pattern_obj().Get(),
                        std::make_pair(cell_found, pdfium::WrapRetain(tiling)));
@@ -2278,10 +2588,63 @@ class Walker {
     return false;
   }
 
+  // What the procedure of glyph |code| of |font| draws, read from the font's
+  // own dictionary the first time in a call. PDFium's cached glyph is not
+  // asked: rendering a page drops the parsed form of a glyph that is one
+  // image, and the answer must not turn on whether the page was drawn.
+  const Context::Glyph& GlyphOf(CPDF_Type3Font* font, uint32_t code) {
+    const auto key = std::make_pair(static_cast<const CPDF_Font*>(font), code);
+    auto it = context_->glyphs.find(key);
+    if (it != context_->glyphs.end()) {
+      return it->second;
+    }
+    Context::Glyph glyph;
+    RetainPtr<const CPDF_Dictionary> dict = font->GetFontDict();
+    RetainPtr<const CPDF_Dictionary> procs =
+        dict ? dict->GetDictFor("CharProcs") : nullptr;
+    const char* name = font->GetCharProcName(code);
+    RetainPtr<const CPDF_Object> entry =
+        name && procs ? procs->GetDirectObjectFor(name) : nullptr;
+    if (!entry) {
+      // No procedure: the glyph draws nothing.
+      glyph.readable = true;
+    } else if (const CPDF_Stream* proc = entry->AsStream()) {
+      bool fell_back = false;
+      if (ChargeStream(&context_->work, proc, &fell_back) &&
+          !context_->work.spent) {
+        RetainPtr<const CPDF_Dictionary> own = dict->GetDictFor("Resources");
+        RetainPtr<CPDF_Dictionary> resources =
+            own && !CPDF_Type3Font::GlyphsUseContentResources(dict.Get())
+                ? pdfium::WrapRetain(const_cast<CPDF_Dictionary*>(own.Get()))
+                : context_->page->GetMutableResources();
+        // The form only reads the stream; it takes a mutable one for its type.
+        CPDF_Form form(context_->page->GetDocument(), std::move(resources),
+                       pdfium::WrapRetain(const_cast<CPDF_Stream*>(proc)));
+        CPDF_Type3Char scratch;
+        form.ParseContentForType3Char(&scratch);
+        context_->work.Spend(form.GetPageObjectCount());
+        glyph.readable = !Unreadable(fell_back, form);
+        for (auto item = form.begin(); item != form.end(); ++item) {
+          const CPDF_PageObject* object = item->get();
+          if (!object->IsActive()) {
+            continue;
+          }
+          if (glyph.bounds.has_value()) {
+            glyph.bounds->Union(object->GetRect());
+          } else {
+            glyph.bounds = object->GetRect();
+          }
+        }
+      }
+    }
+    return context_->glyphs.emplace(key, glyph).first->second;
+  }
+
   // The glyphs of Type 3 |text| whose procedure paints in a region though
   // the box the glyph declares does not meet it. The text redactor goes by
   // the declared box: a glyph whose box meets a region is removed with its
-  // text, whatever its procedure holds, and is not counted here.
+  // text, whatever its procedure holds, and is not counted here. A
+  // procedure that cannot be read is taken to paint in the region.
   unsigned Type3Reach(CPDF_TextObject& text, const CFX_Matrix& to_page) {
     RetainPtr<CPDF_Font> font = text.GetFont();
     CPDF_Type3Font* type3 = font ? font->AsType3Font() : nullptr;
@@ -2297,29 +2660,8 @@ class Walker {
           !context_->work.Spend(1)) {
         continue;
       }
-      const CPDF_Type3Char* glyph = type3->LoadChar(item.char_code_);
-      const CPDF_Form* form =
-          glyph ? static_cast<const CPDF_Form*>(glyph->form()) : nullptr;
-      if (!form) {
-        continue;
-      }
-      if (context_->glyphs_charged.emplace(font.Get(), item.char_code_).second) {
-        SpendParse(form->GetStream().Get(), form);
-      }
-      // The procedure's own bounds.
-      std::optional<CFX_FloatRect> bounds;
-      for (auto it = form->begin(); it != form->end(); ++it) {
-        const CPDF_PageObject* object = it->get();
-        if (!object->IsActive()) {
-          continue;
-        }
-        if (bounds.has_value()) {
-          bounds->Union(object->GetRect());
-        } else {
-          bounds = object->GetRect();
-        }
-      }
-      if (!bounds.has_value()) {
+      const Context::Glyph& glyph = GlyphOf(type3, item.char_code_);
+      if (glyph.readable && !glyph.bounds.has_value()) {
         continue;
       }
       const auto meets = [&](const CFX_FloatRect& local) {
@@ -2337,11 +2679,16 @@ class Walker {
           units.bottom * size / 1000.0f + item.origin_.y,
           units.right * size / 1000.0f + item.origin_.x,
           units.top * size / 1000.0f + item.origin_.y));
-      CFX_FloatRect drawn = type3->GetFontMatrix().TransformRect(*bounds);
-      drawn.Normalize();
-      const bool reaches = meets(CFX_FloatRect(
-          drawn.left * size + item.origin_.x, drawn.bottom * size + item.origin_.y,
-          drawn.right * size + item.origin_.x, drawn.top * size + item.origin_.y));
+      bool reaches = true;
+      if (glyph.readable) {
+        CFX_FloatRect drawn =
+            type3->GetFontMatrix().TransformRect(*glyph.bounds);
+        drawn.Normalize();
+        reaches = meets(CFX_FloatRect(drawn.left * size + item.origin_.x,
+                                      drawn.bottom * size + item.origin_.y,
+                                      drawn.right * size + item.origin_.x,
+                                      drawn.top * size + item.origin_.y));
+      }
       if (reaches && !declared) {
         ++count;
       }
@@ -2360,6 +2707,9 @@ class Walker {
     }
     unsigned count = 0;
     for (auto it = holder->begin(); it != holder->end(); ++it) {
+      if (context_->work.spent) {
+        return count;
+      }
       CPDF_PageObject* object = it->get();
       count += CellsOf(object, chain).content;
       if (CPDF_TextObject* text = object->AsText()) {
@@ -2768,26 +3118,51 @@ void Unremovable(Context* context, Entry* entry) {
   if (!redactor) {
     return;
   }
-  CPDF_Page* page = context->page;
+  // Annotation appearances are not read. The apply removes every annotation
+  // whose /Rect meets a region, and one whose /Rect does not is drawn inside
+  // that rectangle and cannot paint in the region.
   Walker walker(entry, redactor.get(), context);
-  walker.Unremovable(page, CFX_Matrix(), 0, Clips());
-  RetainPtr<const CPDF_Array> annots = page->GetAnnotsArray();
-  for (size_t i = 0; annots && i < annots->size(); ++i) {
-    RetainPtr<const CPDF_Dictionary> annot = annots->GetDictAt(i);
-    if (!annot) {
-      continue;
-    }
-    const ByteString subtype = annot->GetNameFor("Subtype");
-    if (subtype == "Redact" || subtype == "Popup") {
-      continue;
-    }
-    for (RetainPtr<CPDF_Stream>& stream : AppearanceStreams(annot.Get())) {
-      CFX_Matrix to_page;
-      std::unique_ptr<CPDF_Form> form =
-          Appearance(page, annot.Get(), std::move(stream), &to_page);
-      walker.Unremovable(form.get(), to_page, 0, Clips());
+  walker.Unremovable(context->page, CFX_Matrix(), 0, Clips(), nullptr);
+}
+
+// Charges the page's own content, already parsed, to the work budget: its
+// content streams' bytes as the file holds them, and its objects.
+void ChargePage(Context* context) {
+  CPDF_Page* page = context->page;
+  uint64_t units = page->GetPageObjectCount() + 1;
+  RetainPtr<const CPDF_Object> contents =
+      page->GetDict()->GetDirectObjectFor("Contents");
+  if (const CPDF_Stream* stream = contents ? contents->AsStream() : nullptr) {
+    units += stream->GetRawSize();
+  } else if (const CPDF_Array* streams = contents ? contents->AsArray() : nullptr) {
+    for (size_t i = 0; i < streams->size(); ++i) {
+      RetainPtr<const CPDF_Stream> part = streams->GetStreamAt(i);
+      units += part ? part->GetRawSize() : 0;
     }
   }
+  context->work.Spend(units);
+}
+
+// Whether anything the apply cannot rewrite is painted under |entries|'
+// regions of |page|: 1 when so, 0 when not, -1 when it could not look.
+int UnremovableUnder(CPDF_Page* page, std::vector<Entry>* entries) {
+  Context context(page, /*strict=*/true);
+  ChargePage(&context);
+  for (Entry& entry : *entries) {
+    Unremovable(&context, &entry);
+    if (context.work.spent) {
+      context.failed = true;
+    }
+    if (context.failed) {
+      return -1;
+    }
+  }
+  for (const Entry& entry : *entries) {
+    if (entry.patterns || entry.shadings || entry.mask_groups || entry.glyphs) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 // Fills in |entry|'s counts. Sets the context's |failed| when it could not
@@ -2799,7 +3174,7 @@ void Inspect(Context* context, Entry* entry) {
   }
   CPDF_Page* page = context->page;
   Walker walker(entry, redactor.get(), context);
-  walker.Holder(page, CFX_Matrix(), Scope::kPage, true, 0, Clips());
+  walker.Holder(page, CFX_Matrix(), Scope::kPage, true, 0, Clips(), nullptr);
   if (context->work.spent) {
     context->failed = true;
     return;
@@ -2826,12 +3201,22 @@ void Inspect(Context* context, Entry* entry) {
       counted |= RedactRegionIntersectsRect(region, rect);
     }
     for (RetainPtr<CPDF_Stream>& stream : AppearanceStreams(annot.Get())) {
+      bool fell_back = false;
+      ChargeStream(&context->work, stream.Get(), &fell_back);
+      if (context->work.spent) {
+        break;
+      }
       CFX_Matrix to_page;
       std::unique_ptr<CPDF_Form> form =
           Appearance(page, annot.Get(), std::move(stream), &to_page);
+      // An appearance that could not be read counts when it lies there.
+      if (Unreadable(fell_back, *form)) {
+        entry->counts.annotation_text += counted ? 1 : 0;
+        continue;
+      }
       // Walked either way, for the page copies inside.
       walker.Holder(form.get(), to_page, Scope::kAnnotation, counted, 0,
-                    Clips());
+                    Clips(), nullptr);
     }
   }
   // A region counts content when either test finds it.
@@ -3088,6 +3473,23 @@ bool Signed(RetainPtr<const CPDF_Array> fields) {
 
 }  // namespace
 
+namespace inkbar {
+
+int UnremovableUnderQuads(CPDF_Page* page,
+                          const std::vector<std::array<float, 8>>& quads) {
+  if (quads.empty()) {
+    return 0;
+  }
+  std::optional<std::vector<Entry>> entries =
+      EntriesOf(quads[0].data(), static_cast<int>(quads.size()));
+  if (!entries.has_value()) {
+    return -1;
+  }
+  return UnremovableUnder(page, &*entries);
+}
+
+}  // namespace inkbar
+
 extern "C" {
 
 char* INK_Inspect_Page(FPDF_DOCUMENT doc,
@@ -3114,6 +3516,7 @@ char* INK_Inspect_Page(FPDF_DOCUMENT doc,
   {
     ScopedFPDFPageView view(handle);
     Context context(view.Get(), /*strict=*/count > 0);
+    ChargePage(&context);
     IndexHolder(context.page, false, 0, &context);
     if (count == 0) {
       entries = FindCandidates(&context);
@@ -3152,15 +3555,7 @@ char* INK_Redact_Unremovable(FPDF_DOCUMENT doc,
   std::string report;
   {
     ScopedFPDFPageView view(handle);
-    Context context(view.Get(), /*strict=*/true);
-    for (Entry& entry : *entries) {
-      Unremovable(&context, &entry);
-      if (context.work.spent) {
-        context.failed = true;
-        break;
-      }
-    }
-    if (!context.failed) {
+    if (UnremovableUnder(view.Get(), &*entries) >= 0) {
       report = UnremovableReport(*entries);
     }
   }

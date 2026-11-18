@@ -30,6 +30,7 @@
 #include "fpdfsdk/cpdfsdk_helpers.h"
 #include "fpdfsdk/epdf_object_helpers.h"
 #include "inkbar/appearance.h"
+#include "inkbar/inspect.h"
 #include "public/epdf_redact.h"
 #include "public/fpdf_edit.h"
 
@@ -203,6 +204,7 @@ int INK_Redact_ApplyPage(FPDF_DOCUMENT doc,
     }
   }
   Handles handles;
+  std::vector<FPDF_ANNOTATION> own;
   if (own_locked) {
     const int annots = FPDFPage_GetAnnotCount(page);
     for (int i = 0; i < annots; ++i) {
@@ -214,8 +216,8 @@ int INK_Redact_ApplyPage(FPDF_DOCUMENT doc,
       const CPDF_Dictionary* dict =
           CPDFAnnotContextFromFPDFAnnotation(annot)->GetAnnotDict();
       if (IsRedact(dict) && dict->KeyExist(kDataKey)) {
-        TagOverlay(view.Get(), CPDFAnnotContextFromFPDFAnnotation(annot));
         // Applied once even when also among |marks|: the engine dedupes.
+        own.push_back(annot);
         apply.push_back(annot);
       }
     }
@@ -225,6 +227,27 @@ int INK_Redact_ApplyPage(FPDF_DOCUMENT doc,
       *out_left = CountRedacts(pdf_page);
     }
     return 0;
+  }
+
+  // The apply cuts or clips an object that paints with a pattern, a shading
+  // that can hold a picture or a soft mask's group, and leaves what it
+  // carries in the file. Nothing is changed when one lies under a mark, or
+  // when the page could not be read to tell.
+  std::vector<std::array<float, 8>> quads;
+  for (FPDF_ANNOTATION mark : apply) {
+    for (const std::array<float, 8>& quad :
+         MarkQuads(CPDFAnnotContextFromFPDFAnnotation(mark)->GetAnnotDict())) {
+      quads.push_back(quad);
+    }
+  }
+  if (inkbar::UnremovableUnderQuads(pdf_page, quads) != 0) {
+    if (out_left) {
+      *out_left = CountRedacts(pdf_page);
+    }
+    return -1;
+  }
+  for (FPDF_ANNOTATION annot : own) {
+    TagOverlay(view.Get(), CPDFAnnotContextFromFPDFAnnotation(annot));
   }
 
   uint32_t removed = 0;

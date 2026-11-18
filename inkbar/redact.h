@@ -38,7 +38,11 @@ int INK_Redact_SetOverlay(FPDF_DOCUMENT doc,
 // removed to *out_removed and the number of REDACT annotations left on the
 // page to *out_left. Returns 1 when applied, 0 when there was nothing to
 // apply, -1 on failure. The caller closes the handles at |marks| afterwards.
-// On failure the page may be partly changed: reload the document.
+// Before anything is changed it asks what INK_Redact_Unremovable asks, of the
+// marks it is about to apply: when something the apply cannot rewrite is
+// painted under one, or the page could not be read to tell, it returns -1
+// and the page is as it was. After any other failure the page may be partly
+// changed: reload the document.
 int INK_Redact_ApplyPage(FPDF_DOCUMENT doc,
                          FPDF_PAGE page,
                          const FPDF_ANNOTATION* marks,
@@ -70,13 +74,16 @@ int INK_Redact_OwnLockedQuads(FPDF_DOCUMENT doc,
 // |quads| as INK_Inspect_Page takes them; |count| > 0. NULL when it could
 // not look (no such page, a bad quad, a limit met, the work budget spent).
 //
-// Counted are the objects, in the page content, in forms at any depth and
-// in annotation appearances, that paint in the region (their shape and every
-// clip in effect, those of enclosing form objects included) and are:
-//   patterns: filled, stroked or shown with a tiling pattern;
-//   shadings: a function-based or mesh shading (types 1, 4 to 7), painted
-//     with sh or as a shading pattern;
-//   maskGroups: under a soft mask whose group holds anything in the region;
+// Counted are the objects, in the page content and in forms at any depth,
+// that paint in the region (their shape and every clip in effect, those of
+// enclosing form objects included), do not lie wholly inside it (the apply
+// removes those outright), and are:
+//   patterns: painting with a tiling pattern;
+//   shadings: a shading that is not a plain ramp (types 1 and 4 to 7, and
+//     an axial or radial shading whose function is not plain), painted with
+//     sh or as a shading pattern;
+//   maskGroups: under a soft mask whose group holds more than a fade in the
+//     region;
 //   glyphs: text in a Type 3 font with a glyph whose procedure paints in
 //     the region though the box it declares does not meet it. A glyph whose
 //     box meets the region is removed with its text and is not counted.

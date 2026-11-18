@@ -54,4 +54,19 @@ void INK_Inspect_Free(char* report);
 }  // extern "C"
 #endif
 
+#ifdef __cplusplus
+#include <array>
+#include <vector>
+
+class CPDF_Page;
+
+namespace inkbar {
+// What INK_Redact_Unremovable asks, of |quads| (8 floats each, as
+// /QuadPoints) on |page|: 1 when something the apply cannot rewrite is
+// painted under one, 0 when nothing is, -1 when it could not look.
+int UnremovableUnderQuads(CPDF_Page* page,
+                          const std::vector<std::array<float, 8>>& quads);
+}  // namespace inkbar
+#endif
+
 #endif  // INKBAR_INSPECT_H_

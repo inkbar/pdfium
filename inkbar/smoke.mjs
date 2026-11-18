@@ -1388,15 +1388,35 @@ const type3Page = (text) => onePagePdf(`BT /T3 40 Tf ${text} ET`, { resources: '
 
 // The counts INK_Redact_Unremovable gives for |rects| on page 0 of |source|:
 // patterns, shadings, mask groups, glyphs.
-function unremovable(source, rects = [PATTERN_MARK]) {
+function unremovableIn(doc, rects = [PATTERN_MARK]) {
+  const quads = rects.map(quadOf)
+  const ptr = m._malloc(quads.length * 32)
+  m.HEAPF32.set(quads.flat(), ptr / 4)
+  const { regions } = report(m._INK_Redact_Unremovable(doc, 0, ptr, quads.length))
+  m._free(ptr)
+  return regions.map((r) => [r.patterns, r.shadings, r.maskGroups, r.glyphs])
+}
+const unremovable = (source, rects) => withDoc(source, (doc) => unremovableIn(doc, rects))
+// The raw pointer INK_Redact_Unremovable returns for PATTERN_MARK, freed; 0 for NULL.
+function unremovablePointer(source) {
   return withDoc(source, (doc) => {
-    const quads = rects.map(quadOf)
-    const ptr = m._malloc(quads.length * 32)
-    m.HEAPF32.set(quads.flat(), ptr / 4)
-    const { regions } = report(m._INK_Redact_Unremovable(doc, 0, ptr, quads.length))
+    const ptr = m._malloc(32)
+    m.HEAPF32.set(quadOf(PATTERN_MARK), ptr / 4)
+    const result = m._INK_Redact_Unremovable(doc, 0, ptr, 1)
     m._free(ptr)
-    return regions.map((r) => [r.patterns, r.shadings, r.maskGroups, r.glyphs])
+    if (result) m._INK_Inspect_Free(result)
+    return result
   })
+}
+// The result of applying a mark over |rect| on |source|, and the saved bytes.
+function tryApply(source, rect = PATTERN_MARK) {
+  let result
+  const bytes = editPage(source, (doc, page) => {
+    const mark = addMark(page, rect)
+    result = applyPage(doc, page, [mark], false).result
+    m._FPDFPage_CloseAnnot(mark)
+  })
+  return { result, bytes }
 }
 // |source| with a mark applied, whatever INK_Redact_Unremovable says.
 function forceApply(source, rect = PATTERN_MARK) {
@@ -1421,7 +1441,7 @@ const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, 
   assert.deepEqual(unremovable(patternPage('20 50 360 100 re S', [hatchCell], '/Pattern CS /P0 SCN 10 w')), [none], 'a pattern stroke around the mark')
   assert.deepEqual(unremovable(patternPage('20 50 360 100 re S', [hatchCell], '/Pattern CS /P0 SCN 30 w')), [[1, 0, 0, 0]], 'a pattern stroke that enters the mark')
   assert.deepEqual(
-    unremovable(onePagePdf('BT /Pattern cs /P0 scn /F1 40 Tf 160 80 Td (AB) Tj ET', { resources: '/Pattern << /P0 6 0 R >>' }, [hatchCell])),
+    unremovable(onePagePdf('BT /Pattern cs /P0 scn /F1 40 Tf 160 80 Td (ABCDEFGHIJ) Tj ET', { resources: '/Pattern << /P0 6 0 R >>' }, [hatchCell])),
     [[1, 0, 0, 0]],
     'text shown with a pattern colour',
   )
@@ -1506,27 +1526,6 @@ const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, 
   assert.deepEqual(zeros(under(forceApply(whole))), [0, 0, 0, 0, 0, 0], 'a fill the apply removed')
 }
 
-// reads nothing under a cut fill: INK_Redact_Unremovable is the gate
-{
-  // What happens when an apply is forced over a carrier that reaches past
-  // the mark, against INK_Redact_Unremovable. The apply cuts the bar and
-  // leaves the pattern, whose cell still draws under the mark. On the saved
-  // page no object paints with the pattern in the region any more, and the
-  // cut bar cannot say that it once did, so INK_Inspect_Page reads nothing
-  // there. It verifies what an apply removed; it is not the gate for
-  // patterns, shading patterns and mask groups.
-  const band = '20 50 360 100 re f'
-  for (const [name, source] of [
-    ['a pattern fill', patternPage(band, [pageCell])],
-    ['a mesh shading pattern fill', onePagePdf(`q /Pattern cs /P0 scn ${band} Q`, { resources: '/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading 6 0 R >> >>' }, [meshShading])],
-    ['a masked fill', maskedPage(band, maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET'))],
-  ]) {
-    assert.ok(unremovable(source)[0].some((n) => n > 0), `${name}: not refused before the apply`)
-    const after = under(forceApply(source))
-    assert.deepEqual(zeros(after), [0, 0, 0, 0, 0, 0], `${name}: ${JSON.stringify(after)}`)
-  }
-}
-
 // counts a path filled with a shading pattern by the path's own rule
 {
   const source = onePagePdf('q /Pattern cs /P0 scn 20 50 360 100 re f Q', { resources: `/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading << ${axial} >> >> >>` })
@@ -1538,30 +1537,28 @@ const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, 
   assert.equal(under(mesh, BESIDE_MARK).paths, 0, 'a mesh pattern fill beside the region')
 }
 
-// still counts a mesh or function-based shading after the apply clipped it
+// still counts a mesh or function-based shading under a clip that excludes the region
 {
-  // |source| before and after the apply: the paths under the mark, and after
-  // the apply those beside it. The apply's own clip does not hide a shading
-  // painted with sh: all clips are ignored for these types.
-  const pathsAround = (source) => {
-    const applied = forceApply(source)
-    return [under(source).paths, under(applied).paths, under(applied, BESIDE_MARK).paths]
-  }
-  const mesh = onePagePdf('/Sh0 sh', { resources: '/Shading << /Sh0 6 0 R >>' }, [meshShading])
-  assert.deepEqual(pathsAround(mesh), [1, 1, 0], 'a mesh shading before the apply, after it, and beside the mark')
+  // A file in which something clipped such a shading away from a box, as an
+  // apply does. (The fork's own apply refuses to, so the files are made by
+  // hand.) The clip does not hide the shading: all clips are ignored for
+  // these types.
+  const hole = '0 0 400 200 re 150 60 100 80 re W* n'
+  const mesh = onePagePdf(`q ${hole} /Sh0 sh Q`, { resources: '/Shading << /Sh0 6 0 R >>' }, [meshShading])
+  assert.equal(under(mesh).paths, 1, 'a mesh shading clipped away from the region')
+  assert.equal(under(mesh, BESIDE_MARK).paths, 0, 'a mesh shading beside the region')
   // The same in candidate mode, under a black box drawn over the mesh.
   const boxed = onePagePdf('/Sh0 sh 0 g 150 60 100 80 re f', { resources: '/Shading << /Sh0 6 0 R >>' }, [meshShading])
   const box = withDoc(boxed, (doc) => inspectPage(doc, 0, [])).find((c) => c.kind === 'filled-box')
   assert.ok(box && box.paths > 0, `a mesh shading under a black box: ${JSON.stringify(box)}`)
   const colours = streamObject('/FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1]', '{ 2 copy add 2 div }', true)
-  // Clipped to a box a little past the mark: PDFium takes an unclipped
-  // shading to paint the whole page, and the apply removes one that lies
-  // wholly under the mark.
-  const source = onePagePdf('q 120 50 160 100 re W n /Sh0 sh Q', {
-    resources: '/Shading << /Sh0 << /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] /Matrix [100 0 0 80 150 60] /Function 6 0 R >> >>',
-  }, [colours])
-  assert.deepEqual(pathsAround(source), [1, 1, 0], 'a function-based shading before the apply, after it, and beside the mark')
-  assert.deepEqual(unremovable(source), [[0, 1, 0, 0]], 'a function-based shading under the mark')
+  const functionBased = (clip) =>
+    onePagePdf(`q ${clip} /Sh0 sh Q`, {
+      resources: '/Shading << /Sh0 << /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] /Matrix [100 0 0 80 150 60] /Function 6 0 R >> >>',
+    }, [colours])
+  assert.equal(under(functionBased(`120 50 160 100 re W n ${hole}`)).paths, 1, 'a function-based shading clipped away from the region')
+  assert.equal(under(functionBased(`120 50 160 100 re W n ${hole}`), BESIDE_MARK).paths, 0, 'a function-based shading beside the region')
+  assert.deepEqual(unremovable(functionBased('120 50 160 100 re W n')), [[0, 1, 0, 0]], 'a function-based shading under the mark')
 }
 
 // counts what a soft mask group holds for an object that paints in the region
@@ -1598,7 +1595,8 @@ const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, 
     streamObject(`/Type /XObject /Subtype /Form /BBox [20 50 380 150] ${masked}`, '/GS0 gs 0 0 1 rg 20 50 360 100 re f'),
   ])
   assert.ok(under(inAppearance).annotationText > 0, 'the group of a mask set in an appearance')
-  assert.deepEqual(unremovable(inAppearance), [[0, 0, 1, 0]], 'the group of a mask set in an appearance')
+  // The apply removes this annotation, so the gate does not read it.
+  assert.deepEqual(unremovable(inAppearance), [[0, 0, 0, 0]], 'the group of a mask set in an appearance')
 }
 
 // counts a Type 3 glyph that draws out of its box into the region
@@ -1606,6 +1604,239 @@ const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, 
   const reach = under(type3Page('100 80 Td (a) Tj'))
   assert.ok(reach.textChars > 0, `a glyph drawn into the region from outside its box: ${JSON.stringify(reach)}`)
   assert.equal(under(type3Page('300 80 Td (b) Tj')).textChars, 0, 'an ordinary glyph beside the region')
+}
+
+// closes the gaps a review found in the gate
+{
+  const none = [0, 0, 0, 0]
+  const band = '20 50 360 100 re f'
+  const patterned = (content, patterns = [hatchCell], resources = '') => onePagePdf(content, { resources: `/Pattern << /P0 6 0 R >> ${resources}` }, patterns)
+  // A bitmap glyph is read the same before and after the page was rendered,
+  // which drops the glyph's parsed form from the font's cache.
+  const wide = [
+    '<< /Type /Font /Subtype /Type3 /FontBBox [0 0 3000 1000] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 7 0 R >> /Encoding << /Type /Encoding /Differences [97 /a] >> /FirstChar 97 /LastChar 97 /Widths [100] >>',
+    streamObject('', '100 0 0 0 100 100 d1 q 3000 0 0 1000 0 0 cm BI /IM true /W 8 /H 8 /BPC 1 /D [1 0] /F /AHx ID 8142241818244281> EI Q', true),
+  ]
+  const bitmapOut = onePagePdf('BT /T3 40 Tf 100 80 Td (a) Tj ET', { resources: '/Font << /T3 6 0 R >>' }, wide)
+  withDoc(bitmapOut, (doc) => {
+    pixelAt(doc, 10, 10)
+    assert.deepEqual(unremovableIn(doc), [[0, 0, 0, 1]], 'a bitmap glyph drawn out of its box, after a render')
+    assert.ok(inspectPage(doc, 0, [PATTERN_MARK])[0].textChars > 0, 'the same in the inspector, after a render')
+  })
+  // Tags a file carries are not trusted before an apply.
+  for (const tag of ['INKB_Overlay', 'INKB_PageCopy']) {
+    const tagged = onePagePdf('/Fm0 Do', { resources: '/XObject << /Fm0 7 0 R >>' }, [
+      hatchCell,
+      streamObject(`/Type /XObject /Subtype /Form /BBox [0 0 400 200] /${tag} true /Resources << /Pattern << /P0 6 0 R >> >>`, `/Pattern cs /P0 scn ${band}`),
+    ])
+    assert.deepEqual(unremovable(tagged), [[1, 0, 0, 0]], `a pattern fill in a form tagged /${tag}`)
+  }
+  // A ramp is plain only when its function is.
+  const ramp = (fn) => onePagePdf('q 20 50 360 100 re W n /Sh0 sh Q', { resources: `/Shading << /Sh0 << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 400 0] /Function ${fn} >> >>` }, [
+    streamObject('/FunctionType 0 /Domain [0 1] /Range [0 1 0 1 0 1] /Size [4] /BitsPerSample 8', Buffer.from([255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0])),
+  ])
+  const exponent = '<< /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>'
+  assert.deepEqual(unremovable(ramp('6 0 R')), [[0, 1, 0, 0]], 'an axial shading with a sampled function')
+  assert.ok(under(ramp('6 0 R')).paths > 0)
+  assert.deepEqual(unremovable(ramp(exponent)), [none], 'an axial shading with an exponential function')
+  assert.deepEqual(unremovable(ramp(`<< /FunctionType 3 /Domain [0 1] /Functions [${exponent} ${exponent}] /Bounds [0.5] /Encode [0 1 0 1] >>`)), [none], 'an axial shading with two stitched stops')
+  assert.deepEqual(
+    unremovable(ramp(`<< /FunctionType 3 /Domain [0 1] /Functions [${Array(9).fill(exponent).join(' ')}] /Bounds [0.1 0.2 0.3 0.4 0.5 0.6 0.7 0.8] /Encode [${Array(9).fill('0 1').join(' ')}] >>`)),
+    [[0, 1, 0, 0]],
+    'an axial shading with nine stitched stops',
+  )
+  // What cannot be decoded counts.
+  const garbage = streamObject('/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Filter /FlateDecode', 'this is not Flate data', true)
+  assert.deepEqual(unremovable(maskedPage(band, garbage)), [[0, 0, 1, 0]], 'a mask group that cannot be decoded')
+  const broken = onePagePdf('BT /T3 40 Tf 300 80 Td (a) Tj ET', { resources: '/Font << /T3 6 0 R >>' }, [wide[0], streamObject('/Filter /FlateDecode', 'this is not Flate data', true)])
+  assert.deepEqual(unremovable(broken), [[0, 0, 0, 1]], 'a glyph procedure that cannot be decoded')
+  // Text: the colour its rendering mode uses, and its stroke's width.
+  assert.deepEqual(unremovable(patterned('BT /Pattern CS /P0 SCN 30 w 1 Tr /F1 40 Tf 256 80 Td (I) Tj ET')), [[1, 0, 0, 0]], 'the stroke of pattern-stroked text beside the mark')
+  assert.deepEqual(unremovable(patterned('BT /Pattern CS /P0 SCN 1 w 1 Tr /F1 40 Tf 256 80 Td (I) Tj ET')), [none], 'thin pattern-stroked text beside the mark')
+  assert.deepEqual(unremovable(patterned('BT /Pattern CS /P0 SCN 0 g /F1 40 Tf 160 80 Td (AB) Tj ET')), [none], 'filled text with a pattern stroke colour it does not use')
+  assert.deepEqual(unremovable(patterned('BT /Pattern cs /P0 scn 3 Tr /F1 40 Tf 160 80 Td (AB) Tj ET')), [none], 'invisible text with a pattern colour')
+  assert.deepEqual(unremovable(patterned('BT /Pattern cs /P0 scn 2 Tr /F1 40 Tf 160 80 Td (ABCDEFGHIJ) Tj ET')), [[1, 0, 0, 0]], 'filled and stroked text with a pattern fill')
+  // Other painters.
+  const uncoloured = patternPage(band, [tiling([0, 0, 10, 10], 10, 10, '0 0 m 10 10 l S', '/PaintType 2')], '/Cs0 cs 1 0 0 /P0 scn', '/ColorSpace << /Cs0 [/Pattern /DeviceRGB] >>')
+  assert.deepEqual(unremovable(uncoloured), [[1, 0, 0, 0]], 'an uncoloured pattern')
+  const image = (dict, data) =>
+    onePagePdf('q /Pattern cs /P0 scn 360 0 0 100 20 50 cm /Im0 Do Q', { resources: '/Pattern << /P0 6 0 R >> /XObject << /Im0 7 0 R >>' }, [hatchCell, streamObject(`/Type /XObject /Subtype /Image /Width 8 /Height 8 ${dict}`, data)])
+  assert.deepEqual(unremovable(image('/ImageMask true /BitsPerComponent 1', Buffer.alloc(8, 0x55))), [[1, 0, 0, 0]], 'an image mask painted with a pattern colour')
+  assert.deepEqual(unremovable(image('/ColorSpace /DeviceGray /BitsPerComponent 8', Buffer.alloc(64, 0x55))), [none], 'an image beside a pattern colour it does not use')
+  assert.deepEqual(unremovable(patterned(`q 260 40 130 120 re W n /Pattern cs /P0 scn ${band} Q`)), [none], 'a pattern fill clipped away from the mark')
+  assert.deepEqual(unremovable(patterned(`q 100 40 200 120 re W n /Pattern cs /P0 scn ${band} Q`)), [[1, 0, 0, 0]], 'a pattern fill clipped over the mark')
+  // Annotations: the apply removes one whose /Rect meets a region, and
+  // another cannot paint in it.
+  for (const rect of ['20 50 380 150', '20 150 380 190']) {
+    const [l, b, r, t] = rect.split(' ').map(Number)
+    const inAppearance = onePagePdf('', { page: '/Annots [7 0 R]' }, [
+      hatchCell,
+      `<< /Type /Annot /Subtype /Square /Rect [${rect}] /AP << /N 8 0 R >> >>`,
+      streamObject(`/Type /XObject /Subtype /Form /BBox [${rect}] /Resources << /Pattern << /P0 6 0 R >> >>`, `/Pattern cs /P0 scn ${l} ${b} ${r - l} ${t - b} re f`),
+    ])
+    assert.deepEqual(unremovable(inAppearance), [none], `a pattern in an appearance at ${rect}`)
+  }
+  // Fades: a mask group holding nothing but ramps and rectangles is how
+  // gradient transparency is drawn, and does not count.
+  const fadeOver = (content, group) =>
+    onePagePdf(`q /GS0 gs ${content} Q BT /F1 12 Tf 20 20 Td (KEEP) Tj ET`, { resources: '/ExtGState << /GS0 << /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >>' }, [
+      maskGroup(group, `/Shading << /Sh0 << ${axial} >> >>`),
+    ])
+  const fadedText = fadeOver('BT /F1 20 Tf 160 90 Td (FADED) Tj ET', '0 0 400 200 re f /Sh0 sh')
+  assert.deepEqual(unremovable(fadedText), [none], 'text under a fade')
+  const faded = tryApply(fadedText)
+  assert.equal(faded.result, 1, 'an apply over text under a fade')
+  assert.ok(!shows(inflateStreams(faded.bytes), 'FADED') && shows(inflateStreams(faded.bytes), 'KEEP'), 'the text under the fade was not removed')
+  assert.deepEqual(unremovable(fadeOver(`0 0 1 rg ${band}`, '0 0 400 200 re f /Sh0 sh')), [none], 'a bar under a fade')
+  assert.deepEqual(unremovable(fadeOver(`0 0 1 rg ${band}`, '/Sh0 sh 170 80 m 230 85 l 220 120 l h f')), [[0, 0, 1, 0]], 'a fade group that also holds a shape')
+  // A mask set on the page reaches into a form painted under it, and lies
+  // where it was set: the form's matrix does not move it again.
+  const inherited = onePagePdf('/GS0 gs /Fm0 Do', { resources: '/XObject << /Fm0 7 0 R >> /ExtGState << /GS0 << /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >>' }, [
+    maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET'),
+    streamObject('/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Matrix [1 0 0 1 100 0]', '0 0 1 rg 0 50 260 100 re f'),
+  ])
+  assert.deepEqual(unremovable(inherited, [PATTERN_MARK, [262, 60, 350, 140]]), [[0, 0, 1, 0], none], 'a mask inherited across Do')
+  const reset = onePagePdf(`/GS0 gs /GS1 gs 0 0 1 rg ${band}`, { resources: '/ExtGState << /GS0 << /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> /GS1 << /SMask /None >> >>' }, [
+    maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET'),
+  ])
+  assert.deepEqual(unremovable(reset), [none], 'a mask reset with /SMask /None')
+  // NULL at the limits.
+  assert.equal(unremovablePointer(nestedFormsPdf(41)), 0, 'forms 41 deep')
+  const heavy = onePagePdf(
+    Array.from({ length: 160 }, (_, i) => `q 1 0 0 1 ${(i / 100).toFixed(2)} 0 cm /GS0 gs ${band} Q`).join(' '),
+    { resources: '/ExtGState << /GS0 << /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >>' },
+    [maskGroup(' '.repeat(8 << 20))],
+  )
+  const started = Date.now()
+  assert.equal(unremovablePointer(heavy), 0, 'a page past the work budget returned a report')
+  assert.ok(Date.now() - started < 10000, 'the gate took more than 10 s')
+}
+
+// refuses an apply over what it cannot rewrite
+{
+  // INK_Redact_ApplyPage asks the same question of the marks it is about to
+  // apply, so a caller that did not ask INK_Redact_Unremovable first cannot
+  // cut a carrier and leave its content behind. The page is left as it was.
+  const band = '20 50 360 100 re f'
+  for (const [name, source] of [
+    ['a pattern fill', patternPage(band, [pageCell])],
+    ['a mesh shading pattern fill', onePagePdf(`q /Pattern cs /P0 scn ${band} Q`, { resources: '/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading 6 0 R >> >>' }, [meshShading])],
+    ['a mesh shading', onePagePdf('/Sh0 sh', { resources: '/Shading << /Sh0 6 0 R >>' }, [meshShading])],
+    ['a masked fill', maskedPage(band, maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET'))],
+    ['a glyph drawn out of its box', type3Page('100 80 Td (a) Tj')],
+    ['forms nested too deep to read', nestedFormsPdf(41)],
+  ]) {
+    const before = withDoc(source, (doc) => (inspectPointer(doc, 0, [quadOf(PATTERN_MARK)]) ? JSON.stringify(inspectPage(doc, 0, [PATTERN_MARK])) : 'NULL'))
+    const forced = tryApply(source)
+    assert.equal(forced.result, -1, `${name}: the apply went ahead`)
+    const after = withDoc(forced.bytes, (doc) => (inspectPointer(doc, 0, [quadOf(PATTERN_MARK)]) ? JSON.stringify(inspectPage(doc, 0, [PATTERN_MARK])) : 'NULL'))
+    assert.equal(after, before, `${name}: the refused apply changed the page`)
+    assert.equal(count(inflateStreams(forced.bytes), '/Redact'), 1, `${name}: the mark is gone`)
+  }
+  // The same for an own mark applied with own_locked.
+  let outcome
+  editPage(patternPage(band, [pageCell]), (doc, page) => {
+    const own = addMark(page, PATTERN_MARK)
+    setData(own, '{"v":1}')
+    m._FPDFPage_CloseAnnot(own)
+    outcome = applyPage(doc, page, [], true)
+  })
+  assert.equal(outcome.result, -1, 'an own mark over a pattern fill was applied')
+}
+
+// lets the apply remove a carrier whose object lies wholly inside the mark
+{
+  // The apply removes such an object outright, and the page no longer names
+  // what it carried, so the rewrite does not write it. Read from the saved
+  // file's streams, not from the inspector.
+  const solid = tiling([0, 0, 10, 10], 10, 10, '0 0 1 rg 0 0 9.75 10 re f')
+  const small = streamObject(
+    '/ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 400 0 200 0 1 0 1 0 1]',
+    Buffer.from([0, 105, 90, 255, 0, 0, 0, 150, 90, 0, 255, 0, 0, 128, 160, 0, 0, 255]),
+  )
+  const keep = 'BT /F1 12 Tf 20 20 Td (KEEP) Tj ET'
+  const patterned = (content) => onePagePdf(`q ${content} Q ${keep}`, { resources: '/Pattern << /P0 6 0 R >>' }, [solid])
+  const meshFill = (fill) => onePagePdf(`q /Pattern cs /P0 scn ${fill} Q ${keep}`, { resources: '/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading 6 0 R >> >>' }, [small])
+  const functionBased = onePagePdf(`q 160 70 80 60 re W n /Sh0 sh Q ${keep}`, {
+    resources: '/Shading << /Sh0 << /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] /Matrix [80 0 0 60 160 70] /Function 6 0 R >> >>',
+  }, [streamObject('/FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1]', '{ 2 copy add 2.125 div }', true)])
+  const group = maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET')
+  for (const [name, source, traces] of [
+    ['a pattern-filled path', patterned('/Pattern cs /P0 scn 160 70 80 60 re f'), ['9.75 10 re', '/PatternType']],
+    ['pattern-coloured text', patterned('BT /Pattern cs /P0 scn /F1 20 Tf 160 90 Td (AB) Tj ET'), ['9.75 10 re', '/PatternType']],
+    ['a pattern-stroked path', patterned('/Pattern CS /P0 SCN 4 w 170 80 60 40 re S'), ['9.75 10 re', '/PatternType']],
+    ['a mesh shading', onePagePdf(`/Sh0 sh ${keep}`, { resources: '/Shading << /Sh0 6 0 R >>' }, [small]), ['/BitsPerFlag', '/ShadingType']],
+    ['a mesh shading-pattern fill', meshFill('160 70 80 60 re f'), ['/BitsPerFlag', '/ShadingType', '/PatternType']],
+    ['a function-based shading', functionBased, ['2.125 div', '/ShadingType']],
+    ['a masked object', maskedPage('160 70 80 60 re f', group), ['MASKSECRET', '/SMask']],
+  ]) {
+    assert.ok(inflateStreams(source).includes(traces[0]), `${name}: the source lacks ${traces[0]}`)
+    assert.deepEqual(unremovable(source), [[0, 0, 0, 0]], `${name} wholly inside the mark`)
+    const applied = tryApply(source)
+    assert.equal(applied.result, 1, `${name}: the apply was refused`)
+    const saved = inflateStreams(applied.bytes)
+    const left = traces.filter((trace) => shows(saved, trace))
+    assert.deepEqual(left, [], `${name}: left in the saved file`)
+    assert.ok(shows(saved, 'KEEP'), `${name}: the kept text is gone`)
+  }
+  // A shape that pokes out of the mark is cut, not removed, and so is a
+  // large shape clipped to a window inside the mark: both are refused.
+  for (const [name, source, counts] of [
+    ['a pattern fill with one edge outside the mark', patterned('/Pattern cs /P0 scn 160 70 100 60 re f'), [1, 0, 0, 0]],
+    ['a pattern stroke whose width crosses the mark', patterned('/Pattern CS /P0 SCN 30 w 170 80 60 40 re S'), [1, 0, 0, 0]],
+    ['a large pattern fill clipped to a window inside the mark', patterned('160 70 80 60 re W n /Pattern cs /P0 scn 20 50 360 100 re f'), [1, 0, 0, 0]],
+    ['a mesh shading-pattern fill with one edge outside', meshFill('160 70 100 60 re f'), [0, 1, 0, 0]],
+    ['a masked fill with one edge outside', maskedPage('160 70 100 60 re f', group), [0, 0, 1, 0]],
+  ]) {
+    assert.deepEqual(unremovable(source), [counts], name)
+    assert.equal(tryApply(source).result, -1, `${name}: the apply went ahead`)
+  }
+  // A definition another object still paints with elsewhere stays in the
+  // file: that is content the page shows there, not under the mark. The
+  // object under the mark is removed all the same.
+  const shared = patterned('/Pattern cs /P0 scn 160 70 80 60 re f 20 160 100 30 re f')
+  assert.deepEqual(unremovable(shared), [[0, 0, 0, 0]])
+  const applied = tryApply(shared)
+  assert.equal(applied.result, 1)
+  assert.ok(inflateStreams(applied.bytes).includes('9.75 10 re'), 'the pattern another fill still uses is gone')
+  withDoc(applied.bytes, (doc) => {
+    assert.deepEqual(pixelAt(doc, 200, 100).slice(0, 3), [255, 255, 255], 'the fill under the mark is still painted')
+    assert.notDeepEqual(pixelAt(doc, 62, 172).slice(0, 3), [255, 255, 255], 'the fill beside the mark is gone')
+  })
+}
+
+// ends when patterns paint with patterns many times over
+{
+  // Eight patterns, each cell painting eight rectangles with the next: read
+  // naively, eight to the eighth cells.
+  const depth = 8
+  const cells = Array.from({ length: depth }, (_, k) =>
+    tiling(
+      [0, 0, 400, 200],
+      400,
+      200,
+      k + 1 < depth ? `/Pattern cs /Pn scn ${Array.from({ length: 8 }, (_, i) => `${i * 40} 0 40 200 re f`).join(' ')}` : '0 0 400 200 re f',
+      '/PaintType 1',
+      k + 1 < depth ? `/Pattern << /Pn ${7 + k} 0 R >>` : '',
+    ),
+  )
+  const source = patternPage('20 50 360 100 re f', cells)
+  const started = Date.now()
+  withDoc(source, (doc) => inspectPointer(doc, 0, [quadOf(PATTERN_MARK)]))
+  assert.ok(Date.now() - started < 5000, 'the inspection took more than 5 s')
+}
+
+// does not find what a cut left behind under a box: a known limit
+{
+  // A file another tool redacted by cutting a hole in a pattern fill and
+  // drawing a black box into it. The pattern's cell still draws under the
+  // box. The open check answers what is painted under a box, and nothing is:
+  // it does not find the content of a pattern, a mask group or a shading
+  // whose painted area was cut away from the box.
+  const cut = patternPage('20 50 360 100 re 150 60 100 80 re f* 0 g 150 60 100 80 re f', [pageCell])
+  const box = withDoc(cut, (doc) => inspectPage(doc, 0, [])).find((c) => c.kind === 'filled-box')
+  assert.ok(box, 'no black box candidate')
+  assert.deepEqual(zeros(box), [0, 0, 0, 0, 0, 0], `under a black box set into a cut fill: ${JSON.stringify(box)}`)
 }
 
 // leaves bitmap-font text to the text redactor
@@ -1810,7 +2041,13 @@ const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, 
     ],
     [
       'a mesh shading',
-      onePagePdf(`q 160 70 80 60 re W n /Sh0 sh Q ${keep}`, { resources: '/Shading << /Sh0 6 0 R >>' }, [meshShading]),
+      // A mesh that lies wholly inside the mark: one that reaches past it is refused.
+      onePagePdf(`q 160 70 80 60 re W n /Sh0 sh Q ${keep}`, { resources: '/Shading << /Sh0 6 0 R >>' }, [
+        streamObject(
+          '/ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 400 0 200 0 1 0 1 0 1]',
+          Buffer.from([0, 105, 90, 255, 0, 0, 0, 150, 90, 0, 255, 0, 0, 128, 160, 0, 0, 255]),
+        ),
+      ]),
       ['/ShadingType 4', '/ShadingType/4', '/BitsPerFlag'],
     ],
     [
