@@ -905,6 +905,13 @@ const textContent = 'BT /F1 20 Tf 50 100 Td (SECRET-ALPHA) Tj 200 0 Td (KEEP-BET
   })
 }
 
+// a region too small to shrink still counts the path under it
+{
+  const source = onePagePdf('0 0 1 rg 50 50 100 100 re f')
+  const [tiny] = withDoc(source, (doc) => inspectPage(doc, 0, [[70, 70, 70.015, 70.015]]))
+  assert.equal(tiny.paths, 1, `path under a tiny region: ${JSON.stringify(tiny)}`)
+}
+
 // inspects text inside a tiling pattern
 {
   const source = onePagePdf(

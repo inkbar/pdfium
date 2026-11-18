@@ -15,8 +15,10 @@ extern "C" {
 #endif
 
 // A UTF-8 JSON report in a malloc'd buffer the caller frees with
-// INK_Inspect_Free, or NULL on failure (no such page, a NULL quad pointer with
-// a nonzero count, a quad that is not finite).
+// INK_Inspect_Free, or NULL when it could not inspect: no such page, a NULL
+// quad pointer with a nonzero count, a quad that is not finite, nesting too
+// deep to read, or a region PDFium's path redactor cannot use. NULL never
+// stands for "nothing found"; treat it as a failed check.
 //
 // |quads|: |count| quads of 8 floats each (x1,y1 ... x4,y4: upper left, upper
 // right, lower left, lower right, as /QuadPoints), in page user space. One

@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -78,8 +79,10 @@ constexpr int kLossyTolerance = 12;
 constexpr float kBoxMinSize = 4.0f;
 constexpr float kBoxDarkBelow = 0.2f;
 constexpr float kBoxLightAbove = 0.98f;
-// Forms nested deeper than this are not walked.
-constexpr int kMaxDepth = 32;
+// Nesting deeper than this fails the inspection rather than going unread.
+// PDFium's content parser stops at 40 nested forms (kMaxFormLevel), so a
+// parsed page never reaches it.
+constexpr int kMaxDepth = 64;
 
 // -- Geometry, as cpdf_text_redactor.cpp tests glyphs ------------------------
 
@@ -541,8 +544,11 @@ enum class Scope {
 
 class Walker {
  public:
-  Walker(Entry* entry, const CPDF_PathRedactor* redactor, SampleCache* samples)
-      : entry_(entry), redactor_(redactor), samples_(samples) {}
+  Walker(Entry* entry,
+         const CPDF_PathRedactor* redactor,
+         SampleCache* samples,
+         bool* failed)
+      : entry_(entry), redactor_(redactor), samples_(samples), failed_(failed) {}
 
   void Holder(CPDF_PageObjectHolder* holder,
               const CFX_Matrix& to_page,
@@ -550,6 +556,7 @@ class Walker {
               bool counted,
               int depth) {
     if (depth > kMaxDepth) {
+      *failed_ = true;
       return;
     }
     const bool page = scope == Scope::kPage;
@@ -670,6 +677,7 @@ class Walker {
   // Characters and images anywhere in a pattern's content.
   unsigned PatternContent(CPDF_PageObjectHolder* holder, int depth) {
     if (depth > kMaxDepth) {
+      *failed_ = true;
       return 0;
     }
     unsigned count = 0;
@@ -691,6 +699,7 @@ class Walker {
   Entry* const entry_;
   const CPDF_PathRedactor* const redactor_;
   SampleCache* const samples_;
+  bool* const failed_;
 };
 
 // The appearance of an annotation, parsed, and the matrix that places it on
@@ -761,8 +770,10 @@ Entry BoxEntry(const char* kind, const CFX_FloatRect& box) {
 void FindBoxes(CPDF_PageObjectHolder* holder,
                const CFX_Matrix& to_page,
                int depth,
-               std::vector<Entry>* entries) {
+               std::vector<Entry>* entries,
+               bool* failed) {
   if (depth > kMaxDepth) {
+    *failed = true;
     return;
   }
   for (auto it = holder->begin(); it != holder->end(); ++it) {
@@ -784,7 +795,7 @@ void FindBoxes(CPDF_PageObjectHolder* holder,
       CPDF_Form* form = form_object->form();
       if (form && !FormHas(form, kOverlayKey)) {
         FindBoxes(form, form_object->form_matrix() * to_page, depth + 1,
-                  entries);
+                  entries, failed);
       }
     }
   }
@@ -805,7 +816,7 @@ std::optional<CFX_FloatRect> AnnotationBox(CPDF_Page* page,
   return path ? OpaqueFilledBox(*path, to_page) : std::nullopt;
 }
 
-std::vector<Entry> FindCandidates(CPDF_Page* page) {
+std::vector<Entry> FindCandidates(CPDF_Page* page, bool* failed) {
   std::vector<Entry> entries;
   RetainPtr<const CPDF_Array> annots = page->GetAnnotsArray();
   for (size_t i = 0; annots && i < annots->size(); ++i) {
@@ -826,7 +837,7 @@ std::vector<Entry> FindCandidates(CPDF_Page* page) {
     entry.own_annot = annot.Get();
     entries.push_back(std::move(entry));
   }
-  FindBoxes(page, CFX_Matrix(), 0, &entries);
+  FindBoxes(page, CFX_Matrix(), 0, &entries, failed);
   for (size_t i = 0; annots && i < annots->size(); ++i) {
     RetainPtr<const CPDF_Dictionary> annot = annots->GetDictAt(i);
     const ByteString subtype = annot ? annot->GetNameFor("Subtype") : "";
@@ -843,22 +854,22 @@ std::vector<Entry> FindCandidates(CPDF_Page* page) {
   return entries;
 }
 
-void Inspect(CPDF_Page* page, Entry* entry, SampleCache* samples) {
+// Fills in |entry|'s counts. Sets |failed| when it could not look everywhere.
+void Inspect(CPDF_Page* page,
+             Entry* entry,
+             SampleCache* samples,
+             bool* failed) {
+  // A region too small to shrink is tested as it is.
   std::vector<RedactRegion> inset;
   for (const RedactRegion& region : entry->regions) {
-    std::optional<RedactRegion> shrunk = Inset(region);
-    if (shrunk.has_value()) {
-      inset.push_back(*shrunk);
-    }
+    inset.push_back(Inset(region).value_or(region));
   }
-  std::unique_ptr<CPDF_PathRedactor> redactor;
-  if (!inset.empty()) {
-    redactor = std::make_unique<CPDF_PathRedactor>(pdfium::span(inset));
-    if (!redactor->IsValid()) {
-      redactor.reset();
-    }
+  auto redactor = std::make_unique<CPDF_PathRedactor>(pdfium::span(inset));
+  if (!redactor->IsValid()) {
+    *failed = true;
+    return;
   }
-  Walker walker(entry, redactor.get(), samples);
+  Walker walker(entry, redactor.get(), samples, failed);
   walker.Holder(page, CFX_Matrix(), Scope::kPage, true, 0);
 
   RetainPtr<const CPDF_Array> annots = page->GetAnnotsArray();
@@ -970,21 +981,27 @@ bool HiddenLayers(const CPDF_Dictionary* root) {
 }
 
 // Whether a field in the tree under |fields| is a signature field with a
-// value.
-bool Signed(const CPDF_Array* fields, int depth) {
-  if (!fields || depth > kMaxDepth) {
-    return false;
+// value. Each field is read once, so a tree that loops still ends.
+bool Signed(RetainPtr<const CPDF_Array> fields) {
+  std::vector<RetainPtr<const CPDF_Array>> pending;
+  std::set<const CPDF_Dictionary*> seen;
+  if (fields) {
+    pending.push_back(std::move(fields));
   }
-  for (size_t i = 0; i < fields->size(); ++i) {
-    RetainPtr<const CPDF_Dictionary> field = fields->GetDictAt(i);
-    if (!field) {
-      continue;
-    }
-    if (field->GetNameFor("FT") == "Sig" && field->GetDictFor("V")) {
-      return true;
-    }
-    if (Signed(field->GetArrayFor("Kids").Get(), depth + 1)) {
-      return true;
+  while (!pending.empty()) {
+    RetainPtr<const CPDF_Array> array = std::move(pending.back());
+    pending.pop_back();
+    for (size_t i = 0; i < array->size(); ++i) {
+      RetainPtr<const CPDF_Dictionary> field = array->GetDictAt(i);
+      if (!field || !seen.insert(field.Get()).second) {
+        continue;
+      }
+      if (field->GetNameFor("FT") == "Sig" && field->GetDictFor("V")) {
+        return true;
+      }
+      if (RetainPtr<const CPDF_Array> kids = field->GetArrayFor("Kids")) {
+        pending.push_back(std::move(kids));
+      }
     }
   }
   return false;
@@ -1030,17 +1047,20 @@ char* INK_Inspect_Page(FPDF_DOCUMENT doc,
   {
     ScopedFPDFPageView view(handle);
     CPDF_Page* page = view.Get();
+    bool failed = false;
     if (count == 0) {
-      entries = FindCandidates(page);
+      entries = FindCandidates(page, &failed);
     }
     SampleCache samples(page->GetDocument());
     for (Entry& entry : entries) {
-      Inspect(page, &entry, &samples);
+      Inspect(page, &entry, &samples, &failed);
     }
-    report = PageReport(entries);
+    if (!failed) {
+      report = PageReport(entries);
+    }
   }
   FPDF_ClosePage(handle);
-  return Copy(report);
+  return report.empty() ? nullptr : Copy(report);
 }
 
 char* INK_Inspect_File(FPDF_DOCUMENT doc,
@@ -1075,7 +1095,7 @@ char* INK_Inspect_File(FPDF_DOCUMENT doc,
   out += ",\"hiddenLayers\":";
   out += boolean(HiddenLayers(root));
   out += ",\"signed\":";
-  out += boolean(form && Signed(form->GetArrayFor("Fields").Get(), 0));
+  out += boolean(form && Signed(form->GetArrayFor("Fields")));
   out += "}";
   return Copy(out);
 }

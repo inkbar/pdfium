@@ -26,9 +26,10 @@
 
 namespace {
 
-// Deeper nesting than this is not walked: direct objects nest no deeper in
-// any real file, and an action chain longer than this is treated as a script.
-constexpr int kMaxDepth = 64;
+// PDFium's parser nests direct objects at most 64 deep
+// (kParserMaxRecursionDepth), so the walk never stops short of an object it
+// parsed. An action chain longer than this is treated as a script.
+constexpr int kMaxDepth = 256;
 
 class Sanitizer {
  public:
