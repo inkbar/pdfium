@@ -1601,6 +1601,21 @@ const sanitizedSaved = withDoc(sanitizeSource, (doc) => {
       ])
     return body(body(0).length)
   }
+  // A /Linearized first object whose /L is set, after a real update, to the
+  // final length: its trailer's /Prev points back, so still two revisions.
+  {
+    const placeholder = '/L 0000000000'
+    const original = buildPdf([
+      `<< /Type /Catalog /Pages 2 0 R /Linearized 1 ${placeholder} >>`,
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] >>',
+    ])
+    const updated = incremental(original)
+    const crafted = Buffer.from(updated.toString('latin1').replace(placeholder, `/L ${String(updated.length).padStart(10, '0')}`), 'latin1')
+    withDoc(crafted, (doc) => {
+      assert.equal(inspectFile(doc, crafted).revisions, 2, 'a crafted /L over an update')
+    })
+  }
   for (const key of ['/Linearized', '/LinearizedX']) {
     const updated = incremental(spoofed(key))
     withDoc(updated, (doc) => {

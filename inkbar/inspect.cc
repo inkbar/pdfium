@@ -1876,12 +1876,49 @@ std::optional<size_t> LinearizedLength(pdfium::span<const uint8_t> bytes) {
   return static_cast<size_t>(length->GetInteger());
 }
 
+// Whether the trailer that the first %%EOF (at |first_end|) closes has a
+// /Prev pointing forward, past that %%EOF: in a linearized file the first-page
+// trailer points on to the main cross-reference table, while an update's
+// trailer points back to an earlier one.
+bool FirstPrevPointsForward(pdfium::span<const uint8_t> bytes,
+                            std::string_view text,
+                            size_t first_end) {
+  // The first-page section's startxref is 0 in a linearized file, so the
+  // trailer is found by its place: the last "trailer" before the first
+  // %%EOF, or else a cross-reference stream as the object right after the
+  // linearization dictionary.
+  CPDF_SyntaxParser parser(pdfium::MakeRetain<CFX_ReadOnlySpanStream>(bytes));
+  RetainPtr<const CPDF_Dictionary> trailer;
+  const std::string_view head = text.substr(0, first_end);
+  const size_t word = head.rfind("trailer");
+  if (word != std::string_view::npos) {
+    parser.SetPos(static_cast<FX_FILESIZE>(word + 7));
+    trailer = ToDictionary(parser.GetObjectBody(nullptr));
+  } else {
+    const size_t first_object_end = head.find("endobj");
+    if (first_object_end == std::string_view::npos) {
+      return false;
+    }
+    parser.SetPos(static_cast<FX_FILESIZE>(first_object_end + 6));
+    RetainPtr<const CPDF_Stream> stream = ToStream(
+        parser.GetIndirectObject(nullptr, CPDF_SyntaxParser::ParseType::kLoose));
+    if (stream && stream->GetDict()->GetNameFor("Type") == "XRef") {
+      trailer = stream->GetDict();
+    }
+  }
+  RetainPtr<const CPDF_Number> prev =
+      trailer ? trailer->GetNumberFor("Prev") : nullptr;
+  return prev && prev->IsInteger() && prev->GetInteger() > 0 &&
+         static_cast<size_t>(prev->GetInteger()) > first_end;
+}
+
 // One more than the %%EOF markers a further startxref follows. A file that
 // is really linearized ends its first-page section with a %%EOF of its own,
 // which is not an earlier version and is not counted. Really linearized: its
 // first object is a linearization dictionary whose /L is the offset just
 // past a %%EOF (and its line end), the one that ends the linearized part; the
-// first-page %%EOF is one before that. Anything else counts.
+// first-page %%EOF is one before that, and the trailer it closes points
+// forward with /Prev. Anything else counts.
 unsigned Revisions(pdfium::span<const uint8_t> bytes) {
   const std::string_view text(reinterpret_cast<const char*>(bytes.data()),
                               bytes.size());
@@ -1914,8 +1951,10 @@ unsigned Revisions(pdfium::span<const uint8_t> bytes) {
     if (text.find("startxref", ends[i] + 5) == std::string_view::npos) {
       continue;
     }
-    // The first-page section's %%EOF: the first, before the part's end.
-    if (part_end.has_value() && i == 0 && *part_end > 0) {
+    // The first-page section's %%EOF: the first, before the part's end,
+    // closing a trailer whose /Prev points forward.
+    if (part_end.has_value() && i == 0 && *part_end > 0 &&
+        FirstPrevPointsForward(bytes, text, ends[0])) {
       continue;
     }
     ++revisions;
