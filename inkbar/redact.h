@@ -29,12 +29,14 @@ int INK_Redact_SetOverlay(FPDF_DOCUMENT doc,
 
 // Applies REDACT annotations of |page|: those at |marks| (count > 0), then
 // every other REDACT annotation of the page that carries /INKB_Gloss when
-// |own_locked| is 1. Calls FPDFPage_GenerateContent. Writes the number of
-// non-REDACT annotations removed to *out_removed and the number of REDACT
-// annotations left on the page to *out_left. Returns 1 when applied, 0 when
-// there was nothing to apply, -1 on failure. The caller closes the handles at
-// |marks| afterwards. On failure the page may be partly changed: reload the
-// document.
+// |own_locked| is 1. Each such own mark first gets an overlay tagged
+// /INKB_Overlay true: its /RO tagged, or, without one, the overlay upstream
+// would synthesise from its /IC and overlay text, installed as its /RO.
+// Calls FPDFPage_GenerateContent. Writes the number of non-REDACT annotations
+// removed to *out_removed and the number of REDACT annotations left on the
+// page to *out_left. Returns 1 when applied, 0 when there was nothing to
+// apply, -1 on failure. The caller closes the handles at |marks| afterwards.
+// On failure the page may be partly changed: reload the document.
 int INK_Redact_ApplyPage(FPDF_DOCUMENT doc,
                          FPDF_PAGE page,
                          const FPDF_ANNOTATION* marks,

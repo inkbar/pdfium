@@ -24,6 +24,7 @@
 #include "core/fpdfapi/parser/cpdf_reference.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
 #include "core/fpdfdoc/cpdf_annot.h"
+#include "core/fpdfdoc/cpdf_appearancegenerator.h"
 #include "core/fxcrt/compiler_specific.h"
 #include "core/fxcrt/span.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
@@ -104,6 +105,33 @@ std::vector<std::array<float, 8>> MarkQuads(const CPDF_Dictionary* dict) {
   return quads;
 }
 
+// Gives an own mark the tagged indirect /RO the apply flattens, so the check
+// tells its overlay from content. A mark without /RO gets the overlay
+// upstream would synthesise from its /IC and overlay text
+// (CPDF_AppearanceGenerator::BuildRedactOverlayForm, as epdf_redact.cpp
+// uses); one with an /RO has that stream tagged. A mark for which no overlay
+// can be built is left without one.
+void TagOverlay(CPDF_Document* doc, CPDF_AnnotContext* context) {
+  RetainPtr<CPDF_Dictionary> dict = context->GetMutableAnnotDict();
+  if (!dict) {
+    return;
+  }
+  RetainPtr<CPDF_Stream> overlay = dict->GetMutableStreamFor("RO");
+  if (!overlay) {
+    overlay =
+        CPDF_AppearanceGenerator::BuildRedactOverlayForm(doc, dict.Get());
+    if (!overlay) {
+      return;
+    }
+  }
+  overlay->GetMutableDict()->SetNewFor<CPDF_Boolean>(kOverlayKey, true);
+  // Indirect, so the flattened page draws this very stream and keeps the tag.
+  const uint32_t objnum = overlay->GetObjNum()
+                              ? overlay->GetObjNum()
+                              : doc->AddIndirectObject(std::move(overlay));
+  dict->SetNewFor<CPDF_Reference>("RO", doc, objnum);
+}
+
 }  // namespace
 
 extern "C" {
@@ -179,6 +207,7 @@ int INK_Redact_ApplyPage(FPDF_DOCUMENT doc,
       const CPDF_Dictionary* dict =
           CPDFAnnotContextFromFPDFAnnotation(annot)->GetAnnotDict();
       if (IsRedact(dict) && dict->KeyExist(kDataKey)) {
+        TagOverlay(view.Get(), CPDFAnnotContextFromFPDFAnnotation(annot));
         // Applied once even when also among |marks|: the engine dedupes.
         apply.push_back(annot);
       }

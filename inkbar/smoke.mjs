@@ -910,6 +910,30 @@ function nestedFormsPdf(levels) {
   })
 }
 
+// tags the overlay of an own mark that has none of its own
+{
+  const [l, b, r, t] = SECRET_RECT
+  const source = onePagePdf(textContent, { page: '/Annots [6 0 R]' }, [
+    `<< /Type /Annot /Subtype /Redact /Rect [${l} ${b} ${r} ${t}] /QuadPoints [${quadOf(SECRET_RECT).join(' ')}] /IC [0 0 0] /INKB_Gloss 7 0 R >>`,
+    streamObject('', '{"v":1}'),
+  ])
+  let quads
+  const applied = editPage(source, (doc, page) => {
+    const out = m._malloc(32)
+    assert.equal(m._INK_Redact_OwnLockedQuads(doc, page, out, 1), 1)
+    quads = [[...m.HEAPF32.slice(out / 4, out / 4 + 8)]]
+    m._free(out)
+    assert.equal(applyPage(doc, page, [], true).result, 1)
+  })
+  assert.equal(count(applied, '/INKB_Overlay true'), 1, 'the synthesised overlay is not tagged')
+  const [after] = withDoc(applied, (doc) => inspectQuads(doc, 0, quads))
+  assert.deepEqual(
+    [after.textChars, after.imagesNotBlank, after.paths, after.patternContent, after.annotationText, after.annotationImages],
+    [0, 0, 0, 0, 0, 0],
+    `under the own mark after the apply: ${JSON.stringify(after)}`,
+  )
+}
+
 // inspects an image under a region
 {
   const pixels = Buffer.alloc(16 * 16 * 3)
