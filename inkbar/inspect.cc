@@ -52,6 +52,7 @@
 #include "core/fpdfapi/parser/cpdf_document.h"
 #include "core/fpdfapi/parser/cpdf_parser.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
+#include "core/fpdfapi/parser/cpdf_stream_acc.h"
 #include "core/fpdftext/cpdf_textpage.h"
 #include "core/fpdfdoc/cpdf_annot.h"
 #include "core/fxcrt/compiler_specific.h"
@@ -80,10 +81,13 @@ constexpr float kSecondInset = 1.0f;
 // this many levels of one value, per 8-bit channel: 0 when the image's last
 // filter is lossless, this many either way after DCT or JPX.
 constexpr int kLossyTolerance = 12;
-// After DCT or JPX, samples this close to the edge of the blanked area may
-// stray twice as far: the apply re-encodes the 8 x 8 blocks the edge crosses
-// with the kept content beside the hole, and that content rings into it.
-constexpr int kLossyEdge = 8;
+// In a JPEG, samples in a block (8 x 8, or the MCU when chroma is
+// subsampled) that the edge of the blanked area crosses may stray twice as
+// far: the apply re-encodes those blocks with the kept content beside the
+// hole, and that content rings into it. Every other sample is held to the
+// tolerance above. A JPEG whose block size cannot be read is taken to have
+// this one, the largest baseline MCU.
+constexpr int kJpegLargestBlock = 16;
 // Filled boxes that count as candidates in the page content.
 constexpr float kBoxMinSize = 4.0f;
 constexpr float kBoxDarkBelow = 0.2f;
@@ -386,7 +390,59 @@ class Band {
 struct Samples {
   RetainPtr<const CFX_DIBBase> dib;  // Null when it could not be decoded.
   int tolerance = 0;
+  // A JPEG's block grid, from its top left; 0 for any other image.
+  int block_width = 0;
+  int block_height = 0;
 };
+
+// The size of a JPEG's coding blocks (its MCU) from its frame header: 8 x 8
+// for one component, else 8 times the largest sampling factors. Nullopt when
+// there is no frame header to read.
+std::optional<std::pair<int, int>> JpegBlock(pdfium::span<const uint8_t> data) {
+  size_t at = 2;
+  if (data.size() < 4 || data[0] != 0xFF || data[1] != 0xD8) {
+    return std::nullopt;
+  }
+  while (at + 4 <= data.size()) {
+    if (data[at] != 0xFF) {
+      return std::nullopt;
+    }
+    const uint8_t marker = data[at + 1];
+    if (marker == 0xFF) {
+      ++at;
+      continue;
+    }
+    const size_t length = (data[at + 2] << 8) | data[at + 3];
+    const bool frame = marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 &&
+                       marker != 0xC8 && marker != 0xCC;
+    if (frame) {
+      const size_t header = at + 4;
+      if (header + 6 > data.size()) {
+        return std::nullopt;
+      }
+      const int components = data[header + 5];
+      if (components == 1) {
+        return std::make_pair(8, 8);
+      }
+      int h = 1;
+      int v = 1;
+      for (int c = 0; c < components; ++c) {
+        const size_t factors = header + 6 + c * 3 + 1;
+        if (factors >= data.size()) {
+          return std::nullopt;
+        }
+        h = std::max(h, data[factors] >> 4);
+        v = std::max(v, data[factors] & 0x0F);
+      }
+      return std::make_pair(8 * h, 8 * v);
+    }
+    if (marker == 0xDA || length < 2) {
+      return std::nullopt;
+    }
+    at += 2 + length;
+  }
+  return std::nullopt;
+}
 
 class SampleCache {
  public:
@@ -399,6 +455,17 @@ class SampleCache {
     }
     Samples samples;
     samples.tolerance = Tolerance(stream->GetDict().Get());
+    const ByteString filter = LastFilter(stream->GetDict().Get());
+    if (filter == "DCTDecode" || filter == "DCT") {
+      // The JPEG itself: its data through every filter before the DCT.
+      auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(stream);
+      acc->LoadAllDataImageAcc(0);
+      const std::pair<int, int> block =
+          JpegBlock(acc->GetSpan())
+              .value_or(std::make_pair(kJpegLargestBlock, kJpegLargestBlock));
+      samples.block_width = block.first;
+      samples.block_height = block.second;
+    }
     samples.dib = Decode(stream);
     // The cache holds the stream, so its address names it for the call.
     streams_.push_back(stream);
@@ -446,10 +513,22 @@ bool SamplesFlat(const Samples& samples,
   const int height = dib->GetHeight();
   const std::vector<GridBox> boxes =
       GridBoxes(image_to_page, width, height, regions);
-  // |band| holds every sample; |inner| those away from a lossy edge.
-  const bool lossy = samples.tolerance > 0;
-  Band band(lossy ? 2 * samples.tolerance : 0);
+  // |band| holds every sample; |inner| those outside the JPEG blocks the
+  // edge of a box crosses.
+  const bool jpeg = samples.block_width > 0 && samples.block_height > 0;
+  Band band(jpeg ? 2 * samples.tolerance : samples.tolerance);
   Band inner(samples.tolerance);
+  // Whether the block holding sample (x, row from the top) is crossed by the
+  // edge of |b|: it meets the box without lying wholly inside it.
+  auto crossed = [&](const GridBox& b, int x, int top_row) {
+    const int bx0 = x / samples.block_width * samples.block_width;
+    const int by0 = top_row / samples.block_height * samples.block_height;
+    const int bx1 = std::min(bx0 + samples.block_width, width);
+    const int by1 = std::min(by0 + samples.block_height, height);
+    const int box_top = height - b.y1;
+    const int box_bottom = height - b.y0;
+    return bx0 < b.x0 || bx1 > b.x1 || by0 < box_top || by1 > box_bottom;
+  };
   const bool mask = dib->IsMaskFormat();
   const bool one_bit = dib->GetBPP() == 1;
   const size_t bytes = mask ? 1 : dib->GetBPP() / 8;
@@ -457,9 +536,7 @@ bool SamplesFlat(const Samples& samples,
     for (int y = b.y0; y < b.y1 && band.flat() && inner.flat(); ++y) {
       pdfium::span<const uint8_t> row = dib->GetScanline(height - 1 - y);
       for (int x = b.x0; x < b.x1; ++x) {
-        const bool edge =
-            lossy && std::min({x - b.x0, b.x1 - 1 - x, y - b.y0,
-                               b.y1 - 1 - y}) < kLossyEdge;
+        const bool edge = jpeg && crossed(b, x, height - 1 - y);
         if (mask) {
           const size_t at = one_bit ? x / 8 : x;
           if (at >= row.size()) {

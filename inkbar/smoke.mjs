@@ -936,6 +936,23 @@ function nestedFormsPdf(levels) {
   )
 }
 
+// holds a JPEG to the tight tolerance outside the blocks a region's edge crosses
+{
+  // 64 x 64 gray, 4:4:4: vertical stripes 4 samples wide of 255 and 215.
+  const faint = Buffer.from(
+    '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUEBAMEBgUGBgYFBgYGBwkIBgcJBwYGCAsICQoKCgoKBggLDAsKDAkKCgr/wAALCABAAEABAREA/8QAFQABAQAAAAAAAAAAAAAAAAAAAAn/xAAYEAACAwAAAAAAAAAAAAAAAAAACEWEw//aAAgBAQAAPwC1jIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnIMjC2cgyMLZyDIwtnI//9k=',
+    'base64',
+  )
+  // One sample a point: the image covers x 300 to 364, y 20 to 84. The region
+  // spans samples 8 to 20 across and down, 12 wide: block 8 to 16 lies
+  // wholly inside it.
+  const source = onePagePdf('q 64 0 0 64 300 20 cm /Jf Do Q', { resources: '/XObject << /Jf 6 0 R >>' }, [
+    streamObject('/Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /DCTDecode', faint, true),
+  ])
+  const [region] = withDoc(source, (doc) => inspectPage(doc, 0, [[308, 64, 320, 76]]))
+  assert.equal(region.imagesNotBlank, 1, `faint stripes under a narrow region: ${JSON.stringify(region)}`)
+}
+
 // inspects an image whose shape is only in its masks
 {
   const black = Buffer.alloc(16 * 16 * 3)
