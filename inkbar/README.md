@@ -37,6 +37,8 @@ node inkbar/smoke.mjs testing/resources/hello_world.pdf
 node inkbar/sample.mjs
 ```
 
+To check the redacted file the smoke check writes, set `SMOKE_REDACT_OUT` to a path inside the checkout and run `podman run --rm --security-opt label=disable -v "$PWD:/w" localhost/inkbar-qpdf:11 qpdf --check /w/<path>` on it.
+
 `build.sh` needs an `origin` remote. It does not check the working tree: it builds the checkout as it is, uncommitted changes included. A release needs more. `write-manifest.sh` needs full history and an `upstream` remote, and records `HEAD` as the fork commit, so build a release from a clean tree.
 
 The script uses `podman`. Set `CONTAINER=docker` to use Docker. The first run downloads several gigabytes of dependencies into the checkout. They are ignored by git. A clean build takes about ten minutes.

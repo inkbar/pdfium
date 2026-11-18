@@ -534,9 +534,80 @@ function inflateStreams(pdf) {
   return out.join('\n')
 }
 
+// The text of every string operand in a content stream, literal (...) with its
+// escapes and hex <...>, the elements of TJ arrays included, joined in order.
+function shownText(content) {
+  const out = []
+  let i = 0
+  while (i < content.length) {
+    const c = content[i]
+    if (c === '%') {
+      while (i < content.length && content[i] !== '\n' && content[i] !== '\r') i++
+    } else if (c === '(') {
+      let depth = 1
+      i++
+      while (i < content.length && depth > 0) {
+        const d = content[i++]
+        if (d === '\\') {
+          const e = content[i++]
+          if (e === undefined) break
+          const named = { n: '\n', r: '\r', t: '\t', b: '\b', f: '\f' }
+          if (e in named) out.push(named[e])
+          else if (/[0-7]/.test(e)) {
+            let octal = e
+            while (octal.length < 3 && /[0-7]/.test(content[i] ?? '')) octal += content[i++]
+            out.push(String.fromCharCode(parseInt(octal, 8) & 0xff))
+          } else if (e === '\r') {
+            if (content[i] === '\n') i++
+          } else if (e !== '\n') out.push(e)
+        } else if (d === '(') {
+          depth++
+          out.push(d)
+        } else if (d === ')') {
+          if (--depth > 0) out.push(d)
+        } else out.push(d)
+      }
+    } else if (c === '<' && content[i + 1] !== '<') {
+      const end = content.indexOf('>', i)
+      if (end < 0) break
+      let hex = content.slice(i + 1, end).replace(/[^0-9A-Fa-f]/g, '')
+      if (hex.length % 2) hex += '0'
+      out.push(Buffer.from(hex, 'hex').toString('latin1'))
+      i = end + 1
+    } else if (c === '<') {
+      i += 2
+    } else i++
+  }
+  return out.join('')
+}
+
+// The shown text of each Flate stream in |pdf|, one string per stream.
+function streamTexts(pdf) {
+  const text = pdf.toString('latin1')
+  const texts = []
+  let from = 0
+  for (;;) {
+    const start = /(?<!end)stream\r?\n/g
+    start.lastIndex = from
+    const found = start.exec(text)
+    if (!found) break
+    const begin = found.index + found[0].length
+    const end = text.indexOf('endstream', begin)
+    if (end < 0) break
+    try {
+      texts.push(shownText(inflateSync(pdf.subarray(begin, end)).toString('latin1')))
+    } catch {
+      // Not a Flate stream.
+    }
+    from = end
+  }
+  return texts
+}
+
 const redactSource = buildTextPdf('BT /F1 20 Tf 50 100 Td (SECRET-ALPHA) Tj 200 0 Td (KEEP-BETA) Tj ET')
 const redactBefore = inflateStreams(redactSource)
 assert.ok(redactBefore.includes('SECRET-ALPHA') && redactBefore.includes('KEEP-BETA'), 'the setup lost its text')
+assert.ok(streamTexts(redactSource).some((t) => t.includes('SECRET-ALPHA') && t.includes('KEEP-BETA')), 'the decoder missed the text')
 const redactOpened = load(redactSource)
 const redactPage = m._FPDF_LoadPage(redactOpened.doc, 0)
 assert.notEqual(redactPage, 0)
@@ -545,17 +616,22 @@ const mark = m._FPDFPage_CreateAnnot(redactPage, FPDF_ANNOT_REDACT)
 assert.notEqual(mark, 0, 'no redact annotation')
 // FS_RECTF: left, top, right, bottom. FS_QUADPOINTSF: top-left, top-right, bottom-left, bottom-right.
 const markRect = m._malloc(16)
-m.HEAPF32.set([45, 125, 195, 95], markRect / 4)
+// The mark covers SECRET-ALPHA (x 50 to about 203) with room to spare and ends
+// well before KEEP-BETA, which starts at x 250.
+m.HEAPF32.set([45, 125, 230, 95], markRect / 4)
 assert.equal(m._FPDFAnnot_SetRect(mark, markRect), 1)
 m._free(markRect)
 const markQuad = m._malloc(32)
-m.HEAPF32.set([45, 125, 195, 125, 45, 95, 195, 95], markQuad / 4)
+m.HEAPF32.set([45, 125, 230, 125, 45, 95, 230, 95], markQuad / 4)
 assert.equal(m._FPDFAnnot_AppendAttachmentPoints(mark, markQuad), 1)
 m._free(markQuad)
 const removedPtr = m._malloc(4)
+// Marks NULL with count 0 applies every REDACT annotation of the page; the last
+// argument receives the number of other annotations the apply removed.
 assert.equal(m._EPDFPage_ApplyRedactions(redactPage, 0, 0, removedPtr), 1, 'no redaction applied')
 assert.equal(m.HEAPU32[removedPtr / 4], 0, 'the redaction removed other annotations')
 m._free(removedPtr)
+// epdf_redact.h: the caller closes the mark's handle after the apply, then generates the content.
 m._FPDFPage_CloseAnnot(mark)
 assert.equal(m._FPDFPage_GenerateContent(redactPage), 1)
 m._FPDF_ClosePage(redactPage)
@@ -567,6 +643,11 @@ const redactAfter = inflateStreams(redactSaved)
 const shows = (text, word) => text.includes(word) || text.toUpperCase().includes(Buffer.from(word, 'latin1').toString('hex').toUpperCase())
 assert.ok(shows(redactAfter, 'KEEP-BETA'), 'the text beside the mark was removed')
 assert.ok(!shows(redactAfter, 'SECRET-ALPHA'), 'the text under the mark survived')
+const redactShown = streamTexts(redactSaved)
+assert.ok(redactShown.some((t) => t.includes('KEEP-BETA')), 'the shown text lost KEEP-BETA')
+for (const word of ['SECRET', 'ALPHA']) {
+  assert.ok(!redactShown.some((t) => t.includes(word)), `the shown text still holds ${word}`)
+}
 assert.ok(!redactAfter.includes('/Redact'), 'the redact annotation survived')
 
 m._INK_Destroy()
