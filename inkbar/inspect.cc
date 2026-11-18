@@ -1761,17 +1761,29 @@ std::string PageReport(const std::vector<Entry>& entries) {
   return out;
 }
 
-// One more than the %%EOF markers a further startxref follows.
+// One more than the %%EOF markers a further startxref follows. A linearized
+// file (its first object holds /Linearized) ends its first-page section with
+// a %%EOF of its own, which is not an earlier version: it is not counted.
 unsigned Revisions(pdfium::span<const uint8_t> bytes) {
   const std::string_view text(reinterpret_cast<const char*>(bytes.data()),
                               bytes.size());
+  const size_t first_object_end = text.find("endobj");
+  const size_t linearized = text.find("/Linearized");
+  bool skip_first = linearized != std::string_view::npos &&
+                    first_object_end != std::string_view::npos &&
+                    linearized < first_object_end;
   unsigned revisions = 1;
   size_t at = 0;
   while ((at = text.find("%%EOF", at)) != std::string_view::npos) {
     at += 5;
-    if (text.find("startxref", at) != std::string_view::npos) {
-      ++revisions;
+    if (text.find("startxref", at) == std::string_view::npos) {
+      continue;
     }
+    if (skip_first) {
+      skip_first = false;
+      continue;
+    }
+    ++revisions;
   }
   return revisions;
 }

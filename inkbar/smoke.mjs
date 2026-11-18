@@ -1412,6 +1412,28 @@ const sanitizedSaved = withDoc(sanitizeSource, (doc) => {
     return bytes
   })
   assert.equal(count(second, '%%EOF'), 2, 'the incremental save made no second revision')
+  // A linearized file (hello_world.pdf through qpdf --linearize) has a second
+  // %EOF after its first-page section, and is still one revision.
+  const linearized = Buffer.from(
+    'JVBERi0xLjcKJb/3ov4KMiAwIG9iago8PCAvTGluZWFyaXplZCAxIC9MIDEzNzcgL0ggWyA1OTAgMTIyIF0gL08gNSAvRSAxMTUyIC9OIDEgL1QgMTIxOSA+PgplbmRvYmoKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAKeHJlZgoyIDgKMDAwMDAwMDAxNSAwMDAwMCBuIAowMDAwMDAwNTQxIDAwMDAwIG4gCjAwMDAwMDA1OTAgMDAwMDAgbiAKMDAwMDAwMDcxMiAwMDAwMCBuIAowMDAwMDAwODQwIDAwMDAwIG4gCjAwMDAwMDA5MTIgMDAwMDAgbiAKMDAwMDAwMDk4MiAwMDAwMCBuIAowMDAwMDAxMTIxIDAwMDAwIG4gCnRyYWlsZXIgPDwgL1Jvb3QgMyAwIFIgL1NpemUgMTAgL1ByZXYgMTIxMSAgICAgICAgICAgICAgICAgIC9JRCBbPDU0NDQ1YWFlNzkwMTVkMGJiYTgyZjk3NGFiMGEwM2RiPjw1NDQ0NWFhZTc5MDE1ZDBiYmE4MmY5NzRhYjBhMDNkYj5dID4+CnN0YXJ0eHJlZgowCiUlRU9GCjMgMCBvYmoKPDwgL1BhZ2VzIDEgMCBSIC9UeXBlIC9DYXRhbG9nID4+CmVuZG9iago0IDAgb2JqCjw8IC9GaWx0ZXIgL0ZsYXRlRGVjb2RlIC9TIDM2IC9MZW5ndGggNDUgPj4Kc3RyZWFtCnicY2BgYGVgYPJjAALGHQxwAGUzAzELQhSkFowZGOQZ2A8ttTvAwAAAZbMEZAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmoKPDwgL0NvbnRlbnRzIDggMCBSIC9NZWRpYUJveCA5IDAgUiAvUGFyZW50IDEgMCBSIC9SZXNvdXJjZXMgPDwgL0ZvbnQgPDwgL0YxIDYgMCBSIC9GMiA3IDAgUiA+PiA+PiAvVHlwZSAvUGFnZSA+PgplbmRvYmoKNiAwIG9iago8PCAvQmFzZUZvbnQgL1RpbWVzLVJvbWFuIC9TdWJ0eXBlIC9UeXBlMSAvVHlwZSAvRm9udCA+PgplbmRvYmoKNyAwIG9iago8PCAvQmFzZUZvbnQgL0hlbHZldGljYSAvU3VidHlwZSAvVHlwZTEgL1R5cGUgL0ZvbnQgPj4KZW5kb2JqCjggMCBvYmoKPDwgL0xlbmd0aCA2OSAvRmlsdGVyIC9GbGF0ZURlY29kZSA+PgpzdHJlYW0KeJxzCuEyMlAwNVAISeHSdzNUMDRSCEnj0vBIzcnJ11Eozy/KSVHUVAjJ4kIoMlIwNAMrcs/PT0mqTEVR5hrCBQBPIRUcZW5kc3RyZWFtCmVuZG9iago5IDAgb2JqClsgMCAwIDIwMCAyMDAgXQplbmRvYmoKMSAwIG9iago8PCAvQ291bnQgMSAvS2lkcyBbIDUgMCBSIF0gL1R5cGUgL1BhZ2VzID4+CmVuZG9iagp4cmVmCjAgMgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDExNTIgMDAwMDAgbiAKdHJhaWxlciA8PCAvU2l6ZSAyIC9JRCBbPDU0NDQ1YWFlNzkwMTVkMGJiYTgyZjk3NGFiMGEwM2RiPjw1NDQ0NWFhZTc5MDE1ZDBiYmE4MmY5NzRhYjBhMDNkYj5dID4+CnN0YXJ0eHJlZgoyMTYKJSVFT0YK',
+    'base64',
+  )
+  assert.equal(count(linearized, '%%EOF'), 2)
+  const appended = withDoc(linearized, (doc) => {
+    assert.equal(inspectFile(doc, linearized).revisions, 1, 'a linearized file is one revision')
+    const page = m._FPDF_LoadPage(doc, 0)
+    m._FPDFPage_CloseAnnot(m._FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE))
+    m._FPDF_ClosePage(page)
+    const writer = m._INK_Save(doc, FPDF_INCREMENTAL)
+    assert.notEqual(writer, 0)
+    const data = m._INK_WriterData(writer)
+    const bytes = Buffer.from(m.HEAPU8.slice(data, data + m._INK_WriterSize(writer)))
+    m._INK_WriterFree(writer)
+    return bytes
+  })
+  withDoc(appended, (doc) => {
+    assert.equal(inspectFile(doc, appended).revisions, 2, 'a linearized file with an appended revision')
+  })
   withDoc(second, (doc) => {
     assert.deepEqual(inspectFile(doc, second), {
       revisions: 2,
