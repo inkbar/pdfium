@@ -715,9 +715,14 @@ function report(ptr) {
 // The inspector's regions for |rects| on page |index|, or its candidates when
 // |rects| is empty.
 function inspectPage(doc, index, rects) {
-  const ptr = m._malloc(Math.max(rects.length * 32, 4))
-  m.HEAPF32.set(rects.flatMap(quadOf), ptr / 4)
-  const result = report(m._INK_Inspect_Page(doc, index, rects.length ? ptr : 0, rects.length))
+  return inspectQuads(doc, index, rects.map(quadOf))
+}
+
+// The inspector's regions for |quads| (8 numbers each) on page |index|.
+function inspectQuads(doc, index, quads) {
+  const ptr = m._malloc(Math.max(quads.length * 32, 4))
+  m.HEAPF32.set(quads.flat(), ptr / 4)
+  const result = report(m._INK_Inspect_Page(doc, index, quads.length ? ptr : 0, quads.length))
   m._free(ptr)
   return result.regions
 }
@@ -1011,6 +1016,26 @@ function nestedFormsPdf(levels) {
   )
   const [region] = withDoc(source, (doc) => inspectPage(doc, 0, [SECRET_RECT]))
   assert.ok(region.textChars > 0, `a glyph that advances into the region: ${JSON.stringify(region)}`)
+}
+
+// shrinks a rotated thin region by 1 pt perpendicular to each edge
+{
+  // A 100 x 4 pt quad turned 45 degrees about (200, 100). A Type3 glyph's
+  // ink lies outside it; the corner of its advance box reaches 0.5 pt into
+  // the quad across its long edge, so it misses the quad shrunk by 1 pt.
+  const s = Math.SQRT1_2
+  const at = (u, v) => [200 + u * s - v * s, 100 + u * s + v * s]
+  const quad = [...at(-50, 2), ...at(50, 2), ...at(-50, -2), ...at(50, -2)]
+  const source = onePagePdf(
+    `BT /T3 20 Tf 180 ${100 + 1.5 / s} Td (A) Tj ET`,
+    { resources: '/Font << /F1 5 0 R /T3 6 0 R >>' },
+    [
+      '<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 7 0 R >> /Encoding << /Type /Encoding /Differences [65 /a] >> /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>',
+      streamObject('', '1000 0 900 900 1000 1000 d1 900 900 100 100 re f'),
+    ],
+  )
+  const [region] = withDoc(source, (doc) => inspectQuads(doc, 0, [quad]))
+  assert.equal(region.textChars, 0, `a glyph box 0.5 pt into a rotated thin region: ${JSON.stringify(region)}`)
 }
 
 // counts a path that crosses the region where its dash pattern leaves a gap

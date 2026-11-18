@@ -176,7 +176,8 @@ bool RectMeetsAnyBBox(const CFX_FloatRect& rect,
 }
 
 // |region| shrunk by |amount| on every side, or nullopt when nothing is
-// left. A quad's corners each move |amount| toward its centre.
+// left. A quad's edges each move |amount| inward, perpendicular to
+// themselves, and its new corners are where the moved edges meet.
 std::optional<RedactRegion> Inset(const RedactRegion& region, float amount) {
   if (!region.has_quad) {
     CFX_FloatRect box = region.bbox;
@@ -188,21 +189,59 @@ std::optional<RedactRegion> Inset(const RedactRegion& region, float amount) {
     inset.bbox = box;
     return inset;
   }
-  CFX_PointF centre;
-  for (const CFX_PointF& p : region.quad) {
-    centre += p;
+  // The corners in ring order, and the ring's winding.
+  std::array<CFX_PointF, 4> ring;
+  for (int i = 0; i < 4; ++i) {
+    ring[i] = region.quad[kQuadRing[i]];
   }
-  centre = CFX_PointF(centre.x / 4, centre.y / 4);
-  Quad corners;
-  for (size_t i = 0; i < 4; ++i) {
-    const CFX_PointF to_centre = centre - region.quad[i];
-    const float length = std::hypot(to_centre.x, to_centre.y);
-    if (length <= 2 * amount) {
+  float area = 0;
+  for (int i = 0; i < 4; ++i) {
+    const CFX_PointF& p = ring[i];
+    const CFX_PointF& q = ring[(i + 1) % 4];
+    area += p.x * q.y - q.x * p.y;
+  }
+  if (area == 0) {
+    return std::nullopt;
+  }
+  const float inward = area > 0 ? 1.0f : -1.0f;
+  // Edge i runs from ring[i] to ring[i + 1], moved inward.
+  std::array<CFX_PointF, 4> origin;
+  std::array<CFX_PointF, 4> direction;
+  for (int i = 0; i < 4; ++i) {
+    const CFX_PointF d = ring[(i + 1) % 4] - ring[i];
+    const float length = std::hypot(d.x, d.y);
+    if (!(length > 0)) {
       return std::nullopt;
     }
-    const float step = amount / length;
-    corners[i] = CFX_PointF(region.quad[i].x + to_centre.x * step,
-                            region.quad[i].y + to_centre.y * step);
+    const CFX_PointF normal(-d.y / length * inward, d.x / length * inward);
+    origin[i] = CFX_PointF(ring[i].x + normal.x * amount,
+                           ring[i].y + normal.y * amount);
+    direction[i] = d;
+  }
+  // Corner ring[i + 1] is where moved edges i and i + 1 meet.
+  std::array<CFX_PointF, 4> moved;
+  for (int i = 0; i < 4; ++i) {
+    const int j = (i + 1) % 4;
+    const CFX_PointF& a = direction[i];
+    const CFX_PointF& b = direction[j];
+    const float cross = a.x * b.y - a.y * b.x;
+    if (cross == 0) {
+      return std::nullopt;
+    }
+    const CFX_PointF w = origin[j] - origin[i];
+    const float t = (w.x * b.y - w.y * b.x) / cross;
+    moved[j] = CFX_PointF(origin[i].x + a.x * t, origin[i].y + a.y * t);
+  }
+  // Nothing is left when an edge turned round.
+  for (int i = 0; i < 4; ++i) {
+    const CFX_PointF d = moved[(i + 1) % 4] - moved[i];
+    if (d.x * direction[i].x + d.y * direction[i].y <= 0) {
+      return std::nullopt;
+    }
+  }
+  Quad corners;
+  for (int i = 0; i < 4; ++i) {
+    corners[kQuadRing[i]] = moved[i];
   }
   return RedactRegionFromQuadCorners(corners);
 }
