@@ -998,6 +998,24 @@ function nestedFormsPdf(levels) {
   assert.equal(region.imagesNotBlank, 1, `faint stripes under a narrow region: ${JSON.stringify(region)}`)
 }
 
+// gives one stream its own fill in each role it plays
+{
+  // A 1-bit stream of zeros: as an image's /Mask it is painted everywhere,
+  // which is the apply's fill for a mask; drawn as a stencil it paints
+  // everywhere, where the fill is unpainted.
+  const white = Buffer.alloc(16 * 16 * 3, 255)
+  const source = onePagePdf(
+    'q 100 0 0 100 50 50 cm /Im0 Do Q 0 g q 100 0 0 100 250 50 cm /St Do Q',
+    { resources: '/XObject << /Im0 6 0 R /St 7 0 R >>' },
+    [
+      streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Mask 7 0 R', white),
+      streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ImageMask true /BitsPerComponent 1', Buffer.alloc(32)),
+    ],
+  )
+  const regions = withDoc(source, (doc) => inspectPage(doc, 0, [[60, 60, 100, 100], [260, 60, 300, 100]]))
+  assert.deepEqual(regions.map((r) => r.imagesNotBlank), [0, 1], `a mask and the same stream as a stencil: ${JSON.stringify(regions)}`)
+}
+
 // reads a 4:2:0 JPEG by its 16 x 16 blocks
 {
   // 64 x 64 RGB, 4:2:0 (16 x 16 MCUs), stripes 4 samples wide: strong ones

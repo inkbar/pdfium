@@ -482,7 +482,8 @@ class SampleCache {
 
   DecodedImage Get(RetainPtr<const CPDF_Stream> stream,
                    RedactionHoleRole role) {
-    auto it = cache_.find(stream.Get());
+    const Key key{stream.Get(), role};
+    auto it = cache_.find(key);
     if (it != cache_.end()) {
       order_.splice(order_.begin(), order_, it->second.place);
       return it->second.image;
@@ -509,9 +510,8 @@ class SampleCache {
         samples.dib ? static_cast<size_t>(samples.dib->GetPitch()) *
                           static_cast<size_t>(samples.dib->GetHeight())
                     : 0;
-    order_.push_front(stream.Get());
-    cache_.emplace(stream.Get(),
-                   Entry{stream, image, bytes, order_.begin()});
+    order_.push_front(key);
+    cache_.emplace(key, Entry{stream, image, bytes, order_.begin()});
     bytes_ += bytes;
     while (bytes_ > kSampleCacheBytes && order_.size() > 1) {
       auto last = cache_.find(order_.back());
@@ -523,12 +523,16 @@ class SampleCache {
   }
 
  private:
+  // A stream and the part it plays: one stream can be an image's /Mask and
+  // also be drawn as a stencil, and the fill differs.
+  using Key = std::pair<const CPDF_Stream*, RedactionHoleRole>;
+
   struct Entry {
     // Held, so its address names it while it is cached.
     RetainPtr<const CPDF_Stream> stream;
     DecodedImage image;
     size_t bytes;
-    std::list<const CPDF_Stream*>::iterator place;
+    std::list<Key>::iterator place;
   };
 
   RetainPtr<const CFX_DIBBase> Decode(RetainPtr<const CPDF_Stream> stream) {
@@ -609,8 +613,8 @@ class SampleCache {
 
   CPDF_Document* const doc_;
   const CPDF_Dictionary* const page_resources_;
-  std::map<const CPDF_Stream*, Entry> cache_;
-  std::list<const CPDF_Stream*> order_;  // Most recently used first.
+  std::map<Key, Entry> cache_;
+  std::list<Key> order_;  // Most recently used first.
   size_t bytes_ = 0;
 };
 
