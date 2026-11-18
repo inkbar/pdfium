@@ -102,6 +102,11 @@ constexpr float kBoxLightAbove = 0.98f;
 // empty (kMaxFormLevel in cpdf_streamcontentparser.cpp), though another
 // viewer may draw it. Meeting one fails the inspection.
 constexpr int kFormLevelLimit = 40;
+// Regions are cut to the page grown by this much on every side.
+constexpr float kPageMargin = 10.0f;
+// A ceiling on the steps of any sampling loop, so the arithmetic stays in
+// range whatever a file holds. Regions held to the page never reach it.
+constexpr double kMaxSteps = 1 << 20;
 // Patterns painted with patterns, more deeply nested than this, fail the
 // inspection rather than going unread.
 constexpr int kMaxPatternChain = 64;
@@ -183,6 +188,14 @@ bool RectMeetsAnyBBox(const CFX_FloatRect& rect,
     }
   }
   return false;
+}
+
+// Steps of at most 1 pt over |length|, at least one, at most kMaxSteps.
+int Steps(double length) {
+  if (!(length > 1)) {
+    return 1;
+  }
+  return static_cast<int>(std::min(std::ceil(length), kMaxSteps));
 }
 
 // |region| shrunk by |amount| on every side, or nullopt when nothing is
@@ -870,8 +883,8 @@ bool ShadingPaintsSample(const CPDF_ShadingObject& shading,
     if (area.IsEmpty()) {
       continue;
     }
-    const int columns = std::max(1, static_cast<int>(std::ceil(area.Width())));
-    const int rows = std::max(1, static_cast<int>(std::ceil(area.Height())));
+    const int columns = Steps(area.Width());
+    const int rows = Steps(area.Height());
     for (int r = 0; r < rows; ++r) {
       for (int c = 0; c < columns; ++c) {
         const CFX_PointF page_point(
@@ -1126,9 +1139,7 @@ class PathSampler {
     }
     const CFX_PointF& from = part->first;
     const CFX_PointF& to = part->second;
-    const int steps = std::max(
-        1, static_cast<int>(std::ceil(std::hypot(to.x - from.x,
-                                                  to.y - from.y))));
+    const int steps = Steps(std::hypot(to.x - from.x, to.y - from.y));
     for (int k = 0; k <= steps; ++k) {
       const float t = static_cast<float>(k) / steps;
       if (visit_(CFX_PointF(from.x + (to.x - from.x) * t,
@@ -1662,6 +1673,33 @@ std::vector<Entry> FindCandidates(Context* context) {
 // look everywhere.
 void Inspect(Context* context, Entry* entry) {
   CPDF_Page* page = context->page;
+  // Regions are held to the page, grown by a margin: a mark's quads come from
+  // the file and may be any size. One wholly outside has nothing under it;
+  // one partly outside becomes its box cut to the page.
+  const CFX_SizeF size = page->GetPageSize();
+  CFX_FloatRect page_box =
+      page->GetPageMatrix().GetInverse().TransformRect(
+          CFX_FloatRect(0, 0, size.width, size.height));
+  page_box.Normalize();
+  page_box.Inflate(kPageMargin, kPageMargin);
+  std::vector<RedactRegion> held;
+  for (const RedactRegion& region : entry->regions) {
+    if (!Intersects(region.bbox, page_box)) {
+      continue;
+    }
+    if (page_box.Contains(region.bbox)) {
+      held.push_back(region);
+      continue;
+    }
+    RedactRegion cut;
+    cut.bbox = region.bbox;
+    cut.bbox.Intersect(page_box);
+    held.push_back(cut);
+  }
+  entry->regions = std::move(held);
+  if (entry->regions.empty()) {
+    return;
+  }
   // A region too small to shrink is tested as it is.
   std::vector<RedactRegion> inset;
   for (const RedactRegion& region : entry->regions) {

@@ -831,6 +831,21 @@ function nestedFormsPdf(levels) {
   })
 }
 
+// a mark with enormous quads is clamped to the page
+{
+  const huge = `1${'0'.repeat(30)}.0`
+  // A dashed line whose one dash lies off the page, running far along the
+  // mark's edge.
+  const source = onePagePdf(`${textContent} [1 ${huge}] 0 d -10 0.5 m ${huge} 0.5 l S`, { page: '/Annots [6 0 R]' }, [
+    `<< /Type /Annot /Subtype /Redact /Rect [0 0 ${huge} ${huge}] /QuadPoints [0 ${huge} ${huge} ${huge} 0 0 ${huge} 0] >>`,
+  ])
+  const started = Date.now()
+  const [mark] = withDoc(source, (doc) => inspectPage(doc, 0, []))
+  assert.ok(Date.now() - started < 5000, 'the inspection took more than 5 s')
+  assert.equal(mark.kind, 'redact-annotation')
+  assert.ok(mark.textChars > 0 && Number.isFinite(mark.rect[2]), `a mark over the whole page: ${JSON.stringify(mark)}`)
+}
+
 // inspects text under a region
 {
   const source = onePagePdf(textContent)
