@@ -61,6 +61,33 @@ int INK_Redact_OwnLockedQuads(FPDF_DOCUMENT doc,
                               float* out,
                               int capacity);
 
+// What is painted under each region of page |page_index| that the apply
+// cannot rewrite, as a UTF-8 JSON report in a malloc'd buffer the caller
+// frees with INK_Inspect_Free. Call it before INK_Redact_ApplyPage, on the
+// page as it is: the apply cuts or clips these objects and leaves what they
+// carry in the file, and afterwards the cut object no longer says what it
+// covered. An apply over a region with any count above zero must be refused.
+// |quads| as INK_Inspect_Page takes them; |count| > 0. NULL when it could
+// not look (no such page, a bad quad, a limit met, the work budget spent).
+//
+// Counted are the objects, in the page content, in forms at any depth and
+// in annotation appearances, that paint in the region (their shape and every
+// clip in effect, those of enclosing form objects included) and are:
+//   patterns: filled, stroked or shown with a tiling pattern;
+//   shadings: a function-based or mesh shading (types 1, 4 to 7), painted
+//     with sh or as a shading pattern;
+//   maskGroups: under a soft mask whose group holds anything in the region;
+//   glyphs: text in a Type 3 font with a glyph whose procedure paints in
+//     the region outside the box it declares, or holds an image, a shading,
+//     a form or a pattern use.
+//
+// { "regions": [ { "index": 0, "patterns": 0, "shadings": 0,
+//     "maskGroups": 0, "glyphs": 0 } ] }
+char* INK_Redact_Unremovable(FPDF_DOCUMENT doc,
+                             int page_index,
+                             const float* quads,
+                             int count);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

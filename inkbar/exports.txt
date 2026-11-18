@@ -78,6 +78,7 @@ FPDFPage_GenerateContent
 INK_Redact_SetOverlay
 INK_Redact_ApplyPage
 INK_Redact_OwnLockedQuads
+INK_Redact_Unremovable
 INK_Sanitize
 INK_Inspect_Page
 INK_Inspect_File

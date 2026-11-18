@@ -33,6 +33,8 @@
 #include "core/fpdfapi/edit/cpdf_path_redactor.h"
 #include "core/fpdfapi/edit/cpdf_text_redactor.h"
 #include "core/fpdfapi/font/cpdf_font.h"
+#include "core/fpdfapi/font/cpdf_type3char.h"
+#include "core/fpdfapi/font/cpdf_type3font.h"
 #include "core/fpdfapi/page/cpdf_clippath.h"
 #include "core/fpdfapi/page/cpdf_color.h"
 #include "core/fpdfapi/page/cpdf_colorstate.h"
@@ -72,6 +74,7 @@
 #include "core/fxge/dib/cfx_dibitmap.h"
 #include "core/fxge/dib/fx_dib.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
+#include "inkbar/redact.h"
 #include "inkbar/sanitize.h"
 
 namespace {
@@ -124,12 +127,6 @@ constexpr size_t kMaxClipPoints = 1 << 16;
 // Patterns painted with patterns, more deeply nested than this, fail the
 // inspection rather than going unread.
 constexpr int kMaxPatternChain = 64;
-// The tiles of one pattern fill placed under one region, at most. A finer
-// tiling counts as drawing under the region.
-constexpr double kMaxTiles = 1 << 12;
-// The tiles tried, along each of the two steps, when looking for one a fill
-// shows whole outside the regions.
-constexpr double kWholeTileTries = 64;
 // What the sampling tests of one INK_Inspect_Page call may do, over every
 // object and region: one unit for each point they try, each clip edge they
 // test against a row of points, and each point they flatten or read. About a
@@ -987,57 +984,6 @@ struct ClipEdges {
   float top = 0;
 };
 
-// Whether a fill of |shape|'s edges under its rule covers |p|.
-bool Covers(const ClipEdges& shape, const CFX_PointF& p) {
-  int winding = 0;
-  int crossings = 0;
-  for (const ClipEdges::Edge& edge : shape.edges) {
-    const CFX_PointF& a = edge.a;
-    const CFX_PointF& b = edge.b;
-    if ((a.y <= p.y) == (b.y <= p.y)) {
-      continue;
-    }
-    if (a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y) > p.x) {
-      ++crossings;
-      winding += b.y > a.y ? 1 : -1;
-    }
-  }
-  return shape.fill == CFX_FillRenderOptions::FillType::kEvenOdd
-             ? crossings % 2
-             : winding != 0;
-}
-
-// Whether |a| and |b| meet, edges included.
-bool Touches(const CFX_FloatRect& a, const CFX_FloatRect& b) {
-  return a.right >= b.left && a.left <= b.right && a.top >= b.bottom &&
-         a.bottom <= b.top;
-}
-
-// Whether |box| lies wholly inside the fill of |shape|: no edge comes within
-// |margin| of it, and its middle is covered. |margin| allows for the lines a
-// curve was flattened into.
-bool Holds(const ClipEdges& shape, CFX_FloatRect box, float margin) {
-  const CFX_PointF middle((box.left + box.right) / 2,
-                          (box.bottom + box.top) / 2);
-  box.Inflate(margin, margin);
-  for (const ClipEdges::Edge& edge : shape.edges) {
-    const CFX_FloatRect reach(
-        std::min(edge.a.x, edge.b.x), std::min(edge.a.y, edge.b.y),
-        std::max(edge.a.x, edge.b.x), std::max(edge.a.y, edge.b.y));
-    if (Touches(reach, box)) {
-      return false;
-    }
-  }
-  return Covers(shape, middle);
-}
-
-// Whether |m| can be undone: its inverse exists and is finite.
-bool Invertible(const CFX_Matrix& m) {
-  const float determinant = m.a * m.d - m.b * m.c;
-  return Finite(m) && std::isfinite(determinant) && determinant != 0 &&
-         Finite(m.GetInverse());
-}
-
 // -- Shadings that can hold a picture ----------------------------------------
 //
 // An axial or radial shading is a colour ramp, and the part of it an apply
@@ -1430,6 +1376,11 @@ struct Entry {
   std::vector<RedactRegion> second;
   // The regions shrunk as the path redactor's are.
   std::vector<RedactRegion> inset;
+  // What INK_Redact_Unremovable counts.
+  unsigned patterns = 0;
+  unsigned shadings = 0;
+  unsigned mask_groups = 0;
+  unsigned glyphs = 0;
   // Only content painted before this position counts (PageIndex order):
   // everything for a region, what lies under it for a candidate.
   size_t before = SIZE_MAX;
@@ -1461,10 +1412,8 @@ struct Context {
   // Regions given: forms tagged /INKB_Overlay are an apply's own drawing.
   // Without regions the tag is not trusted.
   const bool strict;
-  // The boxes of the regions the caller gave, all of them.
-  std::vector<CFX_FloatRect> given;
-  // The page's box in user space.
-  CFX_FloatRect page_box;
+  // The Type 3 glyph procedures whose parsing was charged to |work|.
+  std::set<std::pair<const CPDF_Font*, uint32_t>> glyphs_charged;
   // Where each shading read so far can paint, by its shading object.
   std::map<const CPDF_Object*, OwnBox> shading_boxes;
   bool failed = false;
@@ -1650,16 +1599,27 @@ class PathSampler {
   double samples_ = 0;
 };
 
+// A clip in effect on what a form holds: the clip of a form object the
+// content is painted through, in the space |to_page| places.
+struct ClipInEffect {
+  CPDF_ClipPath clip;
+  CFX_Matrix to_page;
+};
+using Clips = std::vector<ClipInEffect>;
+
 class Walker {
  public:
   Walker(Entry* entry, const CPDF_PathRedactor* redactor, Context* context)
       : entry_(entry), redactor_(redactor), context_(context) {}
 
+  // Counts what |holder| holds under the regions. |clips| are the clips of
+  // the form objects it is painted through.
   void Holder(CPDF_PageObjectHolder* holder,
               const CFX_Matrix& to_page,
               Scope scope,
               bool counted,
-              int depth) {
+              int depth,
+              const Clips& clips) {
     if (depth > kFormLevelLimit) {
       context_->failed = true;
       return;
@@ -1682,38 +1642,46 @@ class Walker {
           // The copy's /Matrix is the page matrix (rotation and box origin),
           // and its content is parsed through it: undo it for page space.
           Holder(form, form->GetDict()->GetMatrixFor("Matrix").GetInverse(),
-                 Scope::kPageCopy, true, depth + 1);
+                 Scope::kPageCopy, true, depth + 1, Clips());
           continue;
         }
-        if (!page || Before(object)) {
+        if ((!page || Before(object)) && PaintsIn(object, to_page, clips)) {
           Group(object, to_page, scope, counted, depth);
         }
+        Clips inner = clips;
+        if (form_object->clip_path().HasRef()) {
+          inner.push_back({form_object->clip_path(), to_page});
+        }
         Holder(form, form_object->form_matrix() * to_page, scope, counted,
-               depth + 1);
+               depth + 1, inner);
         continue;
       }
       if (page && !Before(object)) {
         continue;
       }
-      // The next three are asked of every object, whether or not its box
-      // meets a region: an apply may have cut the object away from the mark.
-      Group(object, to_page, scope, counted, depth);
-      if (counted || page) {
-        std::set<const CPDF_Object*> chain;
-        const Found found = PatternFound(object, to_page, false, &chain);
-        if (counted) {
-          entry_->counts.pattern_content += found.content;
-        }
-        if (page && found.drawing) {
-          ++entry_->counts.paths;
-        }
-        if (page && PictureShadingPattern(object, to_page)) {
-          ++entry_->counts.paths;
+      // What an object carries with it (a mask's group, a pattern's cell, a
+      // shading pattern) counts when the object itself paints in a region.
+      if (Carries(object) && PaintsIn(object, to_page, clips)) {
+        Group(object, to_page, scope, counted, depth);
+        if (counted || page) {
+          std::set<const CPDF_Object*> chain;
+          const Found found = CellsOf(object, &chain);
+          if (counted) {
+            entry_->counts.pattern_content += found.content;
+          }
+          if (page && found.drawing) {
+            ++entry_->counts.paths;
+          }
+          if (page && PictureShadingPattern(object, to_page)) {
+            ++entry_->counts.paths;
+          }
         }
       }
       if (CPDF_TextObject* text = object->AsText()) {
         if (counted) {
-          const unsigned chars = TextChars(*text, to_page);
+          // A Type 3 glyph may draw outside the box it declares.
+          const unsigned chars =
+              TextChars(*text, to_page) + Type3Reach(*text, to_page, nullptr);
           if (page) {
             entry_->counts.text_chars += chars;
             if (in_group_) {
@@ -1743,6 +1711,67 @@ class Walker {
                      ShadingCounts(*shading, to_page))) {
           ++entry_->counts.paths;
         }
+      }
+    }
+  }
+
+  // What INK_Redact_Unremovable counts in |holder|: the objects that paint
+  // in a region and carry what the apply cannot rewrite.
+  void Unremovable(CPDF_PageObjectHolder* holder,
+                   const CFX_Matrix& to_page,
+                   int depth,
+                   const Clips& clips) {
+    if (depth > kFormLevelLimit) {
+      context_->failed = true;
+      return;
+    }
+    for (auto it = holder->begin(); it != holder->end(); ++it) {
+      if (context_->work.spent) {
+        return;
+      }
+      CPDF_PageObject* object = it->get();
+      if (!object->IsActive()) {
+        continue;
+      }
+      if (CPDF_FormObject* form_object = object->AsForm()) {
+        CPDF_Form* form = form_object->form();
+        // An overlay an earlier apply drew, and a loupe's copy of the page,
+        // which the engine draws again after an apply.
+        if (!form || FormHas(form, kOverlayKey) || FormHas(form, kPageCopyKey)) {
+          continue;
+        }
+        if (PaintsIn(object, to_page, clips) && GroupHolds(object, to_page, 0)) {
+          ++entry_->mask_groups;
+        }
+        Clips inner = clips;
+        if (form_object->clip_path().HasRef()) {
+          inner.push_back({form_object->clip_path(), to_page});
+        }
+        Unremovable(form, form_object->form_matrix() * to_page, depth + 1,
+                    inner);
+        continue;
+      }
+      if (CPDF_TextObject* text = object->AsText()) {
+        bool carrier = false;
+        const unsigned reach = Type3Reach(*text, to_page, &carrier);
+        if ((reach || carrier) && ClipsReach(object, to_page, clips)) {
+          ++entry_->glyphs;
+        }
+      }
+      if (!Carries(object) || !PaintsIn(object, to_page, clips)) {
+        continue;
+      }
+      if (PaintsWithTiling(object)) {
+        ++entry_->patterns;
+      }
+      const CPDF_ShadingObject* shading = object->AsShading();
+      if ((shading && PictureShading(shading->pattern(),
+                                     shading->matrix() * to_page)) ||
+          PictureShadingPattern(object, to_page)) {
+        ++entry_->shadings;
+      }
+      if (GroupHolds(object, to_page, 0)) {
+        ++entry_->mask_groups;
       }
     }
   }
@@ -1839,21 +1868,30 @@ class Walker {
     return true;
   }
 
-  // A mask's group, parsed; the work is charged by its objects.
+  // Charges parsing |stream| into |holder| to the work budget: a unit a
+  // byte of the stream as the file holds it, and one an object.
+  void SpendParse(const CPDF_Stream* stream,
+                  const CPDF_PageObjectHolder* holder) {
+    context_->work.Spend((stream ? stream->GetRawSize() : 0) + 1 +
+                         holder->GetPageObjectCount());
+  }
+
+  // A mask's group, parsed.
   std::unique_ptr<CPDF_Form> ParseGroup(RetainPtr<CPDF_Stream> stream) {
+    const CPDF_Stream* id = stream.Get();
     auto form = std::make_unique<CPDF_Form>(
         context_->page->GetDocument(), context_->page->GetMutableResources(),
         std::move(stream));
     form->ParseContent();
-    context_->work.Spend(1 + form->GetPageObjectCount());
+    SpendParse(id, form.get());
     return form;
   }
 
   // Counts what the group of a soft mask on |object| holds under the
-  // regions, as content of the holder the object lies in. The apply cuts or
-  // removes the object and leaves the group as it was, so the group is read
-  // wherever the object lies. A group in effect on many objects through one
-  // matrix is read once. A group whose place is not finite counts.
+  // regions, as content of the holder the object lies in. The caller has
+  // found that the object paints in a region. A group in effect on many
+  // objects through one matrix is read once. A group whose place is not
+  // finite counts.
   void Group(const CPDF_PageObject* object,
              const CFX_Matrix& to_page,
              Scope scope,
@@ -1886,9 +1924,60 @@ class Walker {
     }
     group_stack_.insert(id);
     ++in_group_;
-    Holder(form.get(), placed, scope, counted, depth + 1);
+    Holder(form.get(), placed, scope, counted, depth + 1, Clips());
     --in_group_;
     group_stack_.erase(id);
+  }
+
+  // Whether the group of a soft mask on |object| holds anything in a
+  // region: an object of the group, or of a group masking one of those,
+  // whose box meets one when placed by the mask's matrix. True when the
+  // place cannot be worked out. False without a group.
+  bool GroupHolds(const CPDF_PageObject* object,
+                  const CFX_Matrix& to_page,
+                  int depth) {
+    RetainPtr<CPDF_Stream> stream;
+    CFX_Matrix placed;
+    if (!GroupOf(object, to_page, &stream, &placed)) {
+      return false;
+    }
+    if (!Finite(placed) || depth > kFormLevelLimit) {
+      return true;
+    }
+    if (group_stack_.count(stream.Get())) {
+      return false;
+    }
+    const float numbers[6] = {placed.a, placed.b, placed.c,
+                              placed.d, placed.e, placed.f};
+    std::pair<const CPDF_Stream*, std::array<uint32_t, 6>> key;
+    key.first = stream.Get();
+    memcpy(key.second.data(), numbers, sizeof(numbers));
+    auto it = group_holds_.find(key);
+    if (it != group_holds_.end()) {
+      return it->second;
+    }
+    const CPDF_Stream* id = stream.Get();
+    std::unique_ptr<CPDF_Form> form = ParseGroup(std::move(stream));
+    if (context_->work.spent) {
+      return true;
+    }
+    bool holds = false;
+    group_stack_.insert(id);
+    for (auto item = form->begin(); item != form->end() && !holds; ++item) {
+      const CPDF_PageObject* inner = item->get();
+      if (!inner->IsActive()) {
+        continue;
+      }
+      CFX_FloatRect box = placed.TransformRect(inner->GetRect());
+      box.Normalize();
+      holds = !Finite(box) || RectMeetsAnyBBox(box, entry_->inset) ||
+              GroupHolds(inner, placed, depth + 1);
+    }
+    group_stack_.erase(id);
+    if (!context_->work.spent) {
+      group_holds_.emplace(key, holds);
+    }
+    return holds;
   }
 
   // Whether a shading that can hold a picture (type 1 or 4 to 7; any type
@@ -1927,8 +2016,7 @@ class Walker {
   }
 
   // Whether |object| paints with a shading pattern that can hold a picture
-  // under the regions. The object's own box is not asked: an apply may have
-  // cut the object back to where it no longer meets the mark.
+  // under the regions. The caller has found that the object paints in one.
   bool PictureShadingPattern(CPDF_PageObject* object,
                              const CFX_Matrix& to_page) {
     const CPDF_ColorState& colors = object->color_state();
@@ -1955,52 +2043,7 @@ class Walker {
     return false;
   }
 
-  // A pattern's cell box and steps, and where pattern space lies on the page.
-  struct Tiling {
-    // Pattern space, shifted to tile |i|, |j|, to the page.
-    CFX_Matrix Tile(double i, double j) const {
-      return CFX_Matrix(1, 0, 0, 1, static_cast<float>(i * x_step),
-                        static_cast<float>(j * y_step)) *
-             to_page;
-    }
-
-    // The tiles over the page rectangle |area|: those that may meet it, or,
-    // with |inside|, those that may lie wholly in it. False when they cannot
-    // be numbered.
-    bool Over(const CFX_FloatRect& area,
-              bool inside,
-              double* first,
-              double* last) const {
-      CFX_FloatRect q = to_pattern.TransformRect(area);
-      q.Normalize();
-      if (!Finite(q)) {
-        return false;
-      }
-      const double lows[2] = {q.left, q.bottom};
-      const double highs[2] = {q.right, q.top};
-      const double starts[2] = {bbox.left, bbox.bottom};
-      const double ends[2] = {bbox.right, bbox.top};
-      const double steps[2] = {x_step, y_step};
-      for (int k = 0; k < 2; ++k) {
-        first[k] = inside ? std::ceil((lows[k] - starts[k]) / steps[k])
-                          : std::floor((lows[k] - ends[k]) / steps[k]);
-        last[k] = inside ? std::floor((highs[k] - ends[k]) / steps[k])
-                         : std::ceil((highs[k] - starts[k]) / steps[k]);
-        if (!std::isfinite(first[k]) || !std::isfinite(last[k])) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    CFX_FloatRect bbox;
-    float x_step = 0;
-    float y_step = 0;
-    CFX_Matrix to_page;
-    CFX_Matrix to_pattern;
-  };
-
-  // What a pattern's cell holds under the regions.
+  // What a pattern's cell holds.
   struct Found {
     void Add(const Found& other) {
       content += other.content;
@@ -2008,22 +2051,7 @@ class Walker {
     }
 
     unsigned content = 0;  // Characters and images.
-    bool drawing = false;  // A path or a shading.
-  };
-
-  // Stands for a cell that could not be read or placed: it counts.
-  static Found Unknown() {
-    Found found;
-    found.content = 1;
-    found.drawing = true;
-    return found;
-  }
-
-  struct Landing {
-    bool placed = false;
-    Tiling grid;
-    Found found;
-    RetainPtr<CPDF_TilingPattern> pattern;
+    bool drawing = false;  // A path, a shading or a pattern of its own.
   };
 
   // Whether |object| paints with its fill colour, or with its stroke colour.
@@ -2035,21 +2063,144 @@ class Walker {
     return true;
   }
 
-  // What the cells of the tiling patterns |object| paints with hold under
-  // the regions: text and images, and drawing. The redaction does not enter
-  // a pattern's stream, so what a cell holds under a mark stays in the file,
-  // behind the hole the apply cut in the fill. On the page (and in an
-  // appearance) the cell is placed over the regions wherever the object
-  // lies: an apply may have cut the object back to where it no longer meets
-  // the mark, and the saved file cannot tell that from a fill that never
-  // did. |to_page| places |object|'s holder. |nested|: the object lies in
-  // another pattern's cell, where nothing is cut and only the part of a
-  // region the object's box meets is asked. A tiling that cannot be worked
-  // out counts with all the cell holds.
-  Found PatternFound(CPDF_PageObject* object,
-                     const CFX_Matrix& to_page,
-                     bool nested,
-                     std::set<const CPDF_Object*>* chain) {
+  // Whether |object| paints with a pattern colour: a tiling pattern, or
+  // with |shading|, a shading pattern.
+  static bool PaintsWithPattern(const CPDF_PageObject* object, bool shading) {
+    const CPDF_ColorState& colors = object->color_state();
+    if (!colors.HasRef()) {
+      return false;
+    }
+    for (bool stroke : {false, true}) {
+      const CPDF_Color* color =
+          stroke ? colors.GetStrokeColor() : colors.GetFillColor();
+      if (!color || !color->IsPattern() || !Paints(object, stroke)) {
+        continue;
+      }
+      RetainPtr<CPDF_Pattern> pattern = color->GetPattern();
+      if (pattern && (shading ? !!pattern->AsShadingPattern()
+                              : !!pattern->AsTilingPattern())) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool PaintsWithTiling(const CPDF_PageObject* object) {
+    return PaintsWithPattern(object, false);
+  }
+
+  // Whether |object| brings with it something the redaction does not enter:
+  // a pattern, a shading that can hold a picture, or a soft mask's group.
+  static bool Carries(const CPDF_PageObject* object) {
+    if (PaintsWithPattern(object, false) || PaintsWithPattern(object, true)) {
+      return true;
+    }
+    if (const CPDF_ShadingObject* shading = object->AsShading()) {
+      const CPDF_ShadingPattern* pattern = shading->pattern();
+      if (!pattern || (pattern->GetShadingType() != kAxialShading &&
+                       pattern->GetShadingType() != kRadialShading)) {
+        return true;
+      }
+    }
+    const CPDF_GeneralState& state = object->general_state();
+    return state.HasRef() && state.GetSoftMask();
+  }
+
+  // Whether |clip|, placed by |to_page|, lets anything be painted in a
+  // region: each of its paths crosses one, by the redactor's test. Text
+  // that clips is not read; it is taken to let everything through.
+  bool ClipReaches(const CPDF_ClipPath& clip, const CFX_Matrix& to_page) {
+    if (!clip.HasRef()) {
+      return true;
+    }
+    const float numbers[6] = {to_page.a, to_page.b, to_page.c,
+                              to_page.d, to_page.e, to_page.f};
+    for (size_t i = 0; i < clip.GetPathCount(); ++i) {
+      const CPDF_Path path = clip.GetPath(i);
+      ClipKey key;
+      std::get<0>(key) = path.GetObject();
+      std::get<1>(key) = static_cast<int>(clip.GetClipType(i));
+      memcpy(std::get<2>(key).data(), numbers, sizeof(numbers));
+      auto it = clip_reach_.find(key);
+      if (it == clip_reach_.end()) {
+        bool reaches = false;
+        if (path.HasRef() && !path.GetPoints().empty()) {
+          CFX_FloatRect box = to_page.TransformRect(path.GetBoundingBox());
+          box.Normalize();
+          if (!Finite(box)) {
+            reaches = true;
+          } else if (RectMeetsAnyBBox(box, entry_->inset)) {
+            const PathRedactionResult result = redactor_->Redact(
+                Probe(path, clip.GetClipType(i)).get(), to_page);
+            reaches = !result.succeeded || result.changed;
+          }
+        }
+        // The path is kept, so its address stays its own.
+        it = clip_reach_.emplace(key, std::make_pair(path, reaches)).first;
+      }
+      if (!it->second.second) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Whether the clips on |object|, its own and those of the form objects it
+  // is painted through, let it paint in a region.
+  bool ClipsReach(const CPDF_PageObject* object,
+                  const CFX_Matrix& to_page,
+                  const Clips& clips) {
+    if (!ClipReaches(object->clip_path(), to_page)) {
+      return false;
+    }
+    for (const ClipInEffect& clip : clips) {
+      if (!ClipReaches(clip.clip, clip.to_page)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // Whether |object| paints in a region: its box meets one, every clip in
+  // effect reaches one, and so does its own shape (a path by the redactor's
+  // test and the sampler, text by its glyphs' boxes, an image by its
+  // quad). Each part is tested against the region on its own, so an object
+  // and a clip that both reach a region in different places count: the
+  // answer errs towards yes. An object whose place is not finite paints.
+  bool PaintsIn(CPDF_PageObject* object,
+                const CFX_Matrix& to_page,
+                const Clips& clips) {
+    CFX_FloatRect box = to_page.TransformRect(object->GetRect());
+    box.Normalize();
+    if (!Finite(box)) {
+      return true;
+    }
+    if (!RectMeetsAnyBBox(box, entry_->inset) ||
+        !ClipsReach(object, to_page, clips)) {
+      return false;
+    }
+    if (CPDF_PathObject* path = object->AsPath()) {
+      return PathCrosses(*redactor_, *path, to_page) ||
+             PathSampleInside(*path, to_page);
+    }
+    if (CPDF_TextObject* text = object->AsText()) {
+      return TextChars(*text, to_page) > 0 || AdvanceChars(*text, to_page) > 0;
+    }
+    if (CPDF_ImageObject* image = object->AsImage()) {
+      return QuadMeetsAny(Transformed(CFX_FloatRect(0, 0, 1, 1),
+                                      image->matrix() * to_page),
+                          entry_->inset);
+    }
+    return true;
+  }
+
+  // What the cells of the tiling patterns |object| paints with hold,
+  // wherever in the cell: characters and images, and whether they draw.
+  // The redaction does not enter a pattern's stream, so the caller counts
+  // this for an object that paints in a region. Patterns used inside a cell
+  // are followed; |chain| holds the patterns being read, so a pattern that
+  // paints with itself ends. A pattern's cell is read once.
+  Found CellsOf(CPDF_PageObject* object, std::set<const CPDF_Object*>* chain) {
     Found found;
     const CPDF_ColorState& colors = object->color_state();
     if (!colors.HasRef()) {
@@ -2068,141 +2219,32 @@ class Walker {
       }
       if (chain->size() >= kMaxPatternChain) {
         context_->failed = true;
-        return Unknown();
+        return found;
       }
+      const bool top = chain->empty();
+      auto it = top ? cells_.find(tiling->pattern_obj().Get()) : cells_.end();
+      if (it != cells_.end()) {
+        found.Add(it->second.first);
+        continue;
+      }
+      Found cell_found;
       chain->insert(tiling->pattern_obj().Get());
-      found.Add(TilingFound(object, tiling, stroke, to_page, nested, chain));
-      chain->erase(tiling->pattern_obj().Get());
-      if (context_->work.spent) {
-        return Unknown();
+      // A pattern's content is parsed on its own, from level 0.
+      std::unique_ptr<CPDF_Form> cell = tiling->Load(object);
+      if (cell) {
+        SpendParse(ToStream(tiling->pattern_obj().Get()), cell.get());
+        cell_found.content = PatternContent(cell.get(), chain, 0);
+        cell_found.drawing = HasDrawing(cell.get(), 0);
       }
+      chain->erase(tiling->pattern_obj().Get());
+      if (top && !context_->work.spent) {
+        // The pattern is kept, so its object's address stays its own.
+        cells_.emplace(tiling->pattern_obj().Get(),
+                       std::make_pair(cell_found, pdfium::WrapRetain(tiling)));
+      }
+      found.Add(cell_found);
     }
     return found;
-  }
-
-  Found TilingFound(CPDF_PageObject* object,
-                    CPDF_TilingPattern* tiling,
-                    bool stroke,
-                    const CFX_Matrix& to_page,
-                    bool nested,
-                    std::set<const CPDF_Object*>* chain) {
-    Landing landing;
-    if (nested) {
-      landing = Land(object, tiling, to_page, true, chain);
-    } else {
-      // The answer is the same for every object painting with this pattern
-      // through this matrix.
-      const float numbers[6] = {to_page.a, to_page.b, to_page.c,
-                                to_page.d, to_page.e, to_page.f};
-      std::pair<const CPDF_Object*, std::array<uint32_t, 6>> key;
-      key.first = tiling->pattern_obj().Get();
-      memcpy(key.second.data(), numbers, sizeof(numbers));
-      auto it = landings_.find(key);
-      if (it == landings_.end()) {
-        landing = Land(object, tiling, to_page, false, chain);
-        if (context_->work.spent) {
-          return Unknown();
-        }
-        // The pattern is kept, so its object's address stays its own.
-        landing.pattern = pdfium::WrapRetain(tiling);
-        it = landings_.emplace(key, landing).first;
-      }
-      landing = it->second;
-    }
-    if (!landing.found.content && !landing.found.drawing) {
-      return {};
-    }
-    // What the cell holds is no secret when the fill shows a whole tile of
-    // it elsewhere.
-    if (landing.placed && !nested && !stroke) {
-      if (const CPDF_PathObject* path = object->AsPath()) {
-        if (WholeTileBeside(*path, landing.grid, to_page)) {
-          return {};
-        }
-      }
-    }
-    return landing.found;
-  }
-
-  // What the cell of |tiling|, tiled over the regions, holds under them.
-  // |placed| says whether the tiling could be worked out; when not, the
-  // landing holds all the cell does.
-  Landing Land(CPDF_PageObject* object,
-               CPDF_TilingPattern* tiling,
-               const CFX_Matrix& to_page,
-               bool nested,
-               std::set<const CPDF_Object*>* chain) {
-    Landing landing;
-    // A pattern's content is parsed on its own, from level 0.
-    std::unique_ptr<CPDF_Form> cell = tiling->Load(object);
-    if (!cell) {
-      return landing;
-    }
-    // Everything in the cell, wherever it lies.
-    const auto all = [&] {
-      Found found;
-      found.content = PatternContent(cell.get(), chain, 0);
-      found.drawing = HasDrawing(cell.get(), 0);
-      return found;
-    };
-    CFX_FloatRect bbox = tiling->bbox();
-    bbox.Normalize();
-    const float x_step = tiling->x_step();
-    const float y_step = tiling->y_step();
-    // Pattern space to the page. The cell's objects were parsed through the
-    // parent matrix, which is undone before a tile's shift.
-    const CFX_Matrix placed = tiling->pattern_to_form() * to_page;
-    const CFX_Matrix& parent = tiling->parent_matrix();
-    CFX_FloatRect object_box = to_page.TransformRect(object->GetRect());
-    object_box.Normalize();
-    if (!Finite(bbox) || !(bbox.Width() > 0) || !(bbox.Height() > 0) ||
-        !std::isfinite(x_step) || !(x_step > 0) || !std::isfinite(y_step) ||
-        !(y_step > 0) || !Invertible(placed) || !Invertible(parent) ||
-        (nested && !Finite(object_box))) {
-      landing.found = all();
-      return landing;
-    }
-    landing.grid = Tiling{bbox, x_step, y_step, placed, placed.GetInverse()};
-    const Tiling& grid = landing.grid;
-    const CFX_Matrix unparent = parent.GetInverse();
-    Found found;
-    for (const RedactRegion& region : entry_->regions) {
-      CFX_FloatRect area = region.bbox;
-      if (nested) {
-        area.Intersect(object_box);
-        if (area.IsEmpty()) {
-          continue;
-        }
-      }
-      double first[2];
-      double last[2];
-      if (!grid.Over(area, false, first, last) ||
-          !((last[0] - first[0] + 1) * (last[1] - first[1] + 1) <= kMaxTiles)) {
-        landing.found = all();
-        return landing;
-      }
-      for (double i = first[0]; i <= last[0]; ++i) {
-        for (double j = first[1]; j <= last[1]; ++j) {
-          if (!context_->work.Spend(1)) {
-            landing.found = Unknown();
-            return landing;
-          }
-          const CFX_Matrix tile = grid.Tile(i, j);
-          CFX_FloatRect tile_box = tile.TransformRect(bbox);
-          tile_box.Normalize();
-          if (!Finite(tile_box)) {
-            landing.found = all();
-            return landing;
-          }
-          if (Intersects(tile_box, region.bbox)) {
-            Cell(cell.get(), unparent * tile, chain, 0, &found);
-          }
-        }
-      }
-    }
-    landing.placed = true;
-    landing.found = found;
-    return landing;
   }
 
   // Whether a cell holds a path, a shading, or an object painted with a
@@ -2238,244 +2280,93 @@ class Walker {
     return false;
   }
 
-  // Adds to |found| what a cell, placed on the page by |to_page|, holds
-  // under the regions, by the tests the page's own content gets, boxes
-  // first: text by its glyphs' boxes, images by their samples, paths and
-  // shadings as on the page. Objects in the cell painted with patterns
-  // follow from this placement, and so do the groups of soft masks.
-  void Cell(CPDF_PageObjectHolder* holder,
-            const CFX_Matrix& to_page,
-            std::set<const CPDF_Object*>* chain,
-            int depth,
-            Found* found) {
-    if (depth > kFormLevelLimit) {
-      context_->failed = true;
-      found->Add(Unknown());
-      return;
-    }
-    for (auto it = holder->begin(); it != holder->end(); ++it) {
-      CPDF_PageObject* object = it->get();
-      if (!context_->work.Spend(1)) {
-        found->Add(Unknown());
-        return;
-      }
-      if (!object->IsActive()) {
-        continue;
-      }
-      RetainPtr<CPDF_Stream> stream;
-      CFX_Matrix placed;
-      if (GroupOf(object, to_page, &stream, &placed) &&
-          !group_stack_.count(stream.Get())) {
-        if (!Finite(placed)) {
-          found->Add(Unknown());
-        } else {
-          const CPDF_Stream* id = stream.Get();
-          std::unique_ptr<CPDF_Form> group = ParseGroup(std::move(stream));
-          group_stack_.insert(id);
-          Cell(group.get(), placed, chain, depth + 1, found);
-          group_stack_.erase(id);
-        }
-      }
-      if (CPDF_FormObject* form = object->AsForm()) {
-        if (form->form()) {
-          Cell(form->form(), form->form_matrix() * to_page, chain, depth + 1,
-               found);
-        }
-        continue;
-      }
-      CFX_FloatRect box = to_page.TransformRect(object->GetRect());
-      box.Normalize();
-      if (!Finite(box)) {
-        found->Add(Unknown());
-        continue;
-      }
-      if (!RectMeetsAnyBBox(box, entry_->regions)) {
-        continue;
-      }
-      found->Add(PatternFound(object, to_page, true, chain));
-      if (PictureShadingPattern(object, to_page)) {
-        found->drawing = true;
-      }
-      if (CPDF_TextObject* text = object->AsText()) {
-        found->content +=
-            std::max(TextChars(*text, to_page), AdvanceChars(*text, to_page));
-      } else if (CPDF_ImageObject* image = object->AsImage()) {
-        if (ImageCounts(*image, to_page)) {
-          ++found->content;
-        }
-      } else if (CPDF_PathObject* path = object->AsPath()) {
-        if (PathCrosses(*redactor_, *path, to_page) ||
-            PathSampleInside(*path, to_page)) {
-          found->drawing = true;
-        }
-      } else if (CPDF_ShadingObject* shading = object->AsShading()) {
-        if (PictureShading(shading->pattern(), shading->matrix() * to_page) ||
-            ShadingCounts(*shading, to_page)) {
-          found->drawing = true;
-        }
-      }
-    }
-  }
-
-  // Appends |path| under |fill|, placed by |to_page|, to |shapes| as edges.
-  // False when it cannot be flattened or has no points.
-  bool AddShape(const CPDF_Path& path,
-                CFX_FillRenderOptions::FillType fill,
-                const CFX_Matrix& to_page,
-                std::vector<ClipEdges>* shapes) {
-    const float stretch =
-        std::sqrt(to_page.a * to_page.a + to_page.b * to_page.b +
-                  to_page.c * to_page.c + to_page.d * to_page.d);
-    const float tolerance = kCurveTolerance / stretch;
-    if (!path.HasRef() || path.GetPoints().empty() ||
-        !std::isfinite(tolerance) || !(tolerance > 0) ||
-        !context_->work.Spend(path.GetPoints().size())) {
-      return false;
-    }
-    std::optional<std::vector<std::vector<CFX_PointF>>> polygons =
-        Polygons(path, tolerance);
-    if (!polygons.has_value()) {
-      return false;
-    }
-    ClipEdges shape;
-    shape.fill = fill;
-    for (const std::vector<CFX_PointF>& polygon : *polygons) {
-      if (!context_->work.Spend(polygon.size()) ||
-          !shape.Add(polygon, to_page)) {
-        return false;
-      }
-    }
-    shapes->push_back(std::move(shape));
-    return true;
-  }
-
-  // Whether the fill of |path| paints a whole tile of |grid| that lies on
-  // the page and outside every region: the regions the caller gave, or this
-  // candidate's own. The tile's box must lie inside the path's fill and
-  // inside each of its clip paths, half a point clear of their edges. Up to
-  // kWholeTileTries tiles along each step are tried, evenly spread. False
-  // whenever it cannot tell.
-  bool WholeTileBeside(const CPDF_PathObject& path,
-                       const Tiling& grid,
-                       const CFX_Matrix& to_page) {
-    // Tiles that overlap may paint over one another.
-    if (grid.x_step < grid.bbox.Width() || grid.y_step < grid.bbox.Height()) {
-      return false;
-    }
-    const CPDF_ClipPath& clip = path.clip_path();
-    std::vector<ClipEdges> shapes;
-    if (!AddShape(path.path(), path.filltype(), path.matrix() * to_page,
-                  &shapes)) {
-      return false;
-    }
-    if (clip.HasRef()) {
-      if (clip.GetTextCount()) {
-        return false;
-      }
-      for (size_t i = 0; i < clip.GetPathCount(); ++i) {
-        if (!AddShape(clip.GetPath(i), clip.GetClipType(i), to_page,
-                      &shapes)) {
-          return false;
-        }
-      }
-    }
-    size_t edges = 0;
-    for (const ClipEdges& shape : shapes) {
-      edges += shape.edges.size();
-    }
-    if (shapes[0].edges.empty()) {
-      return false;
-    }
-    CFX_FloatRect fill_box(shapes[0].edges[0].a);
-    for (const ClipEdges::Edge& edge : shapes[0].edges) {
-      fill_box.UpdateRect(edge.a);
-      fill_box.UpdateRect(edge.b);
-    }
-    double first[2];
-    double last[2];
-    if (!grid.Over(fill_box, true, first, last) || last[0] < first[0] ||
-        last[1] < first[1]) {
-      return false;
-    }
-    std::vector<CFX_FloatRect> own;
-    if (!context_->strict) {
-      for (const RedactRegion& region : entry_->regions) {
-        own.push_back(region.bbox);
-      }
-    }
-    const std::vector<CFX_FloatRect>& regions =
-        context_->strict ? context_->given : own;
-    const double stride_i =
-        std::max(1.0, std::ceil((last[0] - first[0] + 1) / kWholeTileTries));
-    const double stride_j =
-        std::max(1.0, std::ceil((last[1] - first[1] + 1) / kWholeTileTries));
-    for (double i = first[0]; i <= last[0]; i += stride_i) {
-      for (double j = first[1]; j <= last[1]; j += stride_j) {
-        if (!context_->work.Spend(1 + regions.size())) {
-          return false;
-        }
-        CFX_FloatRect tile = grid.Tile(i, j).TransformRect(grid.bbox);
-        tile.Normalize();
-        if (!Finite(tile) || !context_->page_box.Contains(tile)) {
-          continue;
-        }
-        bool clear = true;
-        for (const CFX_FloatRect& region : regions) {
-          clear = clear && !Touches(tile, region);
-        }
-        if (!clear) {
-          continue;
-        }
-        if (!context_->work.Spend(edges)) {
-          return false;
-        }
-        bool held = true;
-        for (const ClipEdges& shape : shapes) {
-          held = held && Holds(shape, tile, 2 * kCurveTolerance);
-        }
-        if (held) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  // The characters and images inside the tiling patterns |object| paints
-  // with, following patterns those paint with in turn. |chain| holds the
-  // patterns being read, so a pattern that paints with itself ends.
-  unsigned PatternsOf(CPDF_PageObject* object,
-                      std::set<const CPDF_Object*>* chain) {
-    const CPDF_ColorState& colors = object->color_state();
-    if (!colors.HasRef()) {
+  // The glyphs of Type 3 |text| whose procedure paints in a region though
+  // the box the glyph declares does not meet it: the text redactor goes by
+  // the declared box. With |carrier|, sets it when a glyph that reaches a
+  // region either way has a procedure holding an image, a shading, a form
+  // or a pattern use, which the text redactor does not rewrite.
+  unsigned Type3Reach(CPDF_TextObject& text,
+                      const CFX_Matrix& to_page,
+                      bool* carrier) {
+    RetainPtr<CPDF_Font> font = text.GetFont();
+    CPDF_Type3Font* type3 = font ? font->AsType3Font() : nullptr;
+    if (!type3) {
       return 0;
     }
+    const float size = text.GetFontSize();
+    const CFX_Matrix matrix = text.GetTextMatrix() * to_page;
     unsigned count = 0;
-    for (const CPDF_Color* color :
-         {colors.GetFillColor(), colors.GetStrokeColor()}) {
-      if (!color || !color->IsPattern()) {
+    for (size_t i = 0; i < text.CharCount(); ++i) {
+      const CPDF_TextObject::Item item = text.GetItemInfo(i);
+      if (item.char_code_ == CPDF_Font::kInvalidCharCode ||
+          !context_->work.Spend(1)) {
         continue;
       }
-      RetainPtr<CPDF_Pattern> pattern = color->GetPattern();
-      CPDF_TilingPattern* tiling = pattern ? pattern->AsTilingPattern() : nullptr;
-      if (!tiling || chain->count(tiling->pattern_obj().Get())) {
+      const CPDF_Type3Char* glyph = type3->LoadChar(item.char_code_);
+      const CPDF_Form* form =
+          glyph ? static_cast<const CPDF_Form*>(glyph->form()) : nullptr;
+      if (!form) {
         continue;
       }
-      if (chain->size() >= kMaxPatternChain) {
-        context_->failed = true;
-        return count;
+      if (context_->glyphs_charged.emplace(font.Get(), item.char_code_).second) {
+        SpendParse(form->GetStream().Get(), form);
       }
-      chain->insert(tiling->pattern_obj().Get());
-      // A pattern's content is parsed on its own, from level 0.
-      std::unique_ptr<CPDF_Form> form = tiling->Load(object);
-      if (form) {
-        count += PatternContent(form.get(), chain, 0);
+      // The procedure's own bounds, and what kinds of object it holds.
+      std::optional<CFX_FloatRect> bounds;
+      bool holds = false;
+      for (auto it = form->begin(); it != form->end(); ++it) {
+        const CPDF_PageObject* object = it->get();
+        if (!object->IsActive()) {
+          continue;
+        }
+        if (bounds.has_value()) {
+          bounds->Union(object->GetRect());
+        } else {
+          bounds = object->GetRect();
+        }
+        const CPDF_ColorState& colors = object->color_state();
+        holds = holds || object->AsImage() || object->AsShading() ||
+                object->AsForm() ||
+                (colors.HasRef() &&
+                 ((colors.GetFillColor() && colors.GetFillColor()->IsPattern()) ||
+                  (colors.GetStrokeColor() &&
+                   colors.GetStrokeColor()->IsPattern())));
       }
-      chain->erase(tiling->pattern_obj().Get());
+      if (!bounds.has_value()) {
+        continue;
+      }
+      const auto meets = [&](const CFX_FloatRect& local) {
+        const Quad quad = Transformed(local, matrix);
+        for (const CFX_PointF& point : quad) {
+          if (!Finite(point)) {
+            return true;
+          }
+        }
+        return QuadMeetsAny(quad, entry_->regions);
+      };
+      const FX_RECT units = font->GetCharBBox(item.char_code_);
+      const bool declared = meets(CFX_FloatRect(
+          units.left * size / 1000.0f + item.origin_.x,
+          units.bottom * size / 1000.0f + item.origin_.y,
+          units.right * size / 1000.0f + item.origin_.x,
+          units.top * size / 1000.0f + item.origin_.y));
+      CFX_FloatRect drawn = type3->GetFontMatrix().TransformRect(*bounds);
+      drawn.Normalize();
+      const bool reaches = meets(CFX_FloatRect(
+          drawn.left * size + item.origin_.x, drawn.bottom * size + item.origin_.y,
+          drawn.right * size + item.origin_.x, drawn.top * size + item.origin_.y));
+      if (reaches && !declared) {
+        ++count;
+      }
+      if (carrier && holds && (reaches || declared)) {
+        *carrier = true;
+      }
     }
     return count;
   }
 
+  // The characters and images a cell holds, patterns its objects paint with
+  // followed.
   unsigned PatternContent(CPDF_PageObjectHolder* holder,
                           std::set<const CPDF_Object*>* chain,
                           int depth) {
@@ -2486,7 +2377,7 @@ class Walker {
     unsigned count = 0;
     for (auto it = holder->begin(); it != holder->end(); ++it) {
       CPDF_PageObject* object = it->get();
-      count += PatternsOf(object, chain);
+      count += CellsOf(object, chain).content;
       if (CPDF_TextObject* text = object->AsText()) {
         count += static_cast<unsigned>(text->CharCount());
       } else if (object->AsImage()) {
@@ -2587,8 +2478,14 @@ class Walker {
   const CPDF_PathRedactor* const redactor_;
   Context* const context_;
   std::map<ShadingKey, std::pair<CPDF_ClipPath, bool>> shadings_;
-  std::map<std::pair<const CPDF_Object*, std::array<uint32_t, 6>>, Landing>
-      landings_;
+  // What each pattern's cell holds.
+  std::map<const CPDF_Object*, std::pair<Found, RetainPtr<CPDF_TilingPattern>>>
+      cells_;
+  // A clip path, its fill rule and its place, and whether it reaches a region.
+  using ClipKey = std::tuple<const CFX_Path*, int, std::array<uint32_t, 6>>;
+  std::map<ClipKey, std::pair<CPDF_Path, bool>> clip_reach_;
+  std::map<std::pair<const CPDF_Stream*, std::array<uint32_t, 6>>, bool>
+      group_holds_;
   // A mask's group, where it lies, the scope and whether it is counted.
   using GroupKey =
       std::tuple<const CPDF_Stream*, std::array<uint32_t, 6>, int, bool>;
@@ -2827,9 +2724,10 @@ std::vector<Entry> FindCandidates(Context* context) {
   return entries;
 }
 
-// Fills in |entry|'s counts. Sets the context's |failed| when it could not
-// look everywhere.
-void Inspect(Context* context, Entry* entry) {
+// Holds |entry|'s regions to the page and shrinks them for the tests.
+// Returns the path redactor over them, or null: with the context's |failed|
+// set when it could not be made, without when no region is left.
+std::unique_ptr<CPDF_PathRedactor> Prepare(Context* context, Entry* entry) {
   CPDF_Page* page = context->page;
   // Regions are held to the page, grown by a margin: a mark's quads come from
   // the file and may be any size. One wholly outside has nothing under it;
@@ -2839,12 +2737,11 @@ void Inspect(Context* context, Entry* entry) {
       page->GetPageMatrix().GetInverse().TransformRect(
           CFX_FloatRect(0, 0, size.width, size.height));
   page_box.Normalize();
-  context->page_box = page_box;
   page_box.Inflate(kPageMargin, kPageMargin);
   if (!Finite(page_box)) {
     // No region can be held to it, and none may be dropped for missing it.
     context->failed = true;
-    return;
+    return nullptr;
   }
   std::vector<RedactRegion> held;
   for (const RedactRegion& region : entry->regions) {
@@ -2862,7 +2759,7 @@ void Inspect(Context* context, Entry* entry) {
   }
   entry->regions = std::move(held);
   if (entry->regions.empty()) {
-    return;
+    return nullptr;
   }
   // A region too small to shrink is tested as it is.
   std::vector<RedactRegion>& inset = entry->inset;
@@ -2874,10 +2771,51 @@ void Inspect(Context* context, Entry* entry) {
   auto redactor = std::make_unique<CPDF_PathRedactor>(pdfium::span(inset));
   if (!redactor->IsValid()) {
     context->failed = true;
+    return nullptr;
+  }
+  return redactor;
+}
+
+// What lies under |entry|'s regions that the apply cannot rewrite, on the
+// page content and in annotation appearances. Sets the context's |failed|
+// when it could not look everywhere.
+void Unremovable(Context* context, Entry* entry) {
+  std::unique_ptr<CPDF_PathRedactor> redactor = Prepare(context, entry);
+  if (!redactor) {
     return;
   }
+  CPDF_Page* page = context->page;
   Walker walker(entry, redactor.get(), context);
-  walker.Holder(page, CFX_Matrix(), Scope::kPage, true, 0);
+  walker.Unremovable(page, CFX_Matrix(), 0, Clips());
+  RetainPtr<const CPDF_Array> annots = page->GetAnnotsArray();
+  for (size_t i = 0; annots && i < annots->size(); ++i) {
+    RetainPtr<const CPDF_Dictionary> annot = annots->GetDictAt(i);
+    if (!annot) {
+      continue;
+    }
+    const ByteString subtype = annot->GetNameFor("Subtype");
+    if (subtype == "Redact" || subtype == "Popup") {
+      continue;
+    }
+    for (RetainPtr<CPDF_Stream>& stream : AppearanceStreams(annot.Get())) {
+      CFX_Matrix to_page;
+      std::unique_ptr<CPDF_Form> form =
+          Appearance(page, annot.Get(), std::move(stream), &to_page);
+      walker.Unremovable(form.get(), to_page, 0, Clips());
+    }
+  }
+}
+
+// Fills in |entry|'s counts. Sets the context's |failed| when it could not
+// look everywhere.
+void Inspect(Context* context, Entry* entry) {
+  std::unique_ptr<CPDF_PathRedactor> redactor = Prepare(context, entry);
+  if (!redactor) {
+    return;
+  }
+  CPDF_Page* page = context->page;
+  Walker walker(entry, redactor.get(), context);
+  walker.Holder(page, CFX_Matrix(), Scope::kPage, true, 0, Clips());
   if (context->work.spent) {
     context->failed = true;
     return;
@@ -2908,7 +2846,8 @@ void Inspect(Context* context, Entry* entry) {
       std::unique_ptr<CPDF_Form> form =
           Appearance(page, annot.Get(), std::move(stream), &to_page);
       // Walked either way, for the page copies inside.
-      walker.Holder(form.get(), to_page, Scope::kAnnotation, counted, 0);
+      walker.Holder(form.get(), to_page, Scope::kAnnotation, counted, 0,
+                    Clips());
     }
   }
   // A region counts content when either test finds it.
@@ -2967,6 +2906,46 @@ std::string PageReport(const std::vector<Entry>& entries) {
   }
   out += "]}";
   return out;
+}
+
+std::string UnremovableReport(const std::vector<Entry>& entries) {
+  std::string out = "{\"regions\":[";
+  for (size_t i = 0; i < entries.size(); ++i) {
+    const Entry& e = entries[i];
+    out += i ? ",{" : "{";
+    out += "\"index\":" + std::to_string(i);
+    AppendField(&out, "patterns", e.patterns);
+    AppendField(&out, "shadings", e.shadings);
+    AppendField(&out, "maskGroups", e.mask_groups);
+    AppendField(&out, "glyphs", e.glyphs);
+    out += "}";
+  }
+  out += "]}";
+  return out;
+}
+
+// One entry for each of |count| quads of 8 floats at |quads|, or nullopt
+// when one is not a region.
+std::optional<std::vector<Entry>> EntriesOf(const float* quads, int count) {
+  std::vector<Entry> entries;
+  // SAFETY: the caller passes |count| quads of 8 floats at |quads|.
+  pdfium::span<const float> values =
+      UNSAFE_BUFFERS(pdfium::span(quads, static_cast<size_t>(count) * 8));
+  for (int i = 0; i < count; ++i) {
+    Quad corners;
+    for (size_t c = 0; c < 4; ++c) {
+      corners[c] = CFX_PointF(values[i * 8 + c * 2], values[i * 8 + c * 2 + 1]);
+    }
+    std::optional<RedactRegion> region = RedactRegionFromQuadCorners(corners);
+    if (!region.has_value()) {
+      return std::nullopt;
+    }
+    Entry entry;
+    entry.rect = region->bbox;
+    entry.regions.push_back(*region);
+    entries.push_back(std::move(entry));
+  }
+  return entries;
 }
 
 // The /L of a file's first object when that object is a linearization
@@ -3136,23 +3115,11 @@ char* INK_Inspect_Page(FPDF_DOCUMENT doc,
   }
   std::vector<Entry> entries;
   if (count > 0) {
-    // SAFETY: the caller passes |count| quads of 8 floats at |quads|.
-    pdfium::span<const float> values =
-        UNSAFE_BUFFERS(pdfium::span(quads, static_cast<size_t>(count) * 8));
-    for (int i = 0; i < count; ++i) {
-      Quad corners;
-      for (size_t c = 0; c < 4; ++c) {
-        corners[c] = CFX_PointF(values[i * 8 + c * 2], values[i * 8 + c * 2 + 1]);
-      }
-      std::optional<RedactRegion> region = RedactRegionFromQuadCorners(corners);
-      if (!region.has_value()) {
-        return nullptr;
-      }
-      Entry entry;
-      entry.rect = region->bbox;
-      entry.regions.push_back(*region);
-      entries.push_back(std::move(entry));
+    std::optional<std::vector<Entry>> given = EntriesOf(quads, count);
+    if (!given.has_value()) {
+      return nullptr;
     }
+    entries = std::move(*given);
   }
 
   FPDF_PAGE handle = FPDF_LoadPage(doc, page_index);
@@ -3163,9 +3130,6 @@ char* INK_Inspect_Page(FPDF_DOCUMENT doc,
   {
     ScopedFPDFPageView view(handle);
     Context context(view.Get(), /*strict=*/count > 0);
-    for (const Entry& entry : entries) {
-      context.given.push_back(entry.rect);
-    }
     IndexHolder(context.page, false, 0, &context);
     if (count == 0) {
       entries = FindCandidates(&context);
@@ -3180,6 +3144,40 @@ char* INK_Inspect_Page(FPDF_DOCUMENT doc,
     }
     if (!context.failed) {
       report = PageReport(entries);
+    }
+  }
+  FPDF_ClosePage(handle);
+  return report.empty() ? nullptr : Copy(report);
+}
+
+char* INK_Redact_Unremovable(FPDF_DOCUMENT doc,
+                             int page_index,
+                             const float* quads,
+                             int count) {
+  if (count <= 0 || !quads) {
+    return nullptr;
+  }
+  std::optional<std::vector<Entry>> entries = EntriesOf(quads, count);
+  if (!entries.has_value()) {
+    return nullptr;
+  }
+  FPDF_PAGE handle = FPDF_LoadPage(doc, page_index);
+  if (!handle) {
+    return nullptr;
+  }
+  std::string report;
+  {
+    ScopedFPDFPageView view(handle);
+    Context context(view.Get(), /*strict=*/true);
+    for (Entry& entry : *entries) {
+      Unremovable(&context, &entry);
+      if (context.work.spent) {
+        context.failed = true;
+        break;
+      }
+    }
+    if (!context.failed) {
+      report = UnremovableReport(*entries);
     }
   }
   FPDF_ClosePage(handle);

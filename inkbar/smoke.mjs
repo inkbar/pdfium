@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 84)
+assert.equal(names.length, 85)
 
 const m = await createModule()
 for (const name of names) {
@@ -1350,186 +1350,209 @@ const clippedAway = (points) => `${roundPath(points)} W n 0 0 400 200 re 3 3 394
   assert.ok(beside.textChars > 0, `the shared form's text is hidden from the check: ${JSON.stringify(beside)}`)
 }
 
-// Drawing inside tiling patterns. The redaction does not enter a pattern's
-// stream, so a shape its cell draws under a mark stays in the file.
+// What the apply cannot rewrite: a tiling pattern's cell, a mesh or
+// function-based shading, a soft mask's group, a Type 3 glyph procedure.
+// The apply cuts or clips the object that paints with one and leaves the
+// carrier in the file, so INK_Redact_Unremovable is asked before the apply,
+// while the object still says what it covers, and an apply over a region it
+// counts in is refused.
 const PATTERN_MARK = [150, 60, 250, 140]
+const BESIDE_MARK = [20, 20, 100, 45]
 const tiling = (bbox, xStep, yStep, content, entries = '/PaintType 1', resources = '') =>
   streamObject(`/Type /Pattern /PatternType 1 ${entries} /TilingType 1 /BBox [${bbox.join(' ')}] /XStep ${xStep} /YStep ${yStep} /Resources << ${resources} >>`, content)
 // A cell the size of the page: a quadrilateral under the mark and a square beside it.
 const pageCell = tiling([0, 0, 400, 200], 400, 200, '1 0 1 rg 170 80 m 230 85 l 220 120 l 180 115 l h f 0 0 1 rg 300 80 40 40 re f')
+const hatchCell = tiling([0, 0, 10, 10], 10, 10, '0 G 1 w 0 0 m 10 10 l S')
 // A page that fills |fill| (path operators) with /P0, the first of |patterns|.
 const patternPage = (fill, patterns, colour = '/Pattern cs /P0 scn', resources = '') =>
   onePagePdf(`q ${colour} ${fill} Q`, { resources: `/Pattern << /P0 6 0 R >> ${resources}` }, patterns)
-// |source| with a mark applied, and what the check then finds under it.
-function underAppliedMark(source, rect = PATTERN_MARK) {
-  const applied = editPage(source, (doc, page) => {
-    const mark = addMark(page, rect)
-    assert.equal(applyPage(doc, page, [mark], false).result, 1)
-    m._FPDFPage_CloseAnnot(mark)
-  })
-  return withDoc(applied, (doc) => inspectPage(doc, 0, [rect]))[0]
-}
-
-// counts a shape a page-sized pattern cell draws under a mark the fill reaches past
-{
-  const after = underAppliedMark(patternPage('20 50 360 100 re f', [pageCell]))
-  assert.ok(after.paths > 0, `the cell's shape under the applied mark: ${JSON.stringify(after)}`)
-  // A pattern inside the cell follows from the cell's place.
-  const outer = streamObject(
-    '/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 400 200] /XStep 400 /YStep 200 /Resources << /Pattern << /Pin 7 0 R >> >>',
-    '/Pattern cs /Pin scn 0 0 400 200 re f',
-  )
-  const nested = underAppliedMark(patternPage('20 50 360 100 re f', [outer, pageCell]))
-  assert.ok(nested.paths > 0, `a shape in a pattern inside the cell: ${JSON.stringify(nested)}`)
-  // In candidate mode, under a black box set into a hole in the fill.
-  const boxed = patternPage('20 50 360 100 re 150 60 100 80 re f* 0 g 150 60 100 80 re f', [pageCell])
-  const box = withDoc(boxed, (doc) => inspectPage(doc, 0, [])).find((c) => c.kind === 'filled-box')
-  assert.ok(box && box.paths > 0, `the cell's shape under a black box: ${JSON.stringify(box)}`)
-}
-
-// counts a cell's shape under a mark that took one whole side of the fill
-{
-  // What the apply leaves of the band no longer reaches the mark, and the
-  // pattern still draws the shape there.
-  const cell = tiling([0, 0, 400, 200], 400, 200, '1 0 1 rg 60 80 m 120 85 l 110 120 l 70 115 l h f 0 0 1 rg 300 80 40 40 re f')
-  const after = underAppliedMark(patternPage('20 50 360 100 re f', [cell]), [10, 40, 200, 160])
-  assert.ok(after.paths > 0, `the cell's shape under a mark across the fill's side: ${JSON.stringify(after)}`)
-}
-
-// places a pattern's cell under a region wherever on the page it is painted
-{
-  const away = '20 150 360 40 re f'
-  const under = (cell) => withDoc(patternPage(away, [cell]), (doc) => inspectPage(doc, 0, [PATTERN_MARK]))[0]
-  // An accepted refusal: the fill never came near the region, but a saved
-  // file cannot say so, and the cell does draw where the region is.
-  assert.ok(under(pageCell).paths > 0, 'a large cell painted elsewhere that draws where the region is')
-  const beside = tiling([0, 0, 400, 200], 400, 200, '0 0 1 rg 300 80 40 40 re f')
-  assert.equal(under(beside).paths, 0, 'a large cell that draws nothing where the region is')
-  const hatch = tiling([0, 0, 10, 10], 10, 10, '0 G 1 w 0 0 m 10 10 l S')
-  assert.equal(under(hatch).paths, 0, 'a hatch painted elsewhere, whole tiles in view')
-}
-
-// counts text and an image in a cell under a mark that took one whole side of the fill
-{
-  const side = [10, 40, 200, 160]
-  const words = tiling([0, 0, 400, 200], 400, 200, 'BT /F1 12 Tf 60 100 Td (CELLSECRET) Tj ET', '/PaintType 1', '/Font << /F1 5 0 R >>')
-  const text = underAppliedMark(patternPage('20 50 360 100 re f', [words]), side)
-  assert.ok(text.patternContent > 0, `a cell's text under a mark across the fill's side: ${JSON.stringify(text)}`)
-  assert.equal(text.textChars, 0, 'pattern text counted as page text')
-  const pixels = Buffer.alloc(16 * 16 * 3)
-  for (let i = 0; i < 256; i++) pixels.set([(i % 16) * 16, Math.floor(i / 16) * 16, 128], i * 3)
-  const picture = tiling([0, 0, 400, 200], 400, 200, 'q 60 0 0 40 60 80 cm /Im0 Do Q', '/PaintType 1', '/XObject << /Im0 7 0 R >>')
-  const image = underAppliedMark(
-    patternPage('20 50 360 100 re f', [picture, streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8', pixels)]),
-    side,
-  )
-  assert.ok(image.patternContent > 0, `a cell's image under a mark across the fill's side: ${JSON.stringify(image)}`)
-  // An inline image is an image like any other.
-  const hex = Array.from({ length: 48 }, (_, i) => ((i * 37) % 256).toString(16).padStart(2, '0')).join('')
-  const inline = tiling([0, 0, 400, 200], 400, 200, `q 60 0 0 40 60 80 cm BI /W 4 /H 4 /CS /RGB /BPC 8 /F /AHx ID ${hex}> EI Q`)
-  const inlined = underAppliedMark(patternPage('20 50 360 100 re f', [inline]), side)
-  assert.ok(inlined.patternContent > 0, `a cell's inline image under a mark across the fill's side: ${JSON.stringify(inlined)}`)
-  // The same cells where they hold nothing under the region.
-  const [beside] = withDoc(patternPage('20 50 360 100 re f', [words]), (doc) => inspectPage(doc, 0, [[300, 60, 380, 140]]))
-  assert.equal(beside.patternContent, 0, `a cell's text beside the region: ${JSON.stringify(beside)}`)
-}
-
-// does not count a hatch that the fill also shows whole beside the mark
-{
-  const hatch = tiling([0, 0, 10, 10], 10, 10, '0 G 1 w 0 0 m 10 10 l S')
-  const after = underAppliedMark(patternPage('20 50 360 100 re f', [hatch]))
-  assert.equal(after.paths, 0, `a hatch under the applied mark: ${JSON.stringify(after)}`)
-}
-
-// counts a small cell's shape when the fill shows no whole tile beside the mark
-{
-  // An uncoloured pattern. The fill reaches 10 pt past the mark on every
-  // side, and the tiles are 100 pt across.
-  const cell = tiling([0, 0, 100, 100], 100, 100, '60 70 30 20 re f', '/PaintType 2')
-  const after = underAppliedMark(patternPage('140 50 120 100 re f', [cell], '/Cs0 cs 1 0 0 /P0 scn', '/ColorSpace << /Cs0 [/Pattern /DeviceRGB] >>'))
-  assert.ok(after.paths > 0, `a shape no whole tile shows elsewhere: ${JSON.stringify(after)}`)
-}
-
-// counts nothing for a pattern fill that lay wholly under the mark
-{
-  const source = patternPage('160 70 80 60 re f', [pageCell])
-  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [PATTERN_MARK]))
-  assert.ok(before.paths > 0, `the fill before the apply: ${JSON.stringify(before)}`)
-  const after = underAppliedMark(source)
-  assert.equal(after.paths, 0, `a fill the apply removed: ${JSON.stringify(after)}`)
-}
-
-// counts a pattern whose tiling cannot be worked out, or fails
-{
-  const hatch = '0 G 1 w 0 0 m 10 10 l S'
-  const band = '20 50 360 100 re f'
-  for (const [name, source] of [
-    ['a step of 0', patternPage(band, [tiling([0, 0, 10, 10], 0, 10, hatch)])],
-    ['an empty cell box', patternPage(band, [tiling([0, 0, 0, 10], 10, 10, hatch)])],
-    ['a matrix that cannot be undone', patternPage(band, [tiling([0, 0, 10, 10], 10, 10, hatch, '/PaintType 1 /Matrix [1 0 2 0 0 0]')])],
-    // A stroke around the mark, which shows no whole tile for certain, in a
-    // pattern with a million tiles to the point.
-    ['tiles too many to place', patternPage('20 50 360 100 re S', [tiling([0, 0, 0.001, 0.001], 0.001, 0.001, '0 0 0.001 0.001 re f')], '/Pattern CS /P0 SCN 10 w')],
-  ]) {
-    const applied = editPage(source, (doc, page) => {
-      const mark = addMark(page, PATTERN_MARK)
-      assert.equal(applyPage(doc, page, [mark], false).result, 1)
-      m._FPDFPage_CloseAnnot(mark)
-    })
-    withDoc(applied, (doc) => {
-      const quad = m._malloc(32)
-      m.HEAPF32.set(quadOf(PATTERN_MARK), quad / 4)
-      const pointer = m._INK_Inspect_Page(doc, 0, quad, 1)
-      m._free(quad)
-      if (pointer) assert.ok(report(pointer).regions[0].paths > 0, `${name}: reported as nothing`)
-    })
-  }
-}
-
-// counts a path filled with a shading pattern by the path's own rule
-{
-  const source = onePagePdf('q /Pattern cs /P0 scn 20 50 360 100 re f Q', {
-    resources: `/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 400 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >> >>`,
-  })
-  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [PATTERN_MARK]))
-  assert.equal(before.paths, 1, `a shading pattern fill before the apply: ${JSON.stringify(before)}`)
-  const after = underAppliedMark(source)
-  assert.equal(after.paths, 0, `a shading pattern fill under the applied mark: ${JSON.stringify(after)}`)
-}
-
-// Shadings that can hold a picture. The apply clips a shading and leaves its
-// definition in the file, so a mesh or a function over the mark stays there.
-const BESIDE_MARK = [20, 20, 100, 50]
 // One Gouraud triangle (type 4) over PATTERN_MARK, 8 bits to a number.
 const meshShading = streamObject(
   '/ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 400 0 200 0 1 0 1 0 1]',
   Buffer.from([0, 96, 77, 255, 0, 0, 0, 159, 77, 0, 255, 0, 0, 128, 179, 0, 0, 255]),
 )
-// |source| before and after PATTERN_MARK is applied: the paths under the
-// mark, and after the apply those beside it.
-function pathsAround(source) {
-  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [PATTERN_MARK]))
-  const applied = editPage(source, (doc, page) => {
-    const mark = addMark(page, PATTERN_MARK)
+const axial = '/ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 400 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>'
+// A page that paints |fill| through /GS0, a soft mask with |group| (object 6).
+const maskedPage = (fill, group, extra = []) =>
+  onePagePdf(`q /GS0 gs 0 0 1 rg ${fill} Q BT /F1 12 Tf 20 20 Td (KEEP) Tj ET`, { resources: '/ExtGState << /GS0 << /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >>' }, [group, ...extra])
+const maskGroup = (content, resources = '/Font << /F1 5 0 R >>') =>
+  streamObject(`/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Group << /S /Transparency /CS /DeviceGray >> /Resources << ${resources} >>`, content)
+// A Type 3 font: /a declares a box a tenth of its em and draws three ems
+// wide, /b draws inside the box it declares.
+const type3Font = [
+  '<< /Type /Font /Subtype /Type3 /FontBBox [0 0 3000 1000] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 7 0 R /b 8 0 R >> /Encoding << /Type /Encoding /Differences [97 /a /b] >> /FirstChar 97 /LastChar 98 /Widths [100 1000] >>',
+  streamObject('', '100 0 0 0 100 100 d1 0 0 3000 1000 re f'),
+  streamObject('', '1000 0 0 0 1000 1000 d1 100 100 800 800 re f'),
+]
+const type3Page = (text) => onePagePdf(`BT /T3 40 Tf ${text} ET`, { resources: '/Font << /T3 6 0 R >>' }, type3Font)
+
+// The counts INK_Redact_Unremovable gives for |rects| on page 0 of |source|:
+// patterns, shadings, mask groups, glyphs.
+function unremovable(source, rects = [PATTERN_MARK]) {
+  return withDoc(source, (doc) => {
+    const quads = rects.map(quadOf)
+    const ptr = m._malloc(quads.length * 32)
+    m.HEAPF32.set(quads.flat(), ptr / 4)
+    const { regions } = report(m._INK_Redact_Unremovable(doc, 0, ptr, quads.length))
+    m._free(ptr)
+    return regions.map((r) => [r.patterns, r.shadings, r.maskGroups, r.glyphs])
+  })
+}
+// |source| with a mark applied, whatever INK_Redact_Unremovable says.
+function forceApply(source, rect = PATTERN_MARK) {
+  return editPage(source, (doc, page) => {
+    const mark = addMark(page, rect)
     assert.equal(applyPage(doc, page, [mark], false).result, 1)
     m._FPDFPage_CloseAnnot(mark)
   })
-  const [after, beside] = withDoc(applied, (doc) => inspectPage(doc, 0, [PATTERN_MARK, BESIDE_MARK]))
-  return [before.paths, after.paths, beside.paths]
+}
+// What the check finds under |rect| in |bytes|.
+const under = (bytes, rect = PATTERN_MARK) => withDoc(bytes, (doc) => inspectPage(doc, 0, [rect]))[0]
+const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, r.annotationText, r.annotationImages]
+
+// says before an apply what lies under a mark that the apply cannot rewrite
+{
+  const none = [0, 0, 0, 0]
+  const band = '20 50 360 100 re f'
+  // Tiling patterns: whatever the cell holds, an object painting with one in
+  // the region counts.
+  assert.deepEqual(unremovable(patternPage(band, [hatchCell]), [PATTERN_MARK, BESIDE_MARK]), [[1, 0, 0, 0], none], 'a hatched bar under the mark and beside it')
+  assert.deepEqual(unremovable(patternPage(band, [pageCell])), [[1, 0, 0, 0]], 'a bar filled with a large cell')
+  assert.deepEqual(unremovable(patternPage('20 50 360 100 re S', [hatchCell], '/Pattern CS /P0 SCN 10 w')), [none], 'a pattern stroke around the mark')
+  assert.deepEqual(unremovable(patternPage('20 50 360 100 re S', [hatchCell], '/Pattern CS /P0 SCN 30 w')), [[1, 0, 0, 0]], 'a pattern stroke that enters the mark')
+  assert.deepEqual(
+    unremovable(onePagePdf('BT /Pattern cs /P0 scn /F1 40 Tf 160 80 Td (AB) Tj ET', { resources: '/Pattern << /P0 6 0 R >>' }, [hatchCell])),
+    [[1, 0, 0, 0]],
+    'text shown with a pattern colour',
+  )
+  // A form's content does not carry the clip its form object is painted
+  // under: the crop decides whether the fill inside paints in the region.
+  const cropped = (crop) =>
+    onePagePdf(`q ${crop} re W n /Fm0 Do Q`, { resources: '/XObject << /Fm0 7 0 R >>' }, [
+      hatchCell,
+      streamObject('/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Resources << /Pattern << /P0 6 0 R >> >>', `/Pattern cs /P0 scn ${band}`),
+    ])
+  assert.deepEqual(unremovable(cropped('260 40 130 120')), [none], 'a pattern fill in a form cropped away from the mark')
+  assert.deepEqual(unremovable(cropped('100 40 200 120')), [[1, 0, 0, 0]], 'a pattern fill in a form cropped over the mark')
+  // Shadings: a mesh or a function can hold a picture, a ramp cannot.
+  const mesh = onePagePdf('/Sh0 sh', { resources: '/Shading << /Sh0 6 0 R >>' }, [meshShading])
+  assert.deepEqual(unremovable(mesh, [PATTERN_MARK, BESIDE_MARK]), [[0, 1, 0, 0], none], 'a mesh shading under the mark and beside it')
+  assert.deepEqual(unremovable(onePagePdf('q 20 50 360 100 re W n /Sh0 sh Q', { resources: `/Shading << /Sh0 << ${axial} >> >>` })), [none], 'an axial shading under the mark')
+  const meshFill = onePagePdf(`q /Pattern cs /P0 scn ${band} Q`, { resources: '/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading 6 0 R >> >>' }, [meshShading])
+  assert.deepEqual(unremovable(meshFill, [PATTERN_MARK, BESIDE_MARK]), [[0, 1, 0, 0], none], 'a path filled with a mesh shading pattern')
+  assert.deepEqual(unremovable(onePagePdf(`q /Pattern cs /P0 scn ${band} Q`, { resources: `/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading << ${axial} >> >> >>` })), [none], 'a path filled with an axial shading pattern')
+  // Soft masks: the object must paint in the region and the group must hold
+  // something there.
+  const secret = maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET')
+  assert.deepEqual(unremovable(maskedPage(band, secret)), [[0, 0, 1, 0]], 'a mask group with text under the mark, on an object under it')
+  assert.deepEqual(unremovable(maskedPage('20 150 360 40 re f', secret)), [none], 'the same group on an object beside the mark')
+  assert.deepEqual(unremovable(maskedPage(band, maskGroup('1 g 300 60 40 20 re f'))), [none], 'a mask group that holds nothing under the mark')
+  // Type 3: the text redactor goes by the box a glyph declares.
+  assert.deepEqual(unremovable(type3Page('100 80 Td (a) Tj')), [[0, 0, 0, 1]], 'a glyph that draws out of its box into the mark')
+  assert.deepEqual(unremovable(type3Page('180 80 Td (b) Tj')), [none], 'an ordinary glyph under the mark')
+  assert.deepEqual(unremovable(type3Page('300 80 Td (b) Tj')), [none], 'an ordinary glyph beside the mark')
+  // NULL when it cannot look.
+  withDoc(mesh, (doc) => {
+    const call = (index, quad, count = 1) => {
+      const ptr = m._malloc(32)
+      m.HEAPF32.set(quad, ptr / 4)
+      const result = m._INK_Redact_Unremovable(doc, index, ptr, count)
+      m._free(ptr)
+      if (result) m._INK_Inspect_Free(result)
+      return result
+    }
+    assert.notEqual(call(0, quadOf(PATTERN_MARK)), 0)
+    assert.equal(call(1, quadOf(PATTERN_MARK)), 0, 'a page out of range')
+    assert.equal(call(0, [150, 140, NaN, 140, 150, 60, 250, 60]), 0, 'a NaN in a quad')
+    assert.equal(call(0, quadOf(PATTERN_MARK), 0), 0, 'no regions')
+    assert.equal(m._INK_Redact_Unremovable(doc, 0, 0, 1), 0, 'a count with NULL quads')
+  })
 }
 
-// still counts a mesh shading under a mark after the apply clipped it
+// does not count carriers painted elsewhere on the page
 {
-  const source = onePagePdf('/Sh0 sh', { resources: '/Shading << /Sh0 6 0 R >>' }, [meshShading])
-  assert.deepEqual(pathsAround(source), [1, 1, 0], 'a mesh shading before the apply, after it, and beside the mark')
+  // A hatched swatch, a texture whose one large cell draws where the region
+  // is, and a mask group with a rectangle over the whole page, each on an
+  // object away from the region, which lies over plain text.
+  const source = onePagePdf(
+    `${textContent} q /Pattern cs /P0 scn 300 150 60 30 re f Q q /Pattern cs /P1 scn 260 20 120 40 re f Q q /GS0 gs 0 0 1 rg 20 150 60 30 re f Q`,
+    { resources: '/Pattern << /P0 6 0 R /P1 7 0 R >> /ExtGState << /GS0 << /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 8 0 R >> >> >>' },
+    [hatchCell, tiling([0, 0, 400, 200], 400, 200, '1 0 1 rg 60 100 m 120 105 l 110 120 l h f'), maskGroup('1 g 0 0 400 200 re f')],
+  )
+  assert.deepEqual(unremovable(source, [SECRET_RECT]), [[0, 0, 0, 0]])
+  const before = under(source, SECRET_RECT)
+  assert.ok(before.textChars > 0, `the text under the region: ${JSON.stringify(before)}`)
+  assert.deepEqual(zeros(before).slice(1), [0, 0, 0, 0, 0], `carriers elsewhere counted before the apply: ${JSON.stringify(before)}`)
+  const after = under(forceApply(source, SECRET_RECT), SECRET_RECT)
+  assert.deepEqual(zeros(after), [0, 0, 0, 0, 0, 0], `carriers elsewhere counted after the apply: ${JSON.stringify(after)}`)
+}
+
+// counts a pattern's cell for an object that paints in the region
+{
+  const band = '20 50 360 100 re f'
+  const words = tiling([0, 0, 400, 200], 400, 200, 'BT /F1 12 Tf 165 100 Td (CELLSECRET) Tj ET', '/PaintType 1', '/Font << /F1 5 0 R >>')
+  const text = under(patternPage(band, [words]))
+  assert.ok(text.patternContent > 0, `a cell's text: ${JSON.stringify(text)}`)
+  assert.equal(text.textChars, 0, 'pattern text counted as page text')
+  const hex = Array.from({ length: 48 }, (_, i) => ((i * 37) % 256).toString(16).padStart(2, '0')).join('')
+  const inline = under(patternPage(band, [tiling([0, 0, 400, 200], 400, 200, `q 60 0 0 40 160 80 cm BI /W 4 /H 4 /CS /RGB /BPC 8 /F /AHx ID ${hex}> EI Q`)]))
+  assert.ok(inline.patternContent > 0, `a cell's inline image: ${JSON.stringify(inline)}`)
+  const drawing = under(patternPage(band, [pageCell]))
+  assert.equal(drawing.paths, 2, `the bar and its cell's drawing: ${JSON.stringify(drawing)}`)
+  assert.equal(under(patternPage(band, [words]), BESIDE_MARK).patternContent, 0, 'a cell counted where its object does not paint')
+  // A fill that lay wholly under the mark is removed, pattern and all.
+  const whole = patternPage('160 70 80 60 re f', [pageCell])
+  assert.ok(under(whole).paths > 0)
+  assert.deepEqual(zeros(under(forceApply(whole))), [0, 0, 0, 0, 0, 0], 'a fill the apply removed')
+}
+
+// reads nothing under a cut fill: INK_Redact_Unremovable is the gate
+{
+  // What happens when an apply is forced over a carrier that reaches past
+  // the mark, against INK_Redact_Unremovable. The apply cuts the bar and
+  // leaves the pattern, whose cell still draws under the mark. On the saved
+  // page no object paints with the pattern in the region any more, and the
+  // cut bar cannot say that it once did, so INK_Inspect_Page reads nothing
+  // there. It verifies what an apply removed; it is not the gate for
+  // patterns, shading patterns and mask groups.
+  const band = '20 50 360 100 re f'
+  for (const [name, source] of [
+    ['a pattern fill', patternPage(band, [pageCell])],
+    ['a mesh shading pattern fill', onePagePdf(`q /Pattern cs /P0 scn ${band} Q`, { resources: '/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading 6 0 R >> >>' }, [meshShading])],
+    ['a masked fill', maskedPage(band, maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET'))],
+  ]) {
+    assert.ok(unremovable(source)[0].some((n) => n > 0), `${name}: not refused before the apply`)
+    const after = under(forceApply(source))
+    assert.deepEqual(zeros(after), [0, 0, 0, 0, 0, 0], `${name}: ${JSON.stringify(after)}`)
+  }
+}
+
+// counts a path filled with a shading pattern by the path's own rule
+{
+  const source = onePagePdf('q /Pattern cs /P0 scn 20 50 360 100 re f Q', { resources: `/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading << ${axial} >> >> >>` })
+  assert.equal(under(source).paths, 1, 'a shading pattern fill before the apply')
+  assert.equal(under(forceApply(source)).paths, 0, 'a shading pattern fill under the applied mark')
+  // A mesh used as a pattern counts once more, for the picture it can hold.
+  const mesh = onePagePdf('q /Pattern cs /P0 scn 20 50 360 100 re f Q', { resources: '/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading 6 0 R >> >>' }, [meshShading])
+  assert.equal(under(mesh).paths, 2, 'a mesh pattern fill before the apply')
+  assert.equal(under(mesh, BESIDE_MARK).paths, 0, 'a mesh pattern fill beside the region')
+}
+
+// still counts a mesh or function-based shading after the apply clipped it
+{
+  // |source| before and after the apply: the paths under the mark, and after
+  // the apply those beside it. The apply's own clip does not hide a shading
+  // painted with sh: all clips are ignored for these types.
+  const pathsAround = (source) => {
+    const applied = forceApply(source)
+    return [under(source).paths, under(applied).paths, under(applied, BESIDE_MARK).paths]
+  }
+  const mesh = onePagePdf('/Sh0 sh', { resources: '/Shading << /Sh0 6 0 R >>' }, [meshShading])
+  assert.deepEqual(pathsAround(mesh), [1, 1, 0], 'a mesh shading before the apply, after it, and beside the mark')
   // The same in candidate mode, under a black box drawn over the mesh.
   const boxed = onePagePdf('/Sh0 sh 0 g 150 60 100 80 re f', { resources: '/Shading << /Sh0 6 0 R >>' }, [meshShading])
   const box = withDoc(boxed, (doc) => inspectPage(doc, 0, [])).find((c) => c.kind === 'filled-box')
   assert.ok(box && box.paths > 0, `a mesh shading under a black box: ${JSON.stringify(box)}`)
-}
-
-// still counts a function-based shading under a mark after the apply
-{
   const colours = streamObject('/FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1]', '{ 2 copy add 2 div }', true)
   // Clipped to a box a little past the mark: PDFium takes an unclipped
   // shading to paint the whole page, and the apply removes one that lies
@@ -1538,62 +1561,51 @@ function pathsAround(source) {
     resources: '/Shading << /Sh0 << /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] /Matrix [100 0 0 80 150 60] /Function 6 0 R >> >>',
   }, [colours])
   assert.deepEqual(pathsAround(source), [1, 1, 0], 'a function-based shading before the apply, after it, and beside the mark')
+  assert.deepEqual(unremovable(source), [[0, 1, 0, 0]], 'a function-based shading under the mark')
 }
 
-// still counts a path filled with a mesh shading pattern after the apply cut it
-{
-  const source = onePagePdf('q /Pattern cs /P0 scn 20 50 360 100 re f Q', {
-    resources: '/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading 6 0 R >> >>',
-  }, [meshShading])
-  const [before, after, beside] = pathsAround(source)
-  assert.ok(before > 0 && after > 0, `a mesh pattern fill before the apply (${before}) and after it (${after})`)
-  assert.equal(beside, 0, 'a mesh pattern fill beside the mark')
-}
-
-// Soft mask groups. The apply cuts the object painted through a mask and
-// leaves the mask's group as it was.
-const maskedPage = (fill, group, extra = []) =>
-  onePagePdf(`q /GS0 gs 0 0 1 rg ${fill} Q BT /F1 12 Tf 20 20 Td (KEEP) Tj ET`, { resources: '/ExtGState << /GS0 << /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >>' }, [group, ...extra])
-const maskGroup = (content, resources = '/Font << /F1 5 0 R >>') =>
-  streamObject(`/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Group << /S /Transparency /CS /DeviceGray >> /Resources << ${resources} >>`, content)
-
-// counts what a soft mask group holds under a mark its object reaches past
+// counts what a soft mask group holds for an object that paints in the region
 {
   const band = '20 50 360 100 re f'
-  const text = underAppliedMark(maskedPage(band, maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET')))
-  assert.ok(text.textChars > 0, `a mask group's text under the applied mark: ${JSON.stringify(text)}`)
+  const text = under(maskedPage(band, maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET')))
+  assert.ok(text.textChars > 0, `a mask group's text: ${JSON.stringify(text)}`)
   const pixels = Buffer.alloc(16 * 16)
   for (let i = 0; i < 256; i++) pixels[i] = i
-  const image = underAppliedMark(
+  const image = under(
     maskedPage(band, maskGroup('q 80 0 0 60 160 70 cm /Im0 Do Q', '/XObject << /Im0 7 0 R >>'), [
       streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 8', pixels),
     ]),
   )
-  assert.ok(image.imagesNotBlank > 0, `a mask group's image under the applied mark: ${JSON.stringify(image)}`)
-  const drawing = underAppliedMark(maskedPage(band, maskGroup('1 g 170 80 m 230 85 l 220 120 l h f')))
-  assert.ok(drawing.paths > 0, `a mask group's drawing under the applied mark: ${JSON.stringify(drawing)}`)
-  const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, r.annotationText, r.annotationImages]
-  const outside = underAppliedMark(maskedPage(band, maskGroup('1 g BT /F1 12 Tf 300 100 Td (ELSEWHERE) Tj ET 300 60 40 20 re f')))
-  assert.deepEqual(zeros(outside), [0, 0, 0, 0, 0, 0], `a mask group that holds nothing under the mark: ${JSON.stringify(outside)}`)
-  const removed = underAppliedMark(maskedPage('160 70 80 60 re f', maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET')))
+  assert.ok(image.imagesNotBlank > 0, `a mask group's image: ${JSON.stringify(image)}`)
+  const drawing = under(maskedPage(band, maskGroup('1 g 170 80 m 230 85 l 220 120 l h f')))
+  assert.equal(drawing.paths, 2, `the bar and its mask group's drawing: ${JSON.stringify(drawing)}`)
+  const outside = under(maskedPage(band, maskGroup('1 g BT /F1 12 Tf 300 100 Td (ELSEWHERE) Tj ET 300 60 40 20 re f')))
+  assert.deepEqual(zeros(outside), [0, 0, 1, 0, 0, 0], `a mask group that holds nothing under the mark: ${JSON.stringify(outside)}`)
+  const removed = under(forceApply(maskedPage('160 70 80 60 re f', maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET'))))
   assert.deepEqual(zeros(removed), [0, 0, 0, 0, 0, 0], `a masked object the apply removed: ${JSON.stringify(removed)}`)
   // A mask set inside a form lies where the form's matrix puts it, and one
   // set in an annotation's appearance counts as annotation text.
   const masked = '/Resources << /ExtGState << /GS0 << /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >> >>'
-  const group = maskGroup('1 g BT /F1 12 Tf 65 100 Td (MASKSECRET) Tj ET')
   const inForm = onePagePdf('/Fm0 Do', { resources: '/XObject << /Fm0 7 0 R >>' }, [
-    group,
+    maskGroup('1 g BT /F1 12 Tf 65 100 Td (MASKSECRET) Tj ET'),
     streamObject(`/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Matrix [1 0 0 1 100 0] ${masked}`, '/GS0 gs 0 0 1 rg 0 50 260 100 re f'),
   ])
-  const formed = underAppliedMark(inForm)
-  assert.ok(formed.textChars > 0, `the group of a mask set inside a form: ${JSON.stringify(formed)}`)
+  assert.ok(under(inForm).textChars > 0, 'the group of a mask set inside a form')
+  assert.deepEqual(unremovable(inForm), [[0, 0, 1, 0]], 'the group of a mask set inside a form')
   const inAppearance = onePagePdf('', { page: '/Annots [7 0 R]' }, [
     maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET'),
     '<< /Type /Annot /Subtype /Square /Rect [20 50 380 150] /AP << /N 8 0 R >> >>',
     streamObject(`/Type /XObject /Subtype /Form /BBox [20 50 380 150] ${masked}`, '/GS0 gs 0 0 1 rg 20 50 360 100 re f'),
   ])
-  const [appearance] = withDoc(inAppearance, (doc) => inspectPage(doc, 0, [PATTERN_MARK]))
-  assert.ok(appearance.annotationText > 0, `the group of a mask set in an appearance: ${JSON.stringify(appearance)}`)
+  assert.ok(under(inAppearance).annotationText > 0, 'the group of a mask set in an appearance')
+  assert.deepEqual(unremovable(inAppearance), [[0, 0, 1, 0]], 'the group of a mask set in an appearance')
+}
+
+// counts a Type 3 glyph that draws out of its box into the region
+{
+  const reach = under(type3Page('100 80 Td (a) Tj'))
+  assert.ok(reach.textChars > 0, `a glyph drawn into the region from outside its box: ${JSON.stringify(reach)}`)
+  assert.equal(under(type3Page('300 80 Td (b) Tj')).textChars, 0, 'an ordinary glyph beside the region')
 }
 
 // Other content defined once and painted through a reference: what an apply
@@ -1867,38 +1879,27 @@ const maskGroup = (content, resources = '/Font << /F1 5 0 R >>') =>
 
 // inspects text inside a tiling pattern
 {
-  // A cell wider than the part of the fill beside the region: no whole tile
-  // of it shows elsewhere.
-  const cell = (bbox) =>
-    streamObject(
-      `/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 ${bbox}] /XStep ${bbox.split(' ')[0]} /YStep ${bbox.split(' ')[1]} /Resources << /Font << /F1 5 0 R >> >>`,
-      'BT /F1 10 Tf 5 5 Td (TILE) Tj ET',
-    )
-  const page = (bbox) => onePagePdf('/Pattern cs /P0 scn 50 50 200 100 re f', { resources: '/Pattern << /P0 6 0 R >>' }, [cell(bbox)])
+  const source = onePagePdf(
+    '/Pattern cs /P0 scn 50 50 200 100 re f',
+    { resources: '/Pattern << /P0 6 0 R >>' },
+    [
+      streamObject(
+        '/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 50 20] /XStep 50 /YStep 20 /Resources << /Font << /F1 5 0 R >> >>',
+        'BT /F1 10 Tf 0 5 Td (TILE) Tj ET',
+      ),
+    ],
+  )
   const region = [60, 60, 100, 100]
-  const source = page('150 80')
-  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [[140, 70, 200, 100]]))
+  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [region]))
   assert.ok(before.patternContent > 0, `pattern text under the region: ${JSON.stringify(before)}`)
   assert.equal(before.textChars, 0, 'pattern text counted as page text')
-  const apply = (bytes, rect) =>
-    editPage(bytes, (doc, page) => {
-      const mark = addMark(page, rect)
-      assert.equal(applyPage(doc, page, [mark], false).result, 1)
-      m._FPDFPage_CloseAnnot(mark)
-    })
-  // The apply does not enter patterns; the check still sees the text.
-  const [after] = withDoc(apply(source, [140, 70, 200, 100]), (doc) => inspectPage(doc, 0, [[140, 70, 200, 100]]))
-  assert.ok(after.patternContent > 0, 'the check lost the pattern text after the apply')
-  // A small cell tiled many times: the fill shows whole tiles of the same
-  // text beside the mark, so what lies under it is no secret.
-  const tiled = page('50 20')
-  const [shown] = withDoc(apply(tiled, region), (doc) => inspectPage(doc, 0, [region]))
-  assert.equal(shown.patternContent, 0, `text the fill shows whole elsewhere: ${JSON.stringify(shown)}`)
+  // The fill does not paint beside itself, so its cell does not count there.
+  const [away] = withDoc(source, (doc) => inspectPage(doc, 0, [[300, 60, 340, 100]]))
+  assert.equal(away.patternContent, 0, `pattern text where the fill does not paint: ${JSON.stringify(away)}`)
 }
 
 // reads tiling patterns inside patterns and inside annotation appearances
 {
-  // Cells 150 pt wide, so that neither fill shows a whole tile beside its region.
   const tile = '/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 150 80] /XStep 150 /YStep 80'
   const source = onePagePdf(
     '/Pattern cs /P1 scn 50 50 200 100 re f',
