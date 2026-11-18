@@ -56,8 +56,10 @@
 #include "core/fpdfapi/parser/cpdf_parser.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
 #include "core/fpdfapi/parser/cpdf_stream_acc.h"
+#include "core/fpdfapi/parser/cpdf_syntax_parser.h"
 #include "core/fpdftext/cpdf_textpage.h"
 #include "core/fpdfdoc/cpdf_annot.h"
+#include "core/fxcrt/cfx_read_only_span_stream.h"
 #include "core/fxcrt/compiler_specific.h"
 #include "core/fxcrt/data_vector.h"
 #include "core/fxcrt/fx_coordinates.h"
@@ -1761,26 +1763,70 @@ std::string PageReport(const std::vector<Entry>& entries) {
   return out;
 }
 
-// One more than the %%EOF markers a further startxref follows. A linearized
-// file (its first object holds /Linearized) ends its first-page section with
-// a %%EOF of its own, which is not an earlier version: it is not counted.
+// The /L of a file's first object when that object is a linearization
+// dictionary (its key is exactly /Linearized), read as PDFium's parser reads
+// it: the object after the header. Nullopt otherwise.
+std::optional<size_t> LinearizedLength(pdfium::span<const uint8_t> bytes) {
+  // The offset PDFium's own linearization check reads from.
+  constexpr FX_FILESIZE kFirstObjectOffset = 9;
+  if (bytes.size() <= static_cast<size_t>(kFirstObjectOffset)) {
+    return std::nullopt;
+  }
+  CPDF_SyntaxParser parser(pdfium::MakeRetain<CFX_ReadOnlySpanStream>(bytes));
+  parser.SetPos(kFirstObjectOffset);
+  RetainPtr<const CPDF_Dictionary> dict = ToDictionary(
+      parser.GetIndirectObject(nullptr, CPDF_SyntaxParser::ParseType::kLoose));
+  if (!dict || !dict->KeyExist("Linearized")) {
+    return std::nullopt;
+  }
+  RetainPtr<const CPDF_Number> length = dict->GetNumberFor("L");
+  if (!length || !length->IsInteger() || length->GetInteger() <= 0 ||
+      static_cast<size_t>(length->GetInteger()) > bytes.size()) {
+    return std::nullopt;
+  }
+  return static_cast<size_t>(length->GetInteger());
+}
+
+// One more than the %%EOF markers a further startxref follows. A file that
+// is really linearized ends its first-page section with a %%EOF of its own,
+// which is not an earlier version and is not counted. Really linearized: its
+// first object is a linearization dictionary whose /L is the offset just
+// past a %%EOF (and its line end), the one that ends the linearized part; the
+// first-page %%EOF is one before that. Anything else counts.
 unsigned Revisions(pdfium::span<const uint8_t> bytes) {
   const std::string_view text(reinterpret_cast<const char*>(bytes.data()),
                               bytes.size());
-  const size_t first_object_end = text.find("endobj");
-  const size_t linearized = text.find("/Linearized");
-  bool skip_first = linearized != std::string_view::npos &&
-                    first_object_end != std::string_view::npos &&
-                    linearized < first_object_end;
+  std::vector<size_t> ends;  // Offsets of each %%EOF.
+  for (size_t at = text.find("%%EOF"); at != std::string_view::npos;
+       at = text.find("%%EOF", at + 5)) {
+    ends.push_back(at);
+  }
+  // The %%EOF that ends the linearized part, when the file is linearized.
+  std::optional<size_t> part_end;
+  if (std::optional<size_t> length = LinearizedLength(bytes)) {
+    for (size_t i = 0; i < ends.size(); ++i) {
+      size_t past = ends[i] + 5;
+      for (int k = 0; k < 2 && past < text.size() &&
+                      (text[past] == '\r' || text[past] == '\n');
+           ++k) {
+        if (past == *length) {
+          break;
+        }
+        ++past;
+      }
+      if (past == *length) {
+        part_end = i;
+        break;
+      }
+    }
+  }
   unsigned revisions = 1;
-  size_t at = 0;
-  while ((at = text.find("%%EOF", at)) != std::string_view::npos) {
-    at += 5;
-    if (text.find("startxref", at) == std::string_view::npos) {
+  for (size_t i = 0; i < ends.size(); ++i) {
+    if (text.find("startxref", ends[i] + 5) == std::string_view::npos) {
       continue;
     }
-    if (skip_first) {
-      skip_first = false;
+    // The first-page section's %%EOF: the first, before the part's end.
+    if (part_end.has_value() && i == 0 && *part_end > 0) {
       continue;
     }
     ++revisions;

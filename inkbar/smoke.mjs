@@ -1469,6 +1469,35 @@ const sanitizedSaved = withDoc(sanitizeSource, (doc) => {
   withDoc(appended, (doc) => {
     assert.equal(inspectFile(doc, appended).revisions, 2, 'a linearized file with an appended revision')
   })
+  // Not linearized, whatever its first object says: a /Linearized key whose
+  // /L is the file's own length, and a /LinearizedX key. Each gets one
+  // appended update, so each is two revisions.
+  const incremental = (bytes) =>
+    withDoc(bytes, (doc) => {
+      const page = m._FPDF_LoadPage(doc, 0)
+      m._FPDFPage_CloseAnnot(m._FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE))
+      m._FPDF_ClosePage(page)
+      const writer = m._INK_Save(doc, FPDF_INCREMENTAL)
+      const data = m._INK_WriterData(writer)
+      const out = Buffer.from(m.HEAPU8.slice(data, data + m._INK_WriterSize(writer)))
+      m._INK_WriterFree(writer)
+      return out
+    })
+  const spoofed = (key) => {
+    const body = (length) =>
+      buildPdf([
+        `<< /Type /Catalog /Pages 2 0 R ${key} 1 /L ${String(length).padStart(10, '0')} /H [0 0] /O 3 /E 1 /N 1 /T 1 >>`,
+        '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] >>',
+      ])
+    return body(body(0).length)
+  }
+  for (const key of ['/Linearized', '/LinearizedX']) {
+    const updated = incremental(spoofed(key))
+    withDoc(updated, (doc) => {
+      assert.equal(inspectFile(doc, updated).revisions, 2, `a first object with ${key} and one update`)
+    })
+  }
   withDoc(second, (doc) => {
     assert.deepEqual(inspectFile(doc, second), {
       revisions: 2,
