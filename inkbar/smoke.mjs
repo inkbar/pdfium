@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 83)
+assert.equal(names.length, 84)
 
 const m = await createModule()
 for (const name of names) {
@@ -875,6 +875,36 @@ function nestedFormsPdf(levels) {
     assert.ok(beta.textChars > 0, 'the mark without /INKB_Gloss was applied')
     const left = inspectPage(doc, 0, []).filter((c) => c.kind === 'redact-annotation')
     assert.equal(left.length, 1, 'the unapplied mark is not a candidate')
+  })
+}
+
+// lists the quads of the page's own marks
+{
+  withDoc(onePagePdf(textContent), (doc) => {
+    const page = m._FPDF_LoadPage(doc, 0)
+    const twoQuads = addMark(page, [45, 95, 100, 125])
+    const second = m._malloc(32)
+    m.HEAPF32.set(quadOf([110, 95, 230, 125]), second / 4)
+    assert.equal(m._FPDFAnnot_AppendAttachmentPoints(twoQuads, second), 1)
+    m._free(second)
+    setData(twoQuads, '{"v":1}')
+    const foreign = addMark(page, [245, 95, 360, 125])
+    const rectOnly = m._FPDFPage_CreateAnnot(page, FPDF_ANNOT_REDACT)
+    const rect = m._malloc(16)
+    m.HEAPF32.set([10, 40, 30, 20], rect / 4)
+    assert.equal(m._FPDFAnnot_SetRect(rectOnly, rect), 1)
+    m._free(rect)
+    setData(rectOnly, '{"v":1}')
+    assert.equal(m._INK_Redact_OwnLockedQuads(doc, page, 0, 0), 3, 'the count-only call')
+    const out = m._malloc(3 * 32)
+    assert.equal(m._INK_Redact_OwnLockedQuads(doc, page, out, 3), 3)
+    const quads = [...m.HEAPF32.slice(out / 4, out / 4 + 24)]
+    assert.deepEqual(quads, [...quadOf([45, 95, 100, 125]), ...quadOf([110, 95, 230, 125]), ...quadOf([10, 20, 30, 40])])
+    assert.equal(m._INK_Redact_OwnLockedQuads(doc, page, out, 1), 3, 'a short buffer still gets the total')
+    assert.deepEqual([...m.HEAPF32.slice(out / 4, out / 4 + 8)], quadOf([45, 95, 100, 125]))
+    m._free(out)
+    ;[twoQuads, foreign, rectOnly].forEach((a) => m._FPDFPage_CloseAnnot(a))
+    m._FPDF_ClosePage(page)
   })
 }
 

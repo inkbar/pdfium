@@ -43,6 +43,19 @@ int INK_Redact_ApplyPage(FPDF_DOCUMENT doc,
                          unsigned* out_removed,
                          unsigned* out_left);
 
+// Writes the quads of the REDACT annotations of |page| that carry
+// /INKB_Gloss, in /Annots order: 8 floats per quad in the corner order
+// INK_Inspect_Page takes, a mark's /QuadPoints when it has them, else one
+// quad from its /Rect (quads that are not finite or empty fall back to the
+// /Rect, as the apply does). Writes at most |capacity| quads to |out| (which
+// may be NULL when |capacity| is 0) and returns the total number of quads, so
+// a caller can size a buffer and call again. Returns -1 on failure. Call it
+// before INK_Redact_ApplyPage, which removes the marks.
+int INK_Redact_OwnLockedQuads(FPDF_DOCUMENT doc,
+                              FPDF_PAGE page,
+                              float* out,
+                              int capacity);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

@@ -6,11 +6,15 @@
 
 #include "inkbar/redact.h"
 
+#include <limits.h>
 #include <stdint.h>
 
+#include <array>
 #include <memory>
+#include <optional>
 #include <vector>
 
+#include "core/fpdfapi/edit/cpdf_text_redactor.h"
 #include "core/fpdfapi/page/cpdf_annotcontext.h"
 #include "core/fpdfapi/page/cpdf_page.h"
 #include "core/fpdfapi/parser/cpdf_array.h"
@@ -19,6 +23,7 @@
 #include "core/fpdfapi/parser/cpdf_document.h"
 #include "core/fpdfapi/parser/cpdf_reference.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
+#include "core/fpdfdoc/cpdf_annot.h"
 #include "core/fxcrt/compiler_specific.h"
 #include "core/fxcrt/span.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
@@ -60,6 +65,42 @@ class Handles {
  private:
   std::vector<FPDF_ANNOTATION> owned_;
 };
+
+// The quads of a mark as the apply reads them: its /QuadPoints, each quad
+// valid, else one quad from its /Rect. In /QuadPoints corner order.
+std::vector<std::array<float, 8>> MarkQuads(const CPDF_Dictionary* dict) {
+  std::vector<std::array<float, 8>> quads;
+  RetainPtr<const CPDF_Array> points = dict->GetArrayFor("QuadPoints");
+  if (points && points->size() >= 8) {
+    const size_t count = CPDF_Annot::QuadPointCount(points.Get());
+    for (size_t i = 0; i < count; ++i) {
+      std::array<float, 8> quad;
+      std::array<CFX_PointF, 4> corners;
+      for (size_t k = 0; k < 8; ++k) {
+        quad[k] = points->GetFloatAt(i * 8 + k);
+      }
+      for (size_t c = 0; c < 4; ++c) {
+        corners[c] = CFX_PointF(quad[c * 2], quad[c * 2 + 1]);
+      }
+      std::optional<RedactRegion> region = RedactRegionFromQuadCorners(corners);
+      if (!region.has_value() || region->bbox.IsEmpty()) {
+        quads.clear();
+        break;
+      }
+      quads.push_back(quad);
+    }
+    if (!quads.empty()) {
+      return quads;
+    }
+  }
+  CFX_FloatRect rect = dict->GetRectFor("Rect");
+  rect.Normalize();
+  if (!rect.IsEmpty()) {
+    quads.push_back({rect.left, rect.top, rect.right, rect.top, rect.left,
+                     rect.bottom, rect.right, rect.bottom});
+  }
+  return quads;
+}
 
 }  // namespace
 
@@ -167,6 +208,40 @@ int INK_Redact_ApplyPage(FPDF_DOCUMENT doc,
     *out_left = CountRedacts(pdf_page);
   }
   return 1;
+}
+
+int INK_Redact_OwnLockedQuads(FPDF_DOCUMENT doc,
+                              FPDF_PAGE page,
+                              float* out,
+                              int capacity) {
+  ScopedFPDFDocumentView view(doc);
+  CPDF_Page* pdf_page = CPDFPageFromFPDFPage(page);
+  if (!view.Get() || !pdf_page || pdf_page->GetDocument() != view.Get() ||
+      capacity < 0 || (capacity > 0 && !out)) {
+    return -1;
+  }
+  // SAFETY: the caller passes room for |capacity| quads of 8 floats at |out|.
+  pdfium::span<float> buffer =
+      capacity ? UNSAFE_BUFFERS(
+                     pdfium::span(out, static_cast<size_t>(capacity) * 8))
+               : pdfium::span<float>();
+  RetainPtr<const CPDF_Array> annots = pdf_page->GetAnnotsArray();
+  size_t total = 0;
+  for (size_t i = 0; annots && i < annots->size(); ++i) {
+    RetainPtr<const CPDF_Dictionary> dict = annots->GetDictAt(i);
+    if (!IsRedact(dict.Get()) || !dict->KeyExist(kDataKey)) {
+      continue;
+    }
+    for (const std::array<float, 8>& quad : MarkQuads(dict.Get())) {
+      if (total < static_cast<size_t>(capacity)) {
+        for (size_t k = 0; k < 8; ++k) {
+          buffer[total * 8 + k] = quad[k];
+        }
+      }
+      ++total;
+    }
+  }
+  return total > INT_MAX ? -1 : static_cast<int>(total);
 }
 
 }  // extern "C"
