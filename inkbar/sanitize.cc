@@ -11,7 +11,11 @@
 
 #include <stdint.h>
 
+#include <ctype.h>
+
+#include <memory>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "core/fpdfapi/parser/cpdf_array.h"
@@ -20,6 +24,7 @@
 #include "core/fpdfapi/parser/cpdf_object.h"
 #include "core/fpdfapi/parser/cpdf_parser.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
+#include "core/fpdfdoc/cpdf_nametree.h"
 #include "core/fxcrt/bytestring.h"
 #include "core/fxcrt/retain_ptr.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
@@ -48,7 +53,8 @@ class Sanitizer {
 
   unsigned found() const { return found_; }
   unsigned attachments() const {
-    return static_cast<unsigned>(embedded_.size()) + unembedded_;
+    return static_cast<unsigned>(embedded_.size() + unembedded_.size()) +
+           unnamed_;
   }
 
  private:
@@ -71,9 +77,23 @@ class Sanitizer {
       return;
     }
     if (RetainPtr<CPDF_Dictionary> names = root->GetMutableDictFor("Names")) {
-      // Its files are counted where their file specifications are visited.
+      // Embedded files are counted where their file specifications are
+      // visited; an entry that names a file without embedding it counts
+      // here, once per file specification, as an annotation's does.
       if (names->KeyExist("EmbeddedFiles")) {
         found_ |= INK_SANITIZE_ATTACHMENTS;
+        if (!remove_) {
+          std::unique_ptr<CPDF_NameTree> tree =
+              CPDF_NameTree::CreateForReading(doc_, "EmbeddedFiles");
+          for (size_t i = 0; tree && i < tree->GetCount(); ++i) {
+            WideString name;
+            RetainPtr<const CPDF_Dictionary> spec =
+                ToDictionary(tree->LookupValueAndName(i, &name));
+            if (spec && EmbeddedStreams(spec.Get()).empty()) {
+              unembedded_.insert(spec.Get());
+            }
+          }
+        }
         Drop(names.Get(), "EmbeddedFiles");
       }
       if (names->KeyExist("JavaScript")) {
@@ -93,7 +113,11 @@ class Sanitizer {
     // number and which GetInfo() does not read.
     const CPDF_Parser* parser = doc_->GetParser();
     const CPDF_Dictionary* trailer = parser ? parser->GetTrailer() : nullptr;
-    if (doc_->GetInfo() || (trailer && trailer->KeyExist("Info"))) {
+    // After DropInfo() GetInfo() is an empty direct dictionary, which is
+    // nothing to remove.
+    RetainPtr<const CPDF_Dictionary> info = doc_->GetInfo();
+    const bool has_info = info && (info->GetObjNum() || info->size() > 0);
+    if (has_info || (trailer && trailer->KeyExist("Info"))) {
       found_ |= INK_SANITIZE_METADATA;
       if (remove_) {
         doc_->DropInfo();
@@ -181,9 +205,14 @@ class Sanitizer {
       }
       found_ |= INK_SANITIZE_ATTACHMENTS;
       RetainPtr<const CPDF_Dictionary> spec = annot->GetDictFor("FS");
-      if (!remove_ && (!spec || EmbeddedStreams(spec.Get()).empty())) {
-        // A file named but not embedded is still an attachment.
-        ++unembedded_;
+      if (!remove_) {
+        // A file named but not embedded is still an attachment, counted
+        // once per file specification; one without any, once.
+        if (!spec) {
+          ++unnamed_;
+        } else if (EmbeddedStreams(spec.Get()).empty()) {
+          unembedded_.insert(spec.Get());
+        }
       }
       if (remove_) {
         // Also off the annotation itself, in case something else still
@@ -264,13 +293,43 @@ class Sanitizer {
     return streams;
   }
 
-  // A URI that runs script when followed: javascript:, in any case, after
-  // leading white space.
+  // A URI that runs script when followed, read as a browser reads it: a
+  // UTF-16BE string (with its byte order mark) decoded, leading control
+  // characters and spaces stripped, tabs and line breaks dropped wherever
+  // they are, and the scheme compared without regard to case.
   static bool IsScriptUri(const ByteString& uri) {
-    ByteString trimmed = uri;
-    trimmed.TrimWhitespaceFront();
-    trimmed.MakeLower();
-    return trimmed.First(11) == "javascript:";
+    pdfium::span<const uint8_t> bytes = uri.unsigned_span();
+    std::vector<uint32_t> units;
+    if (bytes.size() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF) {
+      for (size_t i = 2; i + 1 < bytes.size(); i += 2) {
+        units.push_back((bytes[i] << 8) | bytes[i + 1]);
+      }
+    } else {
+      size_t from = 0;
+      if (bytes.size() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB &&
+          bytes[2] == 0xBF) {
+        from = 3;
+      }
+      for (size_t i = from; i < bytes.size(); ++i) {
+        units.push_back(bytes[i]);
+      }
+    }
+    std::string scheme;
+    bool leading = true;
+    for (uint32_t unit : units) {
+      if (leading && unit <= 0x20) {
+        continue;
+      }
+      leading = false;
+      if (unit == '\t' || unit == '\n' || unit == '\r') {
+        continue;
+      }
+      scheme += unit < 0x80 ? static_cast<char>(tolower(unit)) : '\x80';
+      if (scheme.size() == 11) {
+        break;
+      }
+    }
+    return scheme == "javascript:";
   }
 
   CPDF_Document* const doc_;
@@ -279,7 +338,10 @@ class Sanitizer {
   // The embedded files found, each once. The document holds them for the
   // whole run, so their addresses name them.
   std::set<const CPDF_Object*> embedded_;
-  unsigned unembedded_ = 0;
+  // File specifications that name a file without embedding it.
+  std::set<const CPDF_Dictionary*> unembedded_;
+  // File attachment annotations with no file specification.
+  unsigned unnamed_ = 0;
 };
 
 }  // namespace

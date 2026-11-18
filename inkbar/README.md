@@ -77,7 +77,7 @@ With no regions, it lists candidates: every redact annotation; filled rectangles
 
 `INK_Inspect_File` counts revisions as one more than the `%%EOF` markers a further `startxref` follows. In a linearized file (its first object holds `/Linearized`) the `%%EOF` that ends the first-page section is not counted, so a linearized file is one revision and one with an appended update is two. `info` is true for a non-empty `/Info`, whether the trailer names an object or holds a direct dictionary.
 
-`INK_Sanitize` also removes the `/XFA` of an interactive form and `/URI` actions whose target starts with `javascript:` in any case. It removes the `/EF` of every file specification, those of GoToE, Launch, RichMedia, Screen and Sound included. Each embedded file counts as one attachment, however many places refer to it.
+`INK_Sanitize` also removes the `/XFA` of an interactive form and `/URI` actions whose target starts with `javascript:` in any case. It removes the `/EF` of every file specification, those of GoToE, Launch, RichMedia, Screen and Sound included. Each embedded file counts as one attachment, however many places refer to it. A file specification that names a file without embedding it counts as one attachment too, whether an `/EmbeddedFiles` entry or a file attachment annotation (or both) refers to it, and a file attachment annotation with no file specification counts as one. A `/URI` target is read as a browser reads it: a UTF-16BE string is decoded, leading control characters and spaces are stripped, and tabs and line breaks are dropped wherever they are. A second `INK_Sanitize` on the same document finds nothing.
 
 ## Changes outside `inkbar/`
 
@@ -85,7 +85,7 @@ Every change this fork's Inkbar commits make outside `inkbar/`. Update this list
 
 - `core/fpdfdoc/cpdf_interactiveform.cpp`, in `InitDict`: a created `/AcroForm` is given an empty `/Fields` array. ISO 32000 requires the entry, and without it Poppler reports "Can't get Fields array". The smoke check guards it.
 - `core/fpdfapi/edit/cpdf_image_redactor.{h,cpp}`: `RedactionHoleSamples()`, a public wrapper over the file's own `HoleSamples()` and `ColorSpaceOf()`, so the redaction check compares an image with the value the redaction fills it with. The smoke check guards it.
-- `core/fpdfapi/parser/cpdf_document.{h,cpp}`: `CPDF_Document::DropInfo()`, which `INK_Sanitize` calls so the next save writes no `/Info`. It caches a direct, empty `/Info` dictionary and removes `/Info` from the parser's trailer, so the save trailer names none and copies none, whether the file named an object or held a direct dictionary. The smoke check guards both cases.
+- `core/fpdfapi/parser/cpdf_document.{h,cpp}`: `CPDF_Document::DropInfo()`, which `INK_Sanitize` calls so the next save writes no `/Info`. It caches a direct, empty `/Info` dictionary and removes `/Info` from the parser's trailer, so the save trailer names none and copies none, whether the file named an object or held a direct dictionary. A layer document shares its base's parser, so on a layer it changes only the cached `/Info` and leaves the base's trailer alone. The smoke check guards both cases.
 
 ## Taking upstream
 

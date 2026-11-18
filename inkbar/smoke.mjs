@@ -1395,6 +1395,41 @@ const sanitizedSaved = withDoc(sanitizeSource, (doc) => {
   })
 }
 
+// matches javascript: links as a browser does, counts unembedded files alike, and sanitises once
+{
+  const source = buildPdf(
+    [
+      '<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(ext.txt) 7 0 R (other.txt) 12 0 R] >> >> >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [8 0 R 9 0 R 10 0 R 11 0 R] >>',
+      streamObject('', textContent),
+      '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+      '<< >>',
+      '<< /Type /Filespec /F (ext.txt) >>',
+      '<< /Type /Annot /Subtype /FileAttachment /Rect [0 0 20 20] /FS 7 0 R >>',
+      '<< /Type /Annot /Subtype /Link /Rect [20 0 40 20] /A << /S /URI /URI (\\001 Jav\\tascript:x) >> >>',
+      '<< /Type /Annot /Subtype /Link /Rect [40 0 60 20] /A << /S /URI /URI <FEFF006A006100760061007300630072006900700074003A0078> >> >>',
+      '<< /Type /Annot /Subtype /Link /Rect [60 0 80 20] /A << /S /URI /URI (java\\nscript:x) >> >>',
+      '<< /Type /Filespec /F (other.txt) >>',
+      '<< /Title (ONCE-INFO) >>',
+    ],
+    '/Info 13 0 R',
+  )
+  const sanitized = withDoc(source, (doc) => {
+    const facts = inspectFile(doc, source)
+    assert.deepEqual([facts.info, facts.attachments, facts.scripts], [true, 2, true], `file facts: ${JSON.stringify(facts)}`)
+    const out = m._malloc(8)
+    assert.equal(m._INK_Sanitize(doc, out, out + 4), 1)
+    assert.deepEqual([m.HEAPU32[out / 4], m.HEAPU32[out / 4 + 1]], [1 | 2 | 4, 2], 'flags and attachments')
+    assert.equal(m._INK_Sanitize(doc, out, out + 4), 1)
+    assert.deepEqual([m.HEAPU32[out / 4], m.HEAPU32[out / 4 + 1]], [0, 0], 'a second sanitise finds nothing')
+    m._free(out)
+    return save(doc)
+  })
+  const inflated = inflateStreams(sanitized)
+  assert.ok(!inflated.includes('/URI') && !inflated.includes('ONCE-INFO'), 'script links or /Info left')
+}
+
 // reports file facts
 {
   const FPDF_INCREMENTAL = 1

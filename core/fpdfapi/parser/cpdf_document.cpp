@@ -909,8 +909,14 @@ RetainPtr<CPDF_Dictionary> CPDF_Document::GetOrCreateInfo() {
 // names no /Info of its own (CPDF_SaveTrailer). The parser's trailer loses
 // its /Info too, so the save copies none, whether it was a reference or a
 // direct dictionary.
+//
+// A layer document shares its base document's parser, so a layer leaves the
+// parser's trailer alone: only the cached /Info changes there.
 void CPDF_Document::DropInfo() {
   SetCachedInfoDict(pdfium::MakeRetain<CPDF_Dictionary>());
+  if (IsLayerDocument()) {
+    return;
+  }
   if (CPDF_Parser* parser = GetParser()) {
     if (const CPDF_Dictionary* trailer = parser->GetTrailer()) {
       // The parser holds its trailer as a mutable dictionary and hands it out
