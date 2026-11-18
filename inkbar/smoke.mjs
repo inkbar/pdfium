@@ -995,6 +995,21 @@ function nestedFormsPdf(levels) {
   })
 }
 
+// counts a shading whose clip does not exclude the region
+{
+  const shading = '/Shading << /Sh0 << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [200 50 300 50] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>'
+  // Two clips: the shading's box, then the box with the region cut out of it.
+  // Under the even-odd rule (W*) the cut excludes the region; under the
+  // nonzero rule (W) the two same-way rectangles do not, and the shading
+  // still paints there.
+  const clipped = (rule) => onePagePdf(`q 200 50 100 100 re W n q 200 50 100 100 re 230 80 40 40 re ${rule} n /Sh0 sh Q Q`, { resources: shading })
+  const region = [235, 85, 265, 115]
+  const [excluded] = withDoc(clipped('W*'), (doc) => inspectPage(doc, 0, [region]))
+  assert.equal(excluded.paths, 0, `a shading clipped away from the region: ${JSON.stringify(excluded)}`)
+  const [wrong] = withDoc(clipped('W'), (doc) => inspectPage(doc, 0, [region]))
+  assert.equal(wrong.paths, 1, `a shading whose clip keeps the region: ${JSON.stringify(wrong)}`)
+}
+
 // a region too small to shrink still counts the path under it
 {
   const source = onePagePdf('0 0 1 rg 50 50 100 100 re f')

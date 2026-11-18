@@ -577,6 +577,123 @@ bool ShadingCrosses(const CPDF_PathRedactor& redactor,
   return true;
 }
 
+// The subpaths of |path| as closed polygons, its curves cut into 16 lines
+// each, in the path's own space.
+std::vector<std::vector<CFX_PointF>> Polygons(const CPDF_Path& path) {
+  std::vector<std::vector<CFX_PointF>> polygons;
+  const std::vector<CFX_Path::Point>& points = path.GetPoints();
+  for (size_t i = 0; i < points.size(); ++i) {
+    const CFX_Path::Point& point = points[i];
+    if (point.type_ == CFX_Path::Point::Type::kMove || polygons.empty()) {
+      polygons.emplace_back();
+      polygons.back().push_back(point.point_);
+      continue;
+    }
+    std::vector<CFX_PointF>& polygon = polygons.back();
+    if (point.type_ == CFX_Path::Point::Type::kLine) {
+      polygon.push_back(point.point_);
+      continue;
+    }
+    if (i + 2 >= points.size()) {
+      break;
+    }
+    const CFX_PointF p0 = polygon.back();
+    const CFX_PointF& c1 = point.point_;
+    const CFX_PointF& c2 = points[i + 1].point_;
+    const CFX_PointF& end = points[i + 2].point_;
+    for (int k = 1; k <= 16; ++k) {
+      const float t = k / 16.0f;
+      const float u = 1 - t;
+      polygon.emplace_back(u * u * u * p0.x + 3 * u * u * t * c1.x +
+                               3 * u * t * t * c2.x + t * t * t * end.x,
+                           u * u * u * p0.y + 3 * u * u * t * c1.y +
+                               3 * u * t * t * c2.y + t * t * t * end.y);
+    }
+    i += 2;
+  }
+  return polygons;
+}
+
+// Whether a fill of |polygons| under |fill| covers |p|: the nonzero winding
+// rule, or the even-odd rule.
+bool Covers(const std::vector<std::vector<CFX_PointF>>& polygons,
+            CFX_FillRenderOptions::FillType fill,
+            const CFX_PointF& p) {
+  int winding = 0;
+  int crossings = 0;
+  for (const std::vector<CFX_PointF>& polygon : polygons) {
+    for (size_t i = 0; i < polygon.size(); ++i) {
+      const CFX_PointF& a = polygon[i];
+      const CFX_PointF& b = polygon[(i + 1) % polygon.size()];
+      if ((a.y <= p.y) == (b.y <= p.y)) {
+        continue;
+      }
+      const float x = a.x + (p.y - a.y) * (b.x - a.x) / (b.y - a.y);
+      if (x > p.x) {
+        ++crossings;
+        winding += b.y > a.y ? 1 : -1;
+      }
+    }
+  }
+  return fill == CFX_FillRenderOptions::FillType::kEvenOdd ? crossings % 2
+                                                           : winding != 0;
+}
+
+// The second test for a shading: points sampled at most 1 pt apart inside
+// the shrunk regions, each tested against the shading's box and every clip
+// path with its fill rule. Whether the shading still paints one of them.
+bool ShadingPaintsSample(const CPDF_ShadingObject& shading,
+                         const CFX_Matrix& to_page,
+                         const std::vector<RedactRegion>& regions) {
+  CFX_FloatRect box = shading.GetRect();
+  box.Normalize();
+  CFX_FloatRect page_box = to_page.TransformRect(box);
+  page_box.Normalize();
+  const CFX_Matrix to_holder = to_page.GetInverse();
+  std::vector<std::pair<std::vector<std::vector<CFX_PointF>>,
+                        CFX_FillRenderOptions::FillType>>
+      clips;
+  const CPDF_ClipPath& clip = shading.clip_path();
+  for (size_t i = 0; clip.HasRef() && i < clip.GetPathCount(); ++i) {
+    clips.emplace_back(Polygons(clip.GetPath(i)), clip.GetClipType(i));
+  }
+  for (const RedactRegion& region : regions) {
+    CFX_FloatRect area = region.bbox;
+    area.Intersect(page_box);
+    if (area.IsEmpty()) {
+      continue;
+    }
+    const int columns = std::max(1, static_cast<int>(std::ceil(area.Width())));
+    const int rows = std::max(1, static_cast<int>(std::ceil(area.Height())));
+    for (int r = 0; r < rows; ++r) {
+      for (int c = 0; c < columns; ++c) {
+        const CFX_PointF page_point(
+            area.left + (c + 0.5f) * area.Width() / columns,
+            area.bottom + (r + 0.5f) * area.Height() / rows);
+        if (!PointInside(page_point, region)) {
+          continue;
+        }
+        const CFX_PointF p = to_holder.Transform(page_point);
+        if (p.x < box.left || p.x > box.right || p.y < box.bottom ||
+            p.y > box.top) {
+          continue;
+        }
+        bool painted = true;
+        for (const auto& [polygons, fill] : clips) {
+          if (!Covers(polygons, fill, p)) {
+            painted = false;
+            break;
+          }
+        }
+        if (painted) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
 // -- Candidates --------------------------------------------------------------
 
 bool FormHas(const CPDF_Form* form, const char* key) {
@@ -852,7 +969,8 @@ class Walker {
           ++entry_->counts.paths;
         }
       } else if (CPDF_ShadingObject* shading = object->AsShading()) {
-        if (page && ShadingCrosses(*redactor_, *shading, to_page)) {
+        if (page && (ShadingCrosses(*redactor_, *shading, to_page) ||
+                     ShadingPaintsSample(*shading, to_page, entry_->second))) {
           ++entry_->counts.paths;
         }
       }
