@@ -1350,6 +1350,106 @@ const clippedAway = (points) => `${roundPath(points)} W n 0 0 400 200 re 3 3 394
   assert.ok(beside.textChars > 0, `the shared form's text is hidden from the check: ${JSON.stringify(beside)}`)
 }
 
+// Drawing inside tiling patterns. The redaction does not enter a pattern's
+// stream, so a shape its cell draws under a mark stays in the file.
+const PATTERN_MARK = [150, 60, 250, 140]
+const tiling = (bbox, xStep, yStep, content, entries = '/PaintType 1') =>
+  streamObject(`/Type /Pattern /PatternType 1 ${entries} /TilingType 1 /BBox [${bbox.join(' ')}] /XStep ${xStep} /YStep ${yStep} /Resources << >>`, content)
+// A cell the size of the page: a quadrilateral under the mark and a square beside it.
+const pageCell = tiling([0, 0, 400, 200], 400, 200, '1 0 1 rg 170 80 m 230 85 l 220 120 l 180 115 l h f 0 0 1 rg 300 80 40 40 re f')
+// A page that fills |fill| (path operators) with /P0, the first of |patterns|.
+const patternPage = (fill, patterns, colour = '/Pattern cs /P0 scn', resources = '') =>
+  onePagePdf(`q ${colour} ${fill} Q`, { resources: `/Pattern << /P0 6 0 R >> ${resources}` }, patterns)
+// |source| with PATTERN_MARK applied, and what the check then finds under it.
+function underAppliedMark(source) {
+  const applied = editPage(source, (doc, page) => {
+    const mark = addMark(page, PATTERN_MARK)
+    assert.equal(applyPage(doc, page, [mark], false).result, 1)
+    m._FPDFPage_CloseAnnot(mark)
+  })
+  return withDoc(applied, (doc) => inspectPage(doc, 0, [PATTERN_MARK]))[0]
+}
+
+// counts a shape a page-sized pattern cell draws under a mark the fill reaches past
+{
+  const after = underAppliedMark(patternPage('20 50 360 100 re f', [pageCell]))
+  assert.ok(after.paths > 0, `the cell's shape under the applied mark: ${JSON.stringify(after)}`)
+  // A pattern inside the cell follows from the cell's place.
+  const outer = streamObject(
+    '/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 400 200] /XStep 400 /YStep 200 /Resources << /Pattern << /Pin 7 0 R >> >>',
+    '/Pattern cs /Pin scn 0 0 400 200 re f',
+  )
+  const nested = underAppliedMark(patternPage('20 50 360 100 re f', [outer, pageCell]))
+  assert.ok(nested.paths > 0, `a shape in a pattern inside the cell: ${JSON.stringify(nested)}`)
+  // In candidate mode, under a black box set into a hole in the fill.
+  const boxed = patternPage('20 50 360 100 re 150 60 100 80 re f* 0 g 150 60 100 80 re f', [pageCell])
+  const box = withDoc(boxed, (doc) => inspectPage(doc, 0, [])).find((c) => c.kind === 'filled-box')
+  assert.ok(box && box.paths > 0, `the cell's shape under a black box: ${JSON.stringify(box)}`)
+}
+
+// does not count a hatch that the fill also shows whole beside the mark
+{
+  const hatch = tiling([0, 0, 10, 10], 10, 10, '0 G 1 w 0 0 m 10 10 l S')
+  const after = underAppliedMark(patternPage('20 50 360 100 re f', [hatch]))
+  assert.equal(after.paths, 0, `a hatch under the applied mark: ${JSON.stringify(after)}`)
+}
+
+// counts a small cell's shape when the fill shows no whole tile beside the mark
+{
+  // An uncoloured pattern. The fill reaches 10 pt past the mark on every
+  // side, and the tiles are 100 pt across.
+  const cell = tiling([0, 0, 100, 100], 100, 100, '60 70 30 20 re f', '/PaintType 2')
+  const after = underAppliedMark(patternPage('140 50 120 100 re f', [cell], '/Cs0 cs 1 0 0 /P0 scn', '/ColorSpace << /Cs0 [/Pattern /DeviceRGB] >>'))
+  assert.ok(after.paths > 0, `a shape no whole tile shows elsewhere: ${JSON.stringify(after)}`)
+}
+
+// counts nothing for a pattern fill that lay wholly under the mark
+{
+  const source = patternPage('160 70 80 60 re f', [pageCell])
+  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [PATTERN_MARK]))
+  assert.ok(before.paths > 0, `the fill before the apply: ${JSON.stringify(before)}`)
+  const after = underAppliedMark(source)
+  assert.equal(after.paths, 0, `a fill the apply removed: ${JSON.stringify(after)}`)
+}
+
+// counts a pattern whose tiling cannot be worked out, or fails
+{
+  const hatch = '0 G 1 w 0 0 m 10 10 l S'
+  const band = '20 50 360 100 re f'
+  for (const [name, source] of [
+    ['a step of 0', patternPage(band, [tiling([0, 0, 10, 10], 0, 10, hatch)])],
+    ['an empty cell box', patternPage(band, [tiling([0, 0, 0, 10], 10, 10, hatch)])],
+    ['a matrix that cannot be undone', patternPage(band, [tiling([0, 0, 10, 10], 10, 10, hatch, '/PaintType 1 /Matrix [1 0 2 0 0 0]')])],
+    // A stroke around the mark, which shows no whole tile for certain, in a
+    // pattern with a million tiles to the point.
+    ['tiles too many to place', patternPage('20 50 360 100 re S', [tiling([0, 0, 0.001, 0.001], 0.001, 0.001, '0 0 0.001 0.001 re f')], '/Pattern CS /P0 SCN 10 w')],
+  ]) {
+    const applied = editPage(source, (doc, page) => {
+      const mark = addMark(page, PATTERN_MARK)
+      assert.equal(applyPage(doc, page, [mark], false).result, 1)
+      m._FPDFPage_CloseAnnot(mark)
+    })
+    withDoc(applied, (doc) => {
+      const quad = m._malloc(32)
+      m.HEAPF32.set(quadOf(PATTERN_MARK), quad / 4)
+      const pointer = m._INK_Inspect_Page(doc, 0, quad, 1)
+      m._free(quad)
+      if (pointer) assert.ok(report(pointer).regions[0].paths > 0, `${name}: reported as nothing`)
+    })
+  }
+}
+
+// counts a path filled with a shading pattern by the path's own rule
+{
+  const source = onePagePdf('q /Pattern cs /P0 scn 20 50 360 100 re f Q', {
+    resources: `/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [0 0 400 0] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >> >>`,
+  })
+  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [PATTERN_MARK]))
+  assert.equal(before.paths, 1, `a shading pattern fill before the apply: ${JSON.stringify(before)}`)
+  const after = underAppliedMark(source)
+  assert.equal(after.paths, 0, `a shading pattern fill under the applied mark: ${JSON.stringify(after)}`)
+}
+
 // a region too small to shrink still counts the path under it
 {
   const source = onePagePdf('0 0 1 rg 50 50 100 100 re f')
