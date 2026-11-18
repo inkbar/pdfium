@@ -4,11 +4,17 @@
 #ifndef CORE_FPDFAPI_EDIT_CPDF_IMAGE_REDACTOR_H_
 #define CORE_FPDFAPI_EDIT_CPDF_IMAGE_REDACTOR_H_
 
+#include <stdint.h>
+
+#include <optional>
+#include <vector>
+
 #include "core/fpdfapi/edit/cpdf_text_redactor.h"
 #include "core/fxcrt/fx_coordinates.h"
 #include "core/fxcrt/span.h"
 
 class CPDF_Dictionary;
+class CPDF_Document;
 class CPDF_ImageObject;
 class CPDF_Page;
 
@@ -38,5 +44,18 @@ RedactResult RedactImageObject(CPDF_Page* page,
                                pdfium::span<const CFX_FloatRect> page_rects,
                                const CFX_Matrix& parent_to_page,
                                bool fill_black);
+
+// Inkbar: what a redaction leaves in the hole of one of an image's streams,
+// for a check that reads the samples back. `role` says which stream it is.
+// The stored sample per component, as RedactImageObject() writes it when it
+// keeps the format, or nullopt when that is not known (the colour space can't
+// be read). `resources` and `page_resources` resolve a named colour space.
+enum class RedactionHoleRole { kImage, kStencil, kMask, kSoftMask };
+std::optional<std::vector<uint32_t>> RedactionHoleSamples(
+    CPDF_Document* doc,
+    const CPDF_Dictionary& dict,
+    RedactionHoleRole role,
+    const CPDF_Dictionary* resources,
+    const CPDF_Dictionary* page_resources);
 
 #endif  // CORE_FPDFAPI_EDIT_CPDF_IMAGE_REDACTOR_H_

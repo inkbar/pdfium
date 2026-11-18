@@ -1122,6 +1122,30 @@ RedactResult RedactDecodedImage(CPDF_Page* page,
 
 }  // namespace
 
+// Inkbar: the fill the hole of a kept-format redaction holds, from the same
+// HoleSamples() the redaction writes with.
+std::optional<std::vector<uint32_t>> RedactionHoleSamples(
+    CPDF_Document* doc,
+    const CPDF_Dictionary& dict,
+    RedactionHoleRole role,
+    const CPDF_Dictionary* resources,
+    const CPDF_Dictionary* page_resources) {
+  if (role == RedactionHoleRole::kStencil || role == RedactionHoleRole::kMask) {
+    return HoleSamples(role == RedactionHoleRole::kMask ? Hole::kPainted
+                                                        : Hole::kUnpainted,
+                       dict, nullptr, 1, 1);
+  }
+  RetainPtr<CPDF_ColorSpace> color_space =
+      ColorSpaceOf(doc, dict, resources, page_resources);
+  if (!color_space) {
+    return std::nullopt;
+  }
+  return HoleSamples(role == RedactionHoleRole::kSoftMask ? Hole::kOpaque
+                                                          : Hole::kPaper,
+                     dict, color_space.Get(), color_space->ComponentCount(),
+                     dict.GetIntegerFor("BitsPerComponent", 8));
+}
+
 RedactResult RedactImageObject(CPDF_Page* page,
                                CPDF_ImageObject* image_object,
                                const CPDF_Dictionary* resources,

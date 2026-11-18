@@ -953,6 +953,28 @@ function nestedFormsPdf(levels) {
   assert.equal(region.imagesNotBlank, 1, `faint stripes under a narrow region: ${JSON.stringify(region)}`)
 }
 
+// counts a flat image that is not the apply's fill when regions are given
+{
+  const red = Buffer.alloc(16 * 16 * 3)
+  for (let i = 0; i < 256; i++) red.set([255, 0, 0], i * 3)
+  const image = streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8', red)
+  const region = [60, 60, 100, 100]
+  const source = onePagePdf('q 100 0 0 100 50 50 cm /Im0 Do Q', { resources: '/XObject << /Im0 6 0 R >>' }, [image])
+  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [region]))
+  assert.equal(before.imagesNotBlank, 1, `a solid red image under the region: ${JSON.stringify(before)}`)
+  const applied = editPage(source, (doc, page) => {
+    const mark = addMark(page, region)
+    assert.equal(applyPage(doc, page, [mark], false).result, 1)
+    m._FPDFPage_CloseAnnot(mark)
+  })
+  const [after] = withDoc(applied, (doc) => inspectPage(doc, 0, [region]))
+  assert.equal(after.imagesNotBlank, 0, `the red image after the apply: ${JSON.stringify(after)}`)
+  // Without regions a flat image under a box is still blank.
+  const boxed = onePagePdf('q 100 0 0 100 50 50 cm /Im0 Do Q 0 g 60 60 40 40 re f', { resources: '/XObject << /Im0 6 0 R >>' }, [image])
+  const [box] = withDoc(boxed, (doc) => inspectPage(doc, 0, []))
+  assert.deepEqual([box.kind, box.imagesNotBlank], ['filled-box', 0], `a flat image under a black box: ${JSON.stringify(box)}`)
+}
+
 // inspects an image whose shape is only in its masks
 {
   const black = Buffer.alloc(16 * 16 * 3)

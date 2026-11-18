@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -27,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/fpdfapi/edit/cpdf_image_redactor.h"
 #include "core/fpdfapi/edit/cpdf_path_redactor.h"
 #include "core/fpdfapi/edit/cpdf_text_redactor.h"
 #include "core/fpdfapi/font/cpdf_font.h"
@@ -50,12 +52,14 @@
 #include "core/fpdfapi/parser/cpdf_array.h"
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fpdfapi/parser/cpdf_document.h"
+#include "core/fpdfapi/parser/cpdf_number.h"
 #include "core/fpdfapi/parser/cpdf_parser.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
 #include "core/fpdfapi/parser/cpdf_stream_acc.h"
 #include "core/fpdftext/cpdf_textpage.h"
 #include "core/fpdfdoc/cpdf_annot.h"
 #include "core/fxcrt/compiler_specific.h"
+#include "core/fxcrt/data_vector.h"
 #include "core/fxcrt/fx_coordinates.h"
 #include "core/fxcrt/retain_ptr.h"
 #include "core/fxcrt/span.h"
@@ -444,18 +448,35 @@ std::optional<std::pair<int, int>> JpegBlock(pdfium::span<const uint8_t> data) {
   return std::nullopt;
 }
 
+// Decoded samples kept for one inspection are released, least recently used
+// first, once they pass this many bytes.
+constexpr size_t kSampleCacheBytes = 64 * 1024 * 1024;
+
+// One stream's samples, with the value the apply fills a hole in them with,
+// decoded the same way: a value per channel (B, G, R), or one for a mask.
+// Empty when that value is not known.
+struct DecodedImage {
+  Samples samples;
+  std::vector<int> fill;
+};
+
 class SampleCache {
  public:
-  explicit SampleCache(CPDF_Document* doc) : doc_(doc) {}
+  SampleCache(CPDF_Document* doc, const CPDF_Dictionary* page_resources)
+      : doc_(doc), page_resources_(page_resources) {}
 
-  const Samples& Get(RetainPtr<const CPDF_Stream> stream) {
+  DecodedImage Get(RetainPtr<const CPDF_Stream> stream,
+                   RedactionHoleRole role) {
     auto it = cache_.find(stream.Get());
     if (it != cache_.end()) {
-      return it->second;
+      order_.splice(order_.begin(), order_, it->second.place);
+      return it->second.image;
     }
-    Samples samples;
-    samples.tolerance = Tolerance(stream->GetDict().Get());
-    const ByteString filter = LastFilter(stream->GetDict().Get());
+    DecodedImage image;
+    Samples& samples = image.samples;
+    RetainPtr<const CPDF_Dictionary> dict = stream->GetDict();
+    samples.tolerance = Tolerance(dict.Get());
+    const ByteString filter = LastFilter(dict.Get());
     if (filter == "DCTDecode" || filter == "DCT") {
       // The JPEG itself: its data through every filter before the DCT.
       auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(stream);
@@ -467,12 +488,34 @@ class SampleCache {
       samples.block_height = block.second;
     }
     samples.dib = Decode(stream);
-    // The cache holds the stream, so its address names it for the call.
-    streams_.push_back(stream);
-    return cache_.emplace(stream.Get(), std::move(samples)).first->second;
+    image.fill = Fill(*dict, role);
+
+    const size_t bytes =
+        samples.dib ? static_cast<size_t>(samples.dib->GetPitch()) *
+                          static_cast<size_t>(samples.dib->GetHeight())
+                    : 0;
+    order_.push_front(stream.Get());
+    cache_.emplace(stream.Get(),
+                   Entry{stream, image, bytes, order_.begin()});
+    bytes_ += bytes;
+    while (bytes_ > kSampleCacheBytes && order_.size() > 1) {
+      auto last = cache_.find(order_.back());
+      bytes_ -= last->second.bytes;
+      cache_.erase(last);
+      order_.pop_back();
+    }
+    return image;
   }
 
  private:
+  struct Entry {
+    // Held, so its address names it while it is cached.
+    RetainPtr<const CPDF_Stream> stream;
+    DecodedImage image;
+    size_t bytes;
+    std::list<const CPDF_Stream*>::iterator place;
+  };
+
   RetainPtr<const CFX_DIBBase> Decode(RetainPtr<const CPDF_Stream> stream) {
     auto dib = pdfium::MakeRetain<CPDF_DIB>(doc_, std::move(stream));
     if (!dib->Load()) {
@@ -495,16 +538,80 @@ class SampleCache {
     return dib->ConvertTo(FXDIB_Format::kBgr);
   }
 
+  // The apply's fill for |dict|'s samples, from upstream's own computation
+  // (RedactionHoleSamples()), decoded as a one-sample image with the same
+  // colour space, depth and /Decode.
+  std::vector<int> Fill(const CPDF_Dictionary& dict, RedactionHoleRole role) {
+    std::optional<std::vector<uint32_t>> hole = RedactionHoleSamples(
+        doc_, dict, role, nullptr, page_resources_);
+    if (!hole.has_value() || hole->empty()) {
+      return {};
+    }
+    const int bpc = role == RedactionHoleRole::kImage ||
+                            role == RedactionHoleRole::kSoftMask
+                        ? dict.GetIntegerFor("BitsPerComponent", 8)
+                        : 1;
+    if (bpc != 1 && bpc != 2 && bpc != 4 && bpc != 8 && bpc != 16) {
+      return {};
+    }
+    DataVector<uint8_t> data((hole->size() * bpc + 7) / 8);
+    size_t bit = 0;
+    for (uint32_t value : *hole) {
+      if (bpc == 16) {
+        data[bit / 8] = static_cast<uint8_t>(value >> 8);
+        data[bit / 8 + 1] = static_cast<uint8_t>(value);
+      } else {
+        const int shift = 8 - bpc - static_cast<int>(bit % 8);
+        data[bit / 8] |= static_cast<uint8_t>(value << shift);
+      }
+      bit += bpc;
+    }
+    RetainPtr<CPDF_Dictionary> one = ToDictionary(dict.Clone());
+    for (const char* key : {"Filter", "DecodeParms", "F", "DP", "SMask", "Mask",
+                            "SMaskInData", "Length"}) {
+      one->RemoveFor(key);
+    }
+    one->SetNewFor<CPDF_Number>("Width", 1);
+    one->SetNewFor<CPDF_Number>("Height", 1);
+    auto stream =
+        pdfium::MakeRetain<CPDF_Stream>(std::move(data), std::move(one));
+    RetainPtr<const CFX_DIBBase> dib = Decode(std::move(stream));
+    if (!dib || dib->GetWidth() < 1 || dib->GetHeight() < 1) {
+      return {};
+    }
+    pdfium::span<const uint8_t> row = dib->GetScanline(0);
+    if (dib->IsMaskFormat()) {
+      if (row.empty()) {
+        return {};
+      }
+      return {dib->GetBPP() == 1 ? row[0] >> 7 : row[0]};
+    }
+    if (row.size() < 3) {
+      return {};
+    }
+    return {row[0], row[1], row[2]};
+  }
+
   CPDF_Document* const doc_;
-  std::vector<RetainPtr<const CPDF_Stream>> streams_;
-  std::map<const CPDF_Stream*, Samples> cache_;
+  const CPDF_Dictionary* const page_resources_;
+  std::map<const CPDF_Stream*, Entry> cache_;
+  std::list<const CPDF_Stream*> order_;  // Most recently used first.
+  size_t bytes_ = 0;
 };
 
 // Whether the samples of |samples| over the regions, on its own grid, are
 // one value. Samples that could not be decoded are not.
+//
+// With |fill| (regions given), each sample must instead be within the
+// tolerance of the apply's fill value: a flat image that is not the fill is
+// content. An empty |fill| when one is wanted fails.
 bool SamplesFlat(const Samples& samples,
                  const CFX_Matrix& image_to_page,
-                 const std::vector<RedactRegion>& regions) {
+                 const std::vector<RedactRegion>& regions,
+                 const std::vector<int>* fill) {
+  if (fill && fill->empty()) {
+    return false;
+  }
   const CFX_DIBBase* dib = samples.dib.Get();
   if (!dib) {
     return false;
@@ -530,10 +637,28 @@ bool SamplesFlat(const Samples& samples,
     return bx0 < b.x0 || bx1 > b.x1 || by0 < box_top || by1 > box_bottom;
   };
   const bool mask = dib->IsMaskFormat();
+  if (fill && fill->size() != (mask ? 1u : 3u)) {
+    return false;
+  }
+  bool on_fill = true;
+  auto add = [&](int channel, int value, bool edge) {
+    if (fill) {
+      // Within the tolerance of the fill; in a crossed JPEG block, anywhere
+      // in a band of the looser range that holds the fill.
+      const int tolerance = edge ? 4 * samples.tolerance : samples.tolerance;
+      on_fill &= std::abs(value - (*fill)[channel]) <= tolerance;
+      return;
+    }
+    band.Add(channel, value);
+    if (!edge) {
+      inner.Add(channel, value);
+    }
+  };
   const bool one_bit = dib->GetBPP() == 1;
   const size_t bytes = mask ? 1 : dib->GetBPP() / 8;
   for (const GridBox& b : boxes) {
-    for (int y = b.y0; y < b.y1 && band.flat() && inner.flat(); ++y) {
+    for (int y = b.y0; y < b.y1 && band.flat() && inner.flat() && on_fill;
+         ++y) {
       pdfium::span<const uint8_t> row = dib->GetScanline(height - 1 - y);
       for (int x = b.x0; x < b.x1; ++x) {
         const bool edge = jpeg && crossed(b, x, height - 1 - y);
@@ -542,11 +667,7 @@ bool SamplesFlat(const Samples& samples,
           if (at >= row.size()) {
             return false;
           }
-          const int value = one_bit ? (row[at] >> (7 - x % 8)) & 1 : row[at];
-          band.Add(0, value);
-          if (!edge) {
-            inner.Add(0, value);
-          }
+          add(0, one_bit ? (row[at] >> (7 - x % 8)) & 1 : row[at], edge);
           continue;
         }
         const size_t at = static_cast<size_t>(x) * bytes;
@@ -554,40 +675,47 @@ bool SamplesFlat(const Samples& samples,
           return false;
         }
         for (int c = 0; c < 3; ++c) {
-          band.Add(c, row[at + c]);
-          if (!edge) {
-            inner.Add(c, row[at + c]);
-          }
+          add(c, row[at + c], edge);
         }
       }
     }
   }
-  return band.flat() && inner.flat();
+  return band.flat() && inner.flat() && on_fill;
 }
 
 // Whether an image is blank under the regions: its own samples, and those of
 // its /SMask and of a stream /Mask, each on its own grid.
+//
+// With |strict| (regions given), blank means the apply's fill value; without,
+// one flat value of any kind.
 bool ImageBlank(SampleCache* cache,
                 const CPDF_ImageObject* object,
                 const CFX_Matrix& to_page,
-                const std::vector<RedactRegion>& regions) {
+                const std::vector<RedactRegion>& regions,
+                bool strict) {
   RetainPtr<CPDF_Image> image = object->GetImage();
   RetainPtr<const CPDF_Stream> stream = image ? image->GetStream() : nullptr;
   if (!stream) {
     return false;
   }
   const CFX_Matrix image_to_page = object->matrix() * to_page;
-  if (!SamplesFlat(cache->Get(stream), image_to_page, regions)) {
+  auto blank = [&](RetainPtr<const CPDF_Stream> part, RedactionHoleRole role) {
+    const DecodedImage decoded = cache->Get(std::move(part), role);
+    return SamplesFlat(decoded.samples, image_to_page, regions,
+                       strict ? &decoded.fill : nullptr);
+  };
+  RetainPtr<const CPDF_Dictionary> dict = stream->GetDict();
+  if (!blank(stream, dict->GetBooleanFor("ImageMask", false)
+                         ? RedactionHoleRole::kStencil
+                         : RedactionHoleRole::kImage)) {
     return false;
   }
-  RetainPtr<const CPDF_Dictionary> dict = stream->GetDict();
-  for (const char* key : {"SMask", "Mask"}) {
-    RetainPtr<const CPDF_Stream> mask = dict->GetStreamFor(key);
-    if (mask && !SamplesFlat(cache->Get(mask), image_to_page, regions)) {
-      return false;
-    }
+  RetainPtr<const CPDF_Stream> soft_mask = dict->GetStreamFor("SMask");
+  if (soft_mask && !blank(soft_mask, RedactionHoleRole::kSoftMask)) {
+    return false;
   }
-  return true;
+  RetainPtr<const CPDF_Stream> mask = dict->GetStreamFor("Mask");
+  return !mask || blank(mask, RedactionHoleRole::kMask);
 }
 
 // -- Paths -------------------------------------------------------------------
@@ -860,7 +988,9 @@ struct PageIndex {
 
 struct Context {
   explicit Context(CPDF_Page* page, bool strict)
-      : page(page), samples(page->GetDocument()), strict(strict) {}
+      : page(page),
+        samples(page->GetDocument(), page->GetResources().Get()),
+        strict(strict) {}
 
   CPDF_Page* const page;
   SampleCache samples;
@@ -1205,7 +1335,8 @@ class Walker {
     if (!RectMeetsAnyBBox(box, entry_->regions)) {
       return false;
     }
-    return !ImageBlank(&context_->samples, &image, to_page, entry_->regions);
+    return !ImageBlank(&context_->samples, &image, to_page, entry_->regions,
+                       context_->strict);
   }
 
   Entry* const entry_;
