@@ -912,6 +912,29 @@ const textContent = 'BT /F1 20 Tf 50 100 Td (SECRET-ALPHA) Tj 200 0 Td (KEEP-BET
   assert.equal(tiny.paths, 1, `path under a tiny region: ${JSON.stringify(tiny)}`)
 }
 
+// counts a glyph whose own box misses the region when its extracted box meets it
+{
+  // A Type3 glyph whose bounding box is a 0.2 pt square at its origin, outside
+  // the region, while it advances 20 pt into it.
+  const source = onePagePdf(
+    'BT /T3 20 Tf 40 100 Td (A) Tj ET',
+    { resources: '/Font << /F1 5 0 R /T3 6 0 R >>' },
+    [
+      '<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 7 0 R >> /Encoding << /Type /Encoding /Differences [65 /a] >> /FirstChar 65 /LastChar 65 /Widths [1000] /Resources << >> >>',
+      streamObject('', '1000 0 0 0 10 10 d1 0 0 10 10 re f'),
+    ],
+  )
+  const [region] = withDoc(source, (doc) => inspectPage(doc, 0, [SECRET_RECT]))
+  assert.ok(region.textChars > 0, `a glyph that advances into the region: ${JSON.stringify(region)}`)
+}
+
+// counts a path that crosses the region where its dash pattern leaves a gap
+{
+  const source = onePagePdf('[2 200] 0 d 2 w 50 150 m 350 150 l S')
+  const [region] = withDoc(source, (doc) => inspectPage(doc, 0, [[100, 140, 200, 160]]))
+  assert.equal(region.paths, 1, `a dashed line through the region: ${JSON.stringify(region)}`)
+}
+
 // inspects text inside a tiling pattern
 {
   const source = onePagePdf(
@@ -936,6 +959,74 @@ const textContent = 'BT /F1 20 Tf 50 100 Td (SECRET-ALPHA) Tj 200 0 Td (KEEP-BET
   // The apply does not enter patterns; the check still sees the text.
   const [after] = withDoc(applied, (doc) => inspectPage(doc, 0, [region]))
   assert.ok(after.patternContent > 0, 'the check lost the pattern text after the apply')
+}
+
+// reads tiling patterns inside patterns and inside annotation appearances
+{
+  const tile = '/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 50 20] /XStep 50 /YStep 20'
+  const source = onePagePdf(
+    '/Pattern cs /P1 scn 50 50 200 100 re f',
+    { resources: '/Pattern << /P1 7 0 R >>', page: '/Annots [8 0 R]' },
+    [
+      streamObject(`${tile} /Resources << /Font << /F1 5 0 R >> >>`, 'BT /F1 10 Tf 0 5 Td (TILE) Tj ET'),
+      streamObject(`${tile} /Resources << /Pattern << /P0 6 0 R >> >>`, '/Pattern cs /P0 scn 0 0 50 20 re f'),
+      '<< /Type /Annot /Subtype /Square /Rect [260 50 360 150] /AP << /N 9 0 R >> >>',
+      streamObject('/Type /XObject /Subtype /Form /BBox [260 50 360 150] /Resources << /Pattern << /P0 6 0 R >> >>', '/Pattern cs /P0 scn 260 50 100 100 re f'),
+    ],
+  )
+  const [nested, annotation] = withDoc(source, (doc) =>
+    inspectPage(doc, 0, [
+      [60, 60, 100, 100],
+      [280, 60, 320, 100],
+    ]),
+  )
+  assert.ok(nested.patternContent > 0, `text in a pattern inside a pattern: ${JSON.stringify(nested)}`)
+  assert.ok(annotation.patternContent > 0, `text in a pattern inside an appearance: ${JSON.stringify(annotation)}`)
+}
+
+// reads every appearance state of an annotation
+{
+  const form = (text) => streamObject('/Type /XObject /Subtype /Form /BBox [60 100 160 120] /Resources << /Font << /F1 5 0 R >> >>', `BT /F1 10 Tf 62 105 Td (${text}) Tj ET`)
+  const source = onePagePdf(
+    '',
+    { page: '/Annots [6 0 R 7 0 R]' },
+    [
+      '<< /Type /Annot /Subtype /Square /Rect [60 100 160 120] /AP << /N 8 0 R /D 9 0 R >> >>',
+      '<< /Type /Annot /Subtype /Widget /FT /Btn /Rect [60 100 160 120] /AS /Off /AP << /N << /Off 8 0 R /On 10 0 R >> >> >>',
+      streamObject('/Type /XObject /Subtype /Form /BBox [60 100 160 120]', ''),
+      form('DOWN'),
+      form('ON'),
+    ],
+  )
+  const [region] = withDoc(source, (doc) => inspectPage(doc, 0, [SECRET_RECT]))
+  assert.ok(region.annotationText >= 6, `text in the down and on appearances: ${JSON.stringify(region)}`)
+}
+
+// counts only what a candidate box is painted over, and does not trust the overlay tag
+{
+  const background = onePagePdf(`1 g 0 0 400 200 re f 0 g ${textContent} 0 g 45 95 185 30 re f 0 g 245 95 120 30 re f BT /F1 20 Tf 250 100 Td (LATER) Tj ET`)
+  const [white, black, early] = withDoc(background, (doc) => inspectPage(doc, 0, []))
+  assert.deepEqual(
+    [white.kind, white.textChars, white.paths],
+    ['filled-box', 0, 0],
+    `the white background has nothing painted before it: ${JSON.stringify(white)}`,
+  )
+  assert.ok(black.textChars > 0, `text painted before the black box: ${JSON.stringify(black)}`)
+  assert.equal(black.paths, 1, 'the background under the black box')
+  // KEEP-BETA lies under the third box and was painted before it; LATER was painted after it.
+  const [laterOnly] = withDoc(onePagePdf(`0 g 245 95 120 30 re f BT /F1 20 Tf 250 100 Td (LATER) Tj ET`), (doc) => inspectPage(doc, 0, []))
+  assert.equal(laterOnly.textChars, 0, `text painted after the box is not under it: ${JSON.stringify(laterOnly)}`)
+  assert.ok(early.textChars > 0, 'KEEP-BETA under the third box')
+  const hidden = onePagePdf(
+    '/Fm0 Do',
+    { resources: '/XObject << /Fm0 6 0 R >>' },
+    [streamObject('/Type /XObject /Subtype /Form /BBox [0 0 400 200] /INKB_Overlay true /Resources << /Font << /F1 5 0 R >> >>', `${textContent} 0 g 45 95 185 30 re f`)],
+  )
+  withDoc(hidden, (doc) => {
+    const [box] = inspectPage(doc, 0, [])
+    assert.ok(box && box.textChars > 0, `text behind a box in a tagged form: ${JSON.stringify(box)}`)
+    assert.equal(inspectPage(doc, 0, [SECRET_RECT])[0].textChars, 0, 'regions given: the tag is trusted')
+  })
 }
 
 // ignores the overlay it tagged

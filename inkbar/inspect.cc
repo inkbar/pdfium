@@ -51,6 +51,7 @@
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fpdfapi/parser/cpdf_document.h"
 #include "core/fpdfapi/parser/cpdf_stream.h"
+#include "core/fpdftext/cpdf_textpage.h"
 #include "core/fpdfdoc/cpdf_annot.h"
 #include "core/fxcrt/compiler_specific.h"
 #include "core/fxcrt/fx_coordinates.h"
@@ -71,6 +72,9 @@ constexpr char kPageCopyKey[] = "INKB_PageCopy";
 // points. The apply cuts them a hair outside the region (its boundary guard),
 // and the save rounds coordinates, so a correctly cut edge must not count.
 constexpr float kPathInset = 0.01f;
+// The second, independent tests for text and paths use regions shrunk by this
+// much on every side, or by a quarter of the smaller side when that is less.
+constexpr float kSecondInset = 1.0f;
 // An image is blank when every stored sample the apply would blank is within
 // this many levels of one value, per 8-bit channel: 0 when the image's last
 // filter is lossless, this many either way after DCT or JPX.
@@ -163,11 +167,12 @@ bool RectMeetsAnyBBox(const CFX_FloatRect& rect,
   return false;
 }
 
-// |region| shrunk by kPathInset, or nullopt when nothing is left.
-std::optional<RedactRegion> Inset(const RedactRegion& region) {
+// |region| shrunk by |amount| on every side, or nullopt when nothing is
+// left. A quad's corners each move |amount| toward its centre.
+std::optional<RedactRegion> Inset(const RedactRegion& region, float amount) {
   if (!region.has_quad) {
     CFX_FloatRect box = region.bbox;
-    box.Deflate(kPathInset, kPathInset);
+    box.Deflate(amount, amount);
     if (!(box.right > box.left) || !(box.top > box.bottom)) {
       return std::nullopt;
     }
@@ -184,14 +189,60 @@ std::optional<RedactRegion> Inset(const RedactRegion& region) {
   for (size_t i = 0; i < 4; ++i) {
     const CFX_PointF to_centre = centre - region.quad[i];
     const float length = std::hypot(to_centre.x, to_centre.y);
-    if (length <= 2 * kPathInset) {
+    if (length <= 2 * amount) {
       return std::nullopt;
     }
-    const float step = kPathInset / length;
+    const float step = amount / length;
     corners[i] = CFX_PointF(region.quad[i].x + to_centre.x * step,
                             region.quad[i].y + to_centre.y * step);
   }
   return RedactRegionFromQuadCorners(corners);
+}
+
+// The inset of the second, independent tests: 1 pt, or a quarter of the
+// region's smaller side when that is less.
+float SecondTestInset(const RedactRegion& region) {
+  float side = std::min(region.bbox.Width(), region.bbox.Height());
+  if (region.has_quad) {
+    const Quad& q = region.quad;
+    side = std::min(std::hypot(q[1].x - q[0].x, q[1].y - q[0].y),
+                    std::hypot(q[2].x - q[0].x, q[2].y - q[0].y));
+  }
+  return std::min(kSecondInset, side / 4);
+}
+
+// Whether |point| lies strictly inside |region|.
+bool PointInside(const CFX_PointF& point, const RedactRegion& region) {
+  const CFX_FloatRect& b = region.bbox;
+  if (!(point.x > b.left && point.x < b.right && point.y > b.bottom &&
+        point.y < b.top)) {
+    return false;
+  }
+  if (!region.has_quad) {
+    return true;
+  }
+  float sign = 0;
+  for (int i = 0; i < 4; ++i) {
+    const CFX_PointF& p = region.quad[kQuadRing[i]];
+    const CFX_PointF& q = region.quad[kQuadRing[(i + 1) % 4]];
+    const float cross =
+        (q.x - p.x) * (point.y - p.y) - (q.y - p.y) * (point.x - p.x);
+    if (cross == 0 || (sign != 0 && (cross > 0) != (sign > 0))) {
+      return false;
+    }
+    sign = cross;
+  }
+  return true;
+}
+
+bool PointInsideAny(const CFX_PointF& point,
+                    const std::vector<RedactRegion>& regions) {
+  for (const RedactRegion& region : regions) {
+    if (PointInside(point, region)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // -- Images, as cpdf_image_redactor.cpp maps regions to samples --------------
@@ -524,17 +575,72 @@ struct Counts {
   unsigned pattern_content = 0;
   unsigned annotation_text = 0;
   unsigned annotation_images = 0;
+  // The second text test's counts, merged into the two above at the end.
+  unsigned text_chars_second = 0;
+  unsigned annotation_text_second = 0;
 };
 
 struct Entry {
   const char* kind = "region";
   CFX_FloatRect rect;
   std::vector<RedactRegion> regions;
+  // The regions shrunk for the second, independent tests.
+  std::vector<RedactRegion> second;
+  // Only content painted before this position counts (PageIndex order):
+  // everything for a region, what lies under it for a candidate.
+  size_t before = SIZE_MAX;
   // A candidate's own drawing, which is not content under it.
   const CPDF_PageObject* own_object = nullptr;
   const CPDF_Dictionary* own_annot = nullptr;
   Counts counts;
 };
+
+// The paint order of the page content, forms taken at their place, and which
+// objects lie inside a form tagged as an overlay. Annotations paint after the
+// content, in /Annots order, from position |content_count| on.
+struct PageIndex {
+  std::map<const CPDF_PageObject*, size_t> order;
+  std::set<const CPDF_PageObject*> in_overlay;
+  size_t content_count = 0;
+};
+
+struct Context {
+  explicit Context(CPDF_Page* page, bool strict)
+      : page(page), samples(page->GetDocument()), strict(strict) {}
+
+  CPDF_Page* const page;
+  SampleCache samples;
+  PageIndex index;
+  std::unique_ptr<CPDF_TextPage> text_page;  // Made on first use.
+  // Regions given: forms tagged /INKB_Overlay are an apply's own drawing.
+  // Without regions the tag is not trusted.
+  const bool strict;
+  bool failed = false;
+};
+
+void IndexHolder(CPDF_PageObjectHolder* holder,
+                 bool overlay,
+                 int depth,
+                 Context* context) {
+  if (depth > kMaxDepth) {
+    context->failed = true;
+    return;
+  }
+  PageIndex& index = context->index;
+  for (auto it = holder->begin(); it != holder->end(); ++it) {
+    CPDF_PageObject* object = it->get();
+    index.order[object] = index.content_count++;
+    if (overlay) {
+      index.in_overlay.insert(object);
+    }
+    if (CPDF_FormObject* form_object = object->AsForm()) {
+      if (CPDF_Form* form = form_object->form()) {
+        IndexHolder(form, overlay || FormHas(form, kOverlayKey), depth + 1,
+                    context);
+      }
+    }
+  }
+}
 
 enum class Scope {
   kPage,        // The page's content.
@@ -542,13 +648,87 @@ enum class Scope {
   kPageCopy,    // A page copy in an annotation, in the page's coordinates.
 };
 
+// The points of a path in page space, its segments sampled at most 1 pt
+// apart, for |visit|. Stops when |visit| returns true; returns whether it did.
+template <typename Visit>
+bool SamplePath(const CPDF_Path& path, const CFX_Matrix& to_page, Visit visit) {
+  const std::vector<CFX_Path::Point>& points = path.GetPoints();
+  auto line = [&](const CFX_PointF& a, const CFX_PointF& b) {
+    const float length = std::hypot(b.x - a.x, b.y - a.y);
+    const int steps = std::clamp(static_cast<int>(std::ceil(length)), 1,
+                                 1 << 20);
+    for (int i = 0; i <= steps; ++i) {
+      const float t = static_cast<float>(i) / steps;
+      if (visit(CFX_PointF(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t))) {
+        return true;
+      }
+    }
+    return false;
+  };
+  CFX_PointF start;
+  CFX_PointF current;
+  for (size_t i = 0; i < points.size(); ++i) {
+    const CFX_Path::Point& point = points[i];
+    const CFX_PointF p = to_page.Transform(point.point_);
+    switch (point.type_) {
+      case CFX_Path::Point::Type::kMove:
+        start = current = p;
+        if (visit(p)) {
+          return true;
+        }
+        break;
+      case CFX_Path::Point::Type::kLine:
+        if (line(current, p)) {
+          return true;
+        }
+        current = p;
+        break;
+      case CFX_Path::Point::Type::kBezier: {
+        if (i + 2 >= points.size()) {
+          return false;
+        }
+        const CFX_PointF c1 = p;
+        const CFX_PointF c2 = to_page.Transform(points[i + 1].point_);
+        const CFX_PointF end = to_page.Transform(points[i + 2].point_);
+        // The control polygon is never shorter than the curve.
+        const float length = std::hypot(c1.x - current.x, c1.y - current.y) +
+                             std::hypot(c2.x - c1.x, c2.y - c1.y) +
+                             std::hypot(end.x - c2.x, end.y - c2.y);
+        const int steps = std::clamp(static_cast<int>(std::ceil(length)), 1,
+                                     1 << 20);
+        CFX_PointF previous = current;
+        for (int k = 1; k <= steps; ++k) {
+          const float t = static_cast<float>(k) / steps;
+          const float u = 1 - t;
+          const CFX_PointF q(
+              u * u * u * current.x + 3 * u * u * t * c1.x +
+                  3 * u * t * t * c2.x + t * t * t * end.x,
+              u * u * u * current.y + 3 * u * u * t * c1.y +
+                  3 * u * t * t * c2.y + t * t * t * end.y);
+          if (line(previous, q)) {
+            return true;
+          }
+          previous = q;
+        }
+        current = end;
+        i += 2;
+        if (points[i].close_figure_ && line(current, start)) {
+          return true;
+        }
+        continue;
+      }
+    }
+    if (point.close_figure_ && line(current, start)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 class Walker {
  public:
-  Walker(Entry* entry,
-         const CPDF_PathRedactor* redactor,
-         SampleCache* samples,
-         bool* failed)
-      : entry_(entry), redactor_(redactor), samples_(samples), failed_(failed) {}
+  Walker(Entry* entry, const CPDF_PathRedactor* redactor, Context* context)
+      : entry_(entry), redactor_(redactor), context_(context) {}
 
   void Holder(CPDF_PageObjectHolder* holder,
               const CFX_Matrix& to_page,
@@ -556,7 +736,7 @@ class Walker {
               bool counted,
               int depth) {
     if (depth > kMaxDepth) {
-      *failed_ = true;
+      context_->failed = true;
       return;
     }
     const bool page = scope == Scope::kPage;
@@ -565,32 +745,9 @@ class Walker {
       if (!object->IsActive() || object == entry_->own_object) {
         continue;
       }
-      if (page) {
-        Patterns(object, to_page);
-      }
-      if (CPDF_TextObject* text = object->AsText()) {
-        if (counted) {
-          const unsigned chars = TextChars(*text, to_page);
-          (page ? entry_->counts.text_chars : entry_->counts.annotation_text) +=
-              chars;
-        }
-      } else if (CPDF_ImageObject* image = object->AsImage()) {
-        if (counted && ImageCounts(*image, to_page)) {
-          ++(page ? entry_->counts.images_not_blank
-                  : entry_->counts.annotation_images);
-        }
-      } else if (CPDF_PathObject* path = object->AsPath()) {
-        if (page && redactor_ && PathCrosses(*redactor_, *path, to_page)) {
-          ++entry_->counts.paths;
-        }
-      } else if (CPDF_ShadingObject* shading = object->AsShading()) {
-        if (page && redactor_ &&
-            ShadingCrosses(*redactor_, *shading, to_page)) {
-          ++entry_->counts.paths;
-        }
-      } else if (CPDF_FormObject* form_object = object->AsForm()) {
+      if (CPDF_FormObject* form_object = object->AsForm()) {
         CPDF_Form* form = form_object->form();
-        if (!form || FormHas(form, kOverlayKey)) {
+        if (!form || (context_->strict && FormHas(form, kOverlayKey))) {
           continue;
         }
         if (FormHas(form, kPageCopyKey) && !page) {
@@ -602,17 +759,75 @@ class Walker {
         }
         Holder(form, form_object->form_matrix() * to_page, scope, counted,
                depth + 1);
+        continue;
+      }
+      if (page && !Before(object)) {
+        continue;
+      }
+      if (counted) {
+        Patterns(object, to_page);
+      }
+      if (CPDF_TextObject* text = object->AsText()) {
+        if (counted) {
+          const unsigned chars = TextChars(*text, to_page);
+          if (page) {
+            entry_->counts.text_chars += chars;
+          } else {
+            entry_->counts.annotation_text += chars;
+            entry_->counts.annotation_text_second +=
+                AdvanceChars(*text, to_page);
+          }
+        }
+      } else if (CPDF_ImageObject* image = object->AsImage()) {
+        if (counted && ImageCounts(*image, to_page)) {
+          ++(page ? entry_->counts.images_not_blank
+                  : entry_->counts.annotation_images);
+        }
+      } else if (CPDF_PathObject* path = object->AsPath()) {
+        if (page && (PathCrosses(*redactor_, *path, to_page) ||
+                     SamplePath(path->path(), path->matrix() * to_page,
+                                [this](const CFX_PointF& p) {
+                                  return PointInsideAny(p, entry_->second);
+                                }))) {
+          ++entry_->counts.paths;
+        }
+      } else if (CPDF_ShadingObject* shading = object->AsShading()) {
+        if (page && ShadingCrosses(*redactor_, *shading, to_page)) {
+          ++entry_->counts.paths;
+        }
       }
     }
+  }
+
+ private:
+  bool Before(const CPDF_PageObject* object) const {
+    auto it = context_->index.order.find(object);
+    return it == context_->index.order.end() || it->second < entry_->before;
   }
 
   // Text and images in the content streams of tiling patterns an object
   // paints into the regions with.
   void Patterns(CPDF_PageObject* object, const CFX_Matrix& to_page) {
-    const CPDF_ColorState& colors = object->color_state();
-    if (!colors.HasRef()) {
+    CFX_FloatRect box = to_page.TransformRect(object->GetRect());
+    box.Normalize();
+    if (!RectMeetsAnyBBox(box, entry_->regions)) {
       return;
     }
+    std::set<const CPDF_Object*> chain;
+    entry_->counts.pattern_content += PatternsOf(object, &chain, 0);
+  }
+
+  // The characters and images inside the tiling patterns |object| paints
+  // with, following patterns those paint with in turn. |chain| holds the
+  // patterns being read, so a pattern that paints with itself ends.
+  unsigned PatternsOf(CPDF_PageObject* object,
+                      std::set<const CPDF_Object*>* chain,
+                      int depth) {
+    const CPDF_ColorState& colors = object->color_state();
+    if (!colors.HasRef()) {
+      return 0;
+    }
+    unsigned count = 0;
     for (const CPDF_Color* color :
          {colors.GetFillColor(), colors.GetStrokeColor()}) {
       if (!color || !color->IsPattern()) {
@@ -620,22 +835,43 @@ class Walker {
       }
       RetainPtr<CPDF_Pattern> pattern = color->GetPattern();
       CPDF_TilingPattern* tiling = pattern ? pattern->AsTilingPattern() : nullptr;
-      if (!tiling) {
-        continue;
-      }
-      CFX_FloatRect box = to_page.TransformRect(object->GetRect());
-      box.Normalize();
-      if (!RectMeetsAnyBBox(box, entry_->regions)) {
+      if (!tiling || !chain->insert(tiling->pattern_obj().Get()).second) {
         continue;
       }
       std::unique_ptr<CPDF_Form> form = tiling->Load(object);
       if (form) {
-        entry_->counts.pattern_content += PatternContent(form.get(), 0);
+        count += PatternContent(form.get(), chain, depth + 1);
       }
+      chain->erase(tiling->pattern_obj().Get());
     }
+    return count;
   }
 
- private:
+  unsigned PatternContent(CPDF_PageObjectHolder* holder,
+                          std::set<const CPDF_Object*>* chain,
+                          int depth) {
+    if (depth > kMaxDepth) {
+      context_->failed = true;
+      return 0;
+    }
+    unsigned count = 0;
+    for (auto it = holder->begin(); it != holder->end(); ++it) {
+      CPDF_PageObject* object = it->get();
+      count += PatternsOf(object, chain, depth + 1);
+      if (CPDF_TextObject* text = object->AsText()) {
+        count += static_cast<unsigned>(text->CharCount());
+      } else if (object->AsImage()) {
+        ++count;
+      } else if (CPDF_FormObject* form = object->AsForm()) {
+        if (form->form()) {
+          count += PatternContent(form->form(), chain, depth + 1);
+        }
+      }
+    }
+    return count;
+  }
+
+  // The redactor's test: each glyph's box from the font's glyph bounds.
   unsigned TextChars(CPDF_TextObject& text, const CFX_Matrix& to_page) {
     RetainPtr<CPDF_Font> font = text.GetFont();
     if (!font) {
@@ -652,16 +888,54 @@ class Walker {
           units.bottom * size / 1000.0f + item.origin_.y,
           units.right * size / 1000.0f + item.origin_.x,
           units.top * size / 1000.0f + item.origin_.y);
-      const Quad quad = {matrix.Transform(CFX_PointF(local.left, local.top)),
-                         matrix.Transform(CFX_PointF(local.right, local.top)),
-                         matrix.Transform(CFX_PointF(local.left, local.bottom)),
-                         matrix.Transform(
-                             CFX_PointF(local.right, local.bottom))};
-      if (QuadMeetsAny(quad, entry_->regions)) {
+      if (QuadMeetsAny(Transformed(local, matrix), entry_->regions)) {
         ++count;
       }
     }
     return count;
+  }
+
+  // The second test for text outside the page content: each glyph's box
+  // from its advance and the font's ascent and descent, against the shrunk
+  // regions.
+  unsigned AdvanceChars(CPDF_TextObject& text, const CFX_Matrix& to_page) {
+    RetainPtr<CPDF_Font> font = text.GetFont();
+    if (!font) {
+      return 0;
+    }
+    const float size = text.GetFontSize();
+    float ascent = font->GetTypeAscent() * size / 1000.0f;
+    float descent = font->GetTypeDescent() * size / 1000.0f;
+    if (!(ascent > descent)) {
+      ascent = size;
+      descent = 0;
+    }
+    const CFX_Matrix matrix = text.GetTextMatrix() * to_page;
+    unsigned count = 0;
+    for (size_t i = 0; i < text.CharCount(); ++i) {
+      const CPDF_TextObject::Item item = text.GetItemInfo(i);
+      if (item.char_code_ == CPDF_Font::kInvalidCharCode) {
+        continue;
+      }
+      float width = text.GetCharWidth(item.char_code_);
+      if (!(width > 0)) {
+        width = size / 2;
+      }
+      const CFX_FloatRect local(item.origin_.x, item.origin_.y + descent,
+                                item.origin_.x + width,
+                                item.origin_.y + ascent);
+      if (QuadMeetsAny(Transformed(local, matrix), entry_->second)) {
+        ++count;
+      }
+    }
+    return count;
+  }
+
+  static Quad Transformed(const CFX_FloatRect& r, const CFX_Matrix& m) {
+    return {m.Transform(CFX_PointF(r.left, r.top)),
+            m.Transform(CFX_PointF(r.right, r.top)),
+            m.Transform(CFX_PointF(r.left, r.bottom)),
+            m.Transform(CFX_PointF(r.right, r.bottom))};
   }
 
   bool ImageCounts(const CPDF_ImageObject& image, const CFX_Matrix& to_page) {
@@ -671,47 +945,90 @@ class Walker {
     if (!RectMeetsAnyBBox(box, entry_->regions)) {
       return false;
     }
-    return !ImageBlank(samples_, &image, to_page, entry_->regions);
-  }
-
-  // Characters and images anywhere in a pattern's content.
-  unsigned PatternContent(CPDF_PageObjectHolder* holder, int depth) {
-    if (depth > kMaxDepth) {
-      *failed_ = true;
-      return 0;
-    }
-    unsigned count = 0;
-    for (auto it = holder->begin(); it != holder->end(); ++it) {
-      CPDF_PageObject* object = it->get();
-      if (CPDF_TextObject* text = object->AsText()) {
-        count += static_cast<unsigned>(text->CharCount());
-      } else if (object->AsImage()) {
-        ++count;
-      } else if (CPDF_FormObject* form = object->AsForm()) {
-        if (form->form()) {
-          count += PatternContent(form->form(), depth + 1);
-        }
-      }
-    }
-    return count;
+    return !ImageBlank(&context_->samples, &image, to_page, entry_->regions);
   }
 
   Entry* const entry_;
   const CPDF_PathRedactor* const redactor_;
-  SampleCache* const samples_;
-  bool* const failed_;
+  Context* const context_;
 };
 
-// The appearance of an annotation, parsed, and the matrix that places it on
-// the page, as CPDF_Annot draws it. nullptr when it has none.
+// The second test for page text: the boxes PDFium's text extraction gives
+// each character (its tight and loose boxes together), against the shrunk
+// regions. Text extraction reads the page content and its forms.
+unsigned ExtractedChars(Context* context, const Entry& entry) {
+  if (!context->text_page) {
+    context->text_page = std::make_unique<CPDF_TextPage>(context->page, false);
+  }
+  const CPDF_TextPage& text_page = *context->text_page;
+  const PageIndex& index = context->index;
+  unsigned count = 0;
+  for (int i = 0; i < text_page.CountChars(); ++i) {
+    const CPDF_TextPage::CharInfo& info = text_page.GetCharInfo(i);
+    if (info.char_type() == CPDF_TextPage::CharType::kGenerated) {
+      continue;
+    }
+    if (const CPDF_TextObject* object = info.text_object()) {
+      if (context->strict && index.in_overlay.count(object)) {
+        continue;
+      }
+      auto it = index.order.find(object);
+      if (it != index.order.end() && it->second >= entry.before) {
+        continue;
+      }
+    }
+    CFX_FloatRect box = info.char_box();
+    box.Normalize();
+    CFX_FloatRect loose = info.loose_char_box();
+    loose.Normalize();
+    if (box.IsEmpty()) {
+      box = loose;
+    } else if (!loose.IsEmpty()) {
+      box.Union(loose);
+    }
+    if (!box.IsEmpty() && QuadMeetsAny(QuadFromRect(box), entry.second)) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+// The streams of an annotation's appearances: every state of /N, /D and /R.
+std::vector<RetainPtr<CPDF_Stream>> AppearanceStreams(
+    const CPDF_Dictionary* annot) {
+  std::vector<RetainPtr<CPDF_Stream>> streams;
+  RetainPtr<const CPDF_Dictionary> ap = annot->GetDictFor("AP");
+  if (!ap) {
+    return streams;
+  }
+  for (const char* mode : {"N", "D", "R"}) {
+    RetainPtr<const CPDF_Object> entry = ap->GetDirectObjectFor(mode);
+    if (!entry) {
+      continue;
+    }
+    if (const CPDF_Stream* stream = entry->AsStream()) {
+      streams.push_back(pdfium::WrapRetain(const_cast<CPDF_Stream*>(stream)));
+    } else if (const CPDF_Dictionary* states = entry->AsDictionary()) {
+      CPDF_DictionaryLocker locker(states);
+      for (const auto& [name, value] : locker) {
+        RetainPtr<const CPDF_Stream> stream = ToStream(value->GetDirect());
+        if (stream) {
+          streams.push_back(
+              pdfium::WrapRetain(const_cast<CPDF_Stream*>(stream.Get())));
+        }
+      }
+    }
+  }
+  return streams;
+}
+
+// An appearance stream, parsed, and the matrix that places it on the page,
+// as CPDF_Annot draws it.
 std::unique_ptr<CPDF_Form> Appearance(CPDF_Page* page,
                                       const CPDF_Dictionary* annot,
+                                      RetainPtr<CPDF_Stream> stream,
                                       CFX_Matrix* to_page) {
-  RetainPtr<CPDF_Stream> stream =
-      GetAnnotAP(annot, CPDF_Annot::AppearanceMode::kNormal);
-  if (!stream) {
-    return nullptr;
-  }
+  // The form only reads the stream; it takes a mutable one for its type.
   auto form = std::make_unique<CPDF_Form>(
       page->GetDocument(), page->GetMutableResources(), std::move(stream));
   form->ParseContent();
@@ -756,24 +1073,26 @@ std::vector<RedactRegion> RegionsOfRedact(const CPDF_Dictionary* annot) {
   return regions;
 }
 
-Entry BoxEntry(const char* kind, const CFX_FloatRect& box) {
+Entry BoxEntry(const char* kind, const CFX_FloatRect& box, size_t before) {
   Entry entry;
   entry.kind = kind;
   entry.rect = box;
+  entry.before = before;
   RedactRegion region;
   region.bbox = box;
   entry.regions.push_back(region);
   return entry;
 }
 
-// Filled boxes in content, forms included, overlays left out.
+// Filled boxes in the content, forms included. Overlay tags are not trusted
+// here: a file could hide content behind one.
 void FindBoxes(CPDF_PageObjectHolder* holder,
                const CFX_Matrix& to_page,
                int depth,
-               std::vector<Entry>* entries,
-               bool* failed) {
+               Context* context,
+               std::vector<Entry>* entries) {
   if (depth > kMaxDepth) {
-    *failed = true;
+    context->failed = true;
     return;
   }
   for (auto it = holder->begin(); it != holder->end(); ++it) {
@@ -787,15 +1106,15 @@ void FindBoxes(CPDF_PageObjectHolder* holder,
       std::optional<float> luminance = Luminance(*path);
       if (luminance.has_value() &&
           (*luminance < kBoxDarkBelow || *luminance > kBoxLightAbove)) {
-        Entry entry = BoxEntry("filled-box", *box);
+        Entry entry =
+            BoxEntry("filled-box", *box, context->index.order[object]);
         entry.own_object = path;
         entries->push_back(std::move(entry));
       }
     } else if (CPDF_FormObject* form_object = object->AsForm()) {
-      CPDF_Form* form = form_object->form();
-      if (form && !FormHas(form, kOverlayKey)) {
+      if (CPDF_Form* form = form_object->form()) {
         FindBoxes(form, form_object->form_matrix() * to_page, depth + 1,
-                  entries, failed);
+                  context, entries);
       }
     }
   }
@@ -807,16 +1126,24 @@ std::optional<CFX_FloatRect> AnnotationBox(CPDF_Page* page,
   if (annot->KeyExist("CA") && annot->GetFloatFor("CA") < 1.0f) {
     return std::nullopt;
   }
+  RetainPtr<CPDF_Stream> stream =
+      GetAnnotAP(annot, CPDF_Annot::AppearanceMode::kNormal);
+  if (!stream) {
+    return std::nullopt;
+  }
   CFX_Matrix to_page;
-  std::unique_ptr<CPDF_Form> form = Appearance(page, annot, &to_page);
-  if (!form || form->GetPageObjectCount() != 1) {
+  std::unique_ptr<CPDF_Form> form =
+      Appearance(page, annot, std::move(stream), &to_page);
+  if (form->GetPageObjectCount() != 1) {
     return std::nullopt;
   }
   CPDF_PathObject* path = form->GetPageObjectByIndex(0)->AsPath();
   return path ? OpaqueFilledBox(*path, to_page) : std::nullopt;
 }
 
-std::vector<Entry> FindCandidates(CPDF_Page* page, bool* failed) {
+std::vector<Entry> FindCandidates(Context* context) {
+  CPDF_Page* page = context->page;
+  const size_t content = context->index.content_count;
   std::vector<Entry> entries;
   RetainPtr<const CPDF_Array> annots = page->GetAnnotsArray();
   for (size_t i = 0; annots && i < annots->size(); ++i) {
@@ -834,10 +1161,11 @@ std::vector<Entry> FindCandidates(CPDF_Page* page, bool* failed) {
     for (const RedactRegion& region : entry.regions) {
       entry.rect.Union(region.bbox);
     }
+    entry.before = content + i;
     entry.own_annot = annot.Get();
     entries.push_back(std::move(entry));
   }
-  FindBoxes(page, CFX_Matrix(), 0, &entries, failed);
+  FindBoxes(page, CFX_Matrix(), 0, context, &entries);
   for (size_t i = 0; annots && i < annots->size(); ++i) {
     RetainPtr<const CPDF_Dictionary> annot = annots->GetDictAt(i);
     const ByteString subtype = annot ? annot->GetNameFor("Subtype") : "";
@@ -846,7 +1174,7 @@ std::vector<Entry> FindCandidates(CPDF_Page* page, bool* failed) {
     }
     std::optional<CFX_FloatRect> box = AnnotationBox(page, annot.Get());
     if (box.has_value()) {
-      Entry entry = BoxEntry("annotation-box", *box);
+      Entry entry = BoxEntry("annotation-box", *box, content + i);
       entry.own_annot = annot.Get();
       entries.push_back(std::move(entry));
     }
@@ -854,26 +1182,32 @@ std::vector<Entry> FindCandidates(CPDF_Page* page, bool* failed) {
   return entries;
 }
 
-// Fills in |entry|'s counts. Sets |failed| when it could not look everywhere.
-void Inspect(CPDF_Page* page,
-             Entry* entry,
-             SampleCache* samples,
-             bool* failed) {
+// Fills in |entry|'s counts. Sets the context's |failed| when it could not
+// look everywhere.
+void Inspect(Context* context, Entry* entry) {
+  CPDF_Page* page = context->page;
   // A region too small to shrink is tested as it is.
   std::vector<RedactRegion> inset;
   for (const RedactRegion& region : entry->regions) {
-    inset.push_back(Inset(region).value_or(region));
+    inset.push_back(Inset(region, kPathInset).value_or(region));
+    entry->second.push_back(
+        Inset(region, SecondTestInset(region)).value_or(region));
   }
   auto redactor = std::make_unique<CPDF_PathRedactor>(pdfium::span(inset));
   if (!redactor->IsValid()) {
-    *failed = true;
+    context->failed = true;
     return;
   }
-  Walker walker(entry, redactor.get(), samples, failed);
+  Walker walker(entry, redactor.get(), context);
   walker.Holder(page, CFX_Matrix(), Scope::kPage, true, 0);
+  entry->counts.text_chars_second = ExtractedChars(context, *entry);
 
+  const size_t content = context->index.content_count;
   RetainPtr<const CPDF_Array> annots = page->GetAnnotsArray();
   for (size_t i = 0; annots && i < annots->size(); ++i) {
+    if (content + i >= entry->before) {
+      break;
+    }
     RetainPtr<const CPDF_Dictionary> annot = annots->GetDictAt(i);
     if (!annot || annot.Get() == entry->own_annot) {
       continue;
@@ -882,19 +1216,24 @@ void Inspect(CPDF_Page* page,
     if (subtype == "Redact" || subtype == "Popup") {
       continue;
     }
-    CFX_Matrix to_page;
-    std::unique_ptr<CPDF_Form> form = Appearance(page, annot.Get(), &to_page);
-    if (!form) {
-      continue;
-    }
     CFX_FloatRect rect = annot->GetRectFor("Rect");
     bool counted = false;
     for (const RedactRegion& region : entry->regions) {
       counted |= RedactRegionIntersectsRect(region, rect);
     }
-    // Walked either way, for the page copies inside.
-    walker.Holder(form.get(), to_page, Scope::kAnnotation, counted, 0);
+    for (RetainPtr<CPDF_Stream>& stream : AppearanceStreams(annot.Get())) {
+      CFX_Matrix to_page;
+      std::unique_ptr<CPDF_Form> form =
+          Appearance(page, annot.Get(), std::move(stream), &to_page);
+      // Walked either way, for the page copies inside.
+      walker.Holder(form.get(), to_page, Scope::kAnnotation, counted, 0);
+    }
   }
+  // A region counts content when either test finds it.
+  Counts& counts = entry->counts;
+  counts.text_chars = std::max(counts.text_chars, counts.text_chars_second);
+  counts.annotation_text =
+      std::max(counts.annotation_text, counts.annotation_text_second);
 }
 
 // -- Reports -----------------------------------------------------------------
@@ -1046,16 +1385,15 @@ char* INK_Inspect_Page(FPDF_DOCUMENT doc,
   std::string report;
   {
     ScopedFPDFPageView view(handle);
-    CPDF_Page* page = view.Get();
-    bool failed = false;
+    Context context(view.Get(), /*strict=*/count > 0);
+    IndexHolder(context.page, false, 0, &context);
     if (count == 0) {
-      entries = FindCandidates(page, &failed);
+      entries = FindCandidates(&context);
     }
-    SampleCache samples(page->GetDocument());
     for (Entry& entry : entries) {
-      Inspect(page, &entry, &samples, &failed);
+      Inspect(&context, &entry);
     }
-    if (!failed) {
+    if (!context.failed) {
       report = PageReport(entries);
     }
   }
