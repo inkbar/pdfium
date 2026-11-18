@@ -36,6 +36,8 @@ namespace {
 
 constexpr char kDataKey[] = "INKB_Gloss";
 constexpr char kOverlayKey[] = "INKB_Overlay";
+// Quads of 8 floats a buffer may hold: 2^29 of them would wrap a 32-bit size.
+constexpr int kMaxQuads = 1 << 29;
 
 bool IsRedact(const CPDF_Dictionary* dict) {
   return dict && dict->GetNameFor("Subtype") == "Redact";
@@ -217,7 +219,7 @@ int INK_Redact_OwnLockedQuads(FPDF_DOCUMENT doc,
   ScopedFPDFDocumentView view(doc);
   CPDF_Page* pdf_page = CPDFPageFromFPDFPage(page);
   if (!view.Get() || !pdf_page || pdf_page->GetDocument() != view.Get() ||
-      capacity < 0 || (capacity > 0 && !out)) {
+      capacity < 0 || capacity >= kMaxQuads || (capacity > 0 && !out)) {
     return -1;
   }
   // SAFETY: the caller passes room for |capacity| quads of 8 floats at |out|.

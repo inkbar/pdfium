@@ -901,6 +901,8 @@ function nestedFormsPdf(levels) {
     const quads = [...m.HEAPF32.slice(out / 4, out / 4 + 24)]
     assert.deepEqual(quads, [...quadOf([45, 95, 100, 125]), ...quadOf([110, 95, 230, 125]), ...quadOf([10, 20, 30, 40])])
     assert.equal(m._INK_Redact_OwnLockedQuads(doc, page, out, 1), 3, 'a short buffer still gets the total')
+    // 2^29 + 1 quads of 8 floats would wrap a 32-bit size.
+    assert.equal(m._INK_Redact_OwnLockedQuads(doc, page, out, 2 ** 29 + 1), -1, 'a capacity past 2^29 quads')
     assert.deepEqual([...m.HEAPF32.slice(out / 4, out / 4 + 8)], quadOf([45, 95, 100, 125]))
     m._free(out)
     ;[twoQuads, foreign, rectOnly].forEach((a) => m._FPDFPage_CloseAnnot(a))

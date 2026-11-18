@@ -49,7 +49,8 @@ int INK_Redact_ApplyPage(FPDF_DOCUMENT doc,
 // quad from its /Rect (quads that are not finite or empty fall back to the
 // /Rect, as the apply does). Writes at most |capacity| quads to |out| (which
 // may be NULL when |capacity| is 0) and returns the total number of quads, so
-// a caller can size a buffer and call again. Returns -1 on failure. Call it
+// a caller can size a buffer and call again. Returns -1 on failure, and for
+// a |capacity| of 2^29 quads or more. Call it
 // before INK_Redact_ApplyPage, which removes the marks.
 int INK_Redact_OwnLockedQuads(FPDF_DOCUMENT doc,
                               FPDF_PAGE page,
