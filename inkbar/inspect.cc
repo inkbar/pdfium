@@ -88,10 +88,13 @@ constexpr int kLossyEdge = 8;
 constexpr float kBoxMinSize = 4.0f;
 constexpr float kBoxDarkBelow = 0.2f;
 constexpr float kBoxLightAbove = 0.98f;
-// Nesting deeper than this fails the inspection rather than going unread.
-// PDFium's content parser stops at 40 nested forms (kMaxFormLevel), so a
-// parsed page never reaches it.
-constexpr int kMaxDepth = 64;
+// PDFium's content parser leaves a form nested deeper than this unparsed and
+// empty (kMaxFormLevel in cpdf_streamcontentparser.cpp), though another
+// viewer may draw it. Meeting one fails the inspection.
+constexpr int kFormLevelLimit = 40;
+// Patterns painted with patterns, more deeply nested than this, fail the
+// inspection rather than going unread.
+constexpr int kMaxPatternChain = 64;
 
 // -- Geometry, as cpdf_text_redactor.cpp tests glyphs ------------------------
 
@@ -640,7 +643,7 @@ void IndexHolder(CPDF_PageObjectHolder* holder,
                  bool overlay,
                  int depth,
                  Context* context) {
-  if (depth > kMaxDepth) {
+  if (depth > kFormLevelLimit) {
     context->failed = true;
     return;
   }
@@ -753,7 +756,7 @@ class Walker {
               Scope scope,
               bool counted,
               int depth) {
-    if (depth > kMaxDepth) {
+    if (depth > kFormLevelLimit) {
       context_->failed = true;
       return;
     }
@@ -832,15 +835,14 @@ class Walker {
       return;
     }
     std::set<const CPDF_Object*> chain;
-    entry_->counts.pattern_content += PatternsOf(object, &chain, 0);
+    entry_->counts.pattern_content += PatternsOf(object, &chain);
   }
 
   // The characters and images inside the tiling patterns |object| paints
   // with, following patterns those paint with in turn. |chain| holds the
   // patterns being read, so a pattern that paints with itself ends.
   unsigned PatternsOf(CPDF_PageObject* object,
-                      std::set<const CPDF_Object*>* chain,
-                      int depth) {
+                      std::set<const CPDF_Object*>* chain) {
     const CPDF_ColorState& colors = object->color_state();
     if (!colors.HasRef()) {
       return 0;
@@ -853,12 +855,18 @@ class Walker {
       }
       RetainPtr<CPDF_Pattern> pattern = color->GetPattern();
       CPDF_TilingPattern* tiling = pattern ? pattern->AsTilingPattern() : nullptr;
-      if (!tiling || !chain->insert(tiling->pattern_obj().Get()).second) {
+      if (!tiling || chain->count(tiling->pattern_obj().Get())) {
         continue;
       }
+      if (chain->size() >= kMaxPatternChain) {
+        context_->failed = true;
+        return count;
+      }
+      chain->insert(tiling->pattern_obj().Get());
+      // A pattern's content is parsed on its own, from level 0.
       std::unique_ptr<CPDF_Form> form = tiling->Load(object);
       if (form) {
-        count += PatternContent(form.get(), chain, depth + 1);
+        count += PatternContent(form.get(), chain, 0);
       }
       chain->erase(tiling->pattern_obj().Get());
     }
@@ -868,14 +876,14 @@ class Walker {
   unsigned PatternContent(CPDF_PageObjectHolder* holder,
                           std::set<const CPDF_Object*>* chain,
                           int depth) {
-    if (depth > kMaxDepth) {
+    if (depth > kFormLevelLimit) {
       context_->failed = true;
       return 0;
     }
     unsigned count = 0;
     for (auto it = holder->begin(); it != holder->end(); ++it) {
       CPDF_PageObject* object = it->get();
-      count += PatternsOf(object, chain, depth + 1);
+      count += PatternsOf(object, chain);
       if (CPDF_TextObject* text = object->AsText()) {
         count += static_cast<unsigned>(text->CharCount());
       } else if (object->AsImage()) {
@@ -1109,7 +1117,7 @@ void FindBoxes(CPDF_PageObjectHolder* holder,
                int depth,
                Context* context,
                std::vector<Entry>* entries) {
-  if (depth > kMaxDepth) {
+  if (depth > kFormLevelLimit) {
     context->failed = true;
     return;
   }

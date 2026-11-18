@@ -789,6 +789,43 @@ const SECRET_RECT = [45, 95, 230, 125]
 const BETA_RECT = [245, 95, 360, 125]
 const textContent = 'BT /F1 20 Tf 50 100 Td (SECRET-ALPHA) Tj 200 0 Td (KEEP-BETA) Tj ET'
 
+// The raw pointer INK_Inspect_Page returns for |quads|, freed; 0 for NULL.
+function inspectPointer(doc, index, quads, count = quads.length) {
+  const ptr = quads ? m._malloc(Math.max(quads.length * 32, 4)) : 0
+  if (quads) m.HEAPF32.set(quads.flat(), ptr / 4)
+  const result = m._INK_Inspect_Page(doc, index, ptr, count)
+  if (ptr) m._free(ptr)
+  if (result) m._INK_Inspect_Free(result)
+  return result
+}
+
+// One page whose text sits in forms nested |levels| deep.
+function nestedFormsPdf(levels) {
+  const forms = []
+  for (let level = 1; level <= levels; level++) {
+    const content = level < levels ? '/Fm Do' : 'BT /F1 20 Tf 50 100 Td (DEEP) Tj ET'
+    forms.push(streamObject(`/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Resources << /Font << /F1 5 0 R >> ${level < levels ? `/XObject << /Fm ${6 + level} 0 R >>` : ''} >>`, content))
+  }
+  return onePagePdf('/Fm Do', { resources: '/XObject << /Fm 6 0 R >>' }, forms)
+}
+
+// returns NULL when it cannot inspect
+{
+  withDoc(nestedFormsPdf(40), (doc) => {
+    assert.ok(inspectPage(doc, 0, [SECRET_RECT])[0].textChars > 0, 'text 40 forms deep')
+  })
+  withDoc(nestedFormsPdf(41), (doc) => {
+    assert.equal(inspectPointer(doc, 0, [quadOf(SECRET_RECT)]), 0, 'text 41 forms deep, which PDFium does not parse')
+    assert.equal(inspectPointer(doc, 0, []), 0, 'candidates over forms 41 deep')
+  })
+  withDoc(onePagePdf(textContent), (doc) => {
+    assert.equal(inspectPointer(doc, 1, [quadOf(SECRET_RECT)]), 0, 'a page out of range')
+    assert.equal(inspectPointer(doc, -1, [quadOf(SECRET_RECT)]), 0, 'a negative page index')
+    assert.equal(inspectPointer(doc, 0, [[45, 125, NaN, 125, 45, 95, 230, 95]]), 0, 'a NaN in a quad')
+    assert.equal(inspectPointer(doc, 0, null, 1), 0, 'a count with NULL quads')
+  })
+}
+
 // inspects text under a region
 {
   const source = onePagePdf(textContent)
