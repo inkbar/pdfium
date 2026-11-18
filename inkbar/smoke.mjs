@@ -1450,6 +1450,59 @@ function underAppliedMark(source) {
   assert.equal(after.paths, 0, `a shading pattern fill under the applied mark: ${JSON.stringify(after)}`)
 }
 
+// Shadings that can hold a picture. The apply clips a shading and leaves its
+// definition in the file, so a mesh or a function over the mark stays there.
+const BESIDE_MARK = [20, 20, 100, 50]
+// One Gouraud triangle (type 4) over PATTERN_MARK, 8 bits to a number.
+const meshShading = streamObject(
+  '/ShadingType 4 /ColorSpace /DeviceRGB /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 400 0 200 0 1 0 1 0 1]',
+  Buffer.from([0, 96, 77, 255, 0, 0, 0, 159, 77, 0, 255, 0, 0, 128, 179, 0, 0, 255]),
+)
+// |source| before and after PATTERN_MARK is applied: the paths under the
+// mark, and after the apply those beside it.
+function pathsAround(source) {
+  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [PATTERN_MARK]))
+  const applied = editPage(source, (doc, page) => {
+    const mark = addMark(page, PATTERN_MARK)
+    assert.equal(applyPage(doc, page, [mark], false).result, 1)
+    m._FPDFPage_CloseAnnot(mark)
+  })
+  const [after, beside] = withDoc(applied, (doc) => inspectPage(doc, 0, [PATTERN_MARK, BESIDE_MARK]))
+  return [before.paths, after.paths, beside.paths]
+}
+
+// still counts a mesh shading under a mark after the apply clipped it
+{
+  const source = onePagePdf('/Sh0 sh', { resources: '/Shading << /Sh0 6 0 R >>' }, [meshShading])
+  assert.deepEqual(pathsAround(source), [1, 1, 0], 'a mesh shading before the apply, after it, and beside the mark')
+  // The same in candidate mode, under a black box drawn over the mesh.
+  const boxed = onePagePdf('/Sh0 sh 0 g 150 60 100 80 re f', { resources: '/Shading << /Sh0 6 0 R >>' }, [meshShading])
+  const box = withDoc(boxed, (doc) => inspectPage(doc, 0, [])).find((c) => c.kind === 'filled-box')
+  assert.ok(box && box.paths > 0, `a mesh shading under a black box: ${JSON.stringify(box)}`)
+}
+
+// still counts a function-based shading under a mark after the apply
+{
+  const colours = streamObject('/FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1]', '{ 2 copy add 2 div }', true)
+  // Clipped to a box a little past the mark: PDFium takes an unclipped
+  // shading to paint the whole page, and the apply removes one that lies
+  // wholly under the mark.
+  const source = onePagePdf('q 120 50 160 100 re W n /Sh0 sh Q', {
+    resources: '/Shading << /Sh0 << /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] /Matrix [100 0 0 80 150 60] /Function 6 0 R >> >>',
+  }, [colours])
+  assert.deepEqual(pathsAround(source), [1, 1, 0], 'a function-based shading before the apply, after it, and beside the mark')
+}
+
+// still counts a path filled with a mesh shading pattern after the apply cut it
+{
+  const source = onePagePdf('q /Pattern cs /P0 scn 20 50 360 100 re f Q', {
+    resources: '/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading 6 0 R >> >>',
+  }, [meshShading])
+  const [before, after, beside] = pathsAround(source)
+  assert.ok(before > 0 && after > 0, `a mesh pattern fill before the apply (${before}) and after it (${after})`)
+  assert.equal(beside, 0, 'a mesh pattern fill beside the mark')
+}
+
 // a region too small to shrink still counts the path under it
 {
   const source = onePagePdf('0 0 1 rg 50 50 100 100 re f')

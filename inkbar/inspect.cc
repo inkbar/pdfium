@@ -41,12 +41,14 @@
 #include "core/fpdfapi/page/cpdf_generalstate.h"
 #include "core/fpdfapi/page/cpdf_image.h"
 #include "core/fpdfapi/page/cpdf_imageobject.h"
+#include "core/fpdfapi/page/cpdf_meshstream.h"
 #include "core/fpdfapi/page/cpdf_page.h"
 #include "core/fpdfapi/page/cpdf_pageobject.h"
 #include "core/fpdfapi/page/cpdf_path.h"
 #include "core/fpdfapi/page/cpdf_pathobject.h"
 #include "core/fpdfapi/page/cpdf_pattern.h"
 #include "core/fpdfapi/page/cpdf_shadingobject.h"
+#include "core/fpdfapi/page/cpdf_shadingpattern.h"
 #include "core/fpdfapi/page/cpdf_textobject.h"
 #include "core/fpdfapi/page/cpdf_tilingpattern.h"
 #include "core/fpdfapi/parser/cpdf_array.h"
@@ -1035,6 +1037,128 @@ bool Invertible(const CFX_Matrix& m) {
          Finite(m.GetInverse());
 }
 
+// -- Shadings that can hold a picture ----------------------------------------
+//
+// An axial or radial shading is a colour ramp, and the part of it an apply
+// leaves in view shows all of it. A mesh (types 4 to 7) or a function over a
+// plane (type 1) can hold any picture, and the apply only clips a shading or
+// cuts the path it fills: the definition stays in the file.
+
+struct OwnBox {
+  // False when the shading's geometry cannot be read.
+  bool known = false;
+  // Outside this, in the shading's own space, it paints nothing.
+  CFX_FloatRect box;
+};
+
+// The bounds of a mesh's points: its vertices, or its patches' control
+// points, which hold the patches. Nullopt when the mesh cannot be read to
+// its end or |work| runs out.
+std::optional<CFX_FloatRect> MeshBounds(const CPDF_ShadingPattern& pattern,
+                                        Work* work) {
+  const ShadingType type = pattern.GetShadingType();
+  RetainPtr<const CPDF_Stream> data = ToStream(pattern.GetShadingObject());
+  RetainPtr<CPDF_ColorSpace> colours = pattern.GetCS();
+  if (!data || !colours) {
+    return std::nullopt;
+  }
+  CPDF_MeshStream stream(type, pattern.GetFuncs(), std::move(data),
+                         std::move(colours));
+  if (!stream.Load()) {
+    return std::nullopt;
+  }
+  const bool patches = type == kCoonsPatchMeshShading ||
+                       type == kTensorProductPatchMeshShading;
+  const bool lattice = type == kLatticeFormGouraudTriangleMeshShading;
+  std::optional<CFX_FloatRect> bounds;
+  while (!stream.IsEOF()) {
+    uint32_t flag = 0;
+    if (!lattice) {
+      if (!stream.CanReadFlag()) {
+        break;
+      }
+      flag = stream.ReadFlag();
+    }
+    // A patch that shares an edge with the one before brings four points
+    // and two colours fewer.
+    int points = 1;
+    uint32_t colour_count = 1;
+    if (patches) {
+      points = type == kTensorProductPatchMeshShading ? 16 : 12;
+      colour_count = 4;
+      if (flag) {
+        points -= 4;
+        colour_count -= 2;
+      }
+    }
+    if (!work->Spend(points)) {
+      return std::nullopt;
+    }
+    for (int i = 0; i < points; ++i) {
+      if (!stream.CanReadCoords()) {
+        return std::nullopt;
+      }
+      const CFX_PointF point = stream.ReadCoords();
+      if (!Finite(point)) {
+        return std::nullopt;
+      }
+      if (bounds.has_value()) {
+        bounds->UpdateRect(point);
+      } else {
+        bounds = CFX_FloatRect(point);
+      }
+    }
+    const uint64_t bits = static_cast<uint64_t>(stream.Components()) *
+                          stream.ComponentBits() * colour_count;
+    if (bits > UINT32_MAX) {
+      return std::nullopt;
+    }
+    stream.SkipBits(static_cast<uint32_t>(bits));
+    if (!patches) {
+      stream.ByteAlign();
+    }
+  }
+  // A mesh with no points paints nothing.
+  return bounds.value_or(CFX_FloatRect());
+}
+
+// Where a shading of type 1 or 4 to 7 can paint, clips aside: its /BBox,
+// and its mesh's bounds or its domain under its matrix.
+OwnBox ShadingOwnBox(const CPDF_ShadingPattern& pattern, Work* work) {
+  RetainPtr<const CPDF_Object> object = pattern.GetShadingObject();
+  RetainPtr<const CPDF_Dictionary> dict = object ? object->GetDict() : nullptr;
+  if (!dict) {
+    return {};
+  }
+  std::optional<CFX_FloatRect> bounds;
+  if (pattern.IsMeshShading()) {
+    bounds = MeshBounds(pattern, work);
+  } else if (pattern.GetShadingType() == kFunctionBasedShading) {
+    CFX_FloatRect domain(0, 0, 1, 1);
+    RetainPtr<const CPDF_Array> array = dict->GetArrayFor("Domain");
+    if (array && array->size() >= 4) {
+      domain = CFX_FloatRect(array->GetFloatAt(0), array->GetFloatAt(2),
+                             array->GetFloatAt(1), array->GetFloatAt(3));
+      domain.Normalize();
+    }
+    bounds = dict->GetMatrixFor("Matrix").TransformRect(domain);
+  }
+  std::optional<CFX_FloatRect> box;
+  if (dict->KeyExist("BBox")) {
+    box = dict->GetRectFor("BBox");
+    box->Normalize();
+  }
+  if (bounds.has_value() && box.has_value()) {
+    box->Intersect(*bounds);
+  } else if (bounds.has_value()) {
+    box = bounds;
+  }
+  if (!box.has_value() || !Finite(*box)) {
+    return {};
+  }
+  return {true, *box};
+}
+
 // The second test for a shading: points sampled at most 1 pt apart inside
 // the shrunk regions, each tested against the shading's box and every clip
 // path with its fill rule (the nonzero winding rule, or the even-odd rule).
@@ -1303,6 +1427,8 @@ struct Entry {
   std::vector<RedactRegion> regions;
   // The regions shrunk for the second, independent tests.
   std::vector<RedactRegion> second;
+  // The regions shrunk as the path redactor's are.
+  std::vector<RedactRegion> inset;
   // Only content painted before this position counts (PageIndex order):
   // everything for a region, what lies under it for a candidate.
   size_t before = SIZE_MAX;
@@ -1338,6 +1464,8 @@ struct Context {
   std::vector<CFX_FloatRect> given;
   // The page's box in user space.
   CFX_FloatRect page_box;
+  // Where each shading read so far can paint, by its shading object.
+  std::map<const CPDF_Object*, OwnBox> shading_boxes;
   bool failed = false;
   // What the sampling tests may still do. Once spent, the inspection fails.
   Work work;
@@ -1566,6 +1694,9 @@ class Walker {
       if (counted) {
         Patterns(object, to_page, page);
       }
+      if (page && PictureShadingPattern(object, to_page)) {
+        ++entry_->counts.paths;
+      }
       if (CPDF_TextObject* text = object->AsText()) {
         if (counted) {
           const unsigned chars = TextChars(*text, to_page);
@@ -1588,7 +1719,9 @@ class Walker {
           ++entry_->counts.paths;
         }
       } else if (CPDF_ShadingObject* shading = object->AsShading()) {
-        if (page && ShadingCounts(*shading, to_page)) {
+        if (page && (PictureShading(shading->pattern(),
+                                    shading->matrix() * to_page) ||
+                     ShadingCounts(*shading, to_page))) {
           ++entry_->counts.paths;
         }
       }
@@ -1677,6 +1810,70 @@ class Walker {
     if (page && PatternDrawing(object, to_page, false, &chain)) {
       ++entry_->counts.paths;
     }
+  }
+
+  // Whether a shading that can hold a picture (type 1 or 4 to 7; any type
+  // but axial and radial, to fail closed) lies under the regions: its own
+  // box, placed by |to_page| from the shading's space, meets one. Clips do
+  // not count, since the apply's own clip would hide what it left in the
+  // file. True when the shading's geometry cannot be read.
+  bool PictureShading(const CPDF_ShadingPattern* pattern,
+                      const CFX_Matrix& to_page) {
+    if (!pattern) {
+      return true;
+    }
+    const ShadingType type = pattern->GetShadingType();
+    if (type == kAxialShading || type == kRadialShading) {
+      return false;
+    }
+    RetainPtr<const CPDF_Object> key = pattern->GetShadingObject();
+    auto it = context_->shading_boxes.find(key.Get());
+    if (it == context_->shading_boxes.end()) {
+      const OwnBox own = ShadingOwnBox(*pattern, &context_->work);
+      if (context_->work.spent) {
+        return true;
+      }
+      it = context_->shading_boxes.emplace(key.Get(), own).first;
+    }
+    const OwnBox& own = it->second;
+    if (!own.known) {
+      return true;
+    }
+    if (!(own.box.Width() > 0) || !(own.box.Height() > 0)) {
+      return false;
+    }
+    CFX_FloatRect box = to_page.TransformRect(own.box);
+    box.Normalize();
+    return !Finite(box) || RectMeetsAnyBBox(box, entry_->inset);
+  }
+
+  // Whether |object| paints with a shading pattern that can hold a picture
+  // under the regions. The object's own box is not asked: an apply may have
+  // cut the object back to where it no longer meets the mark.
+  bool PictureShadingPattern(CPDF_PageObject* object,
+                             const CFX_Matrix& to_page) {
+    const CPDF_ColorState& colors = object->color_state();
+    if (!colors.HasRef()) {
+      return false;
+    }
+    for (bool stroke : {false, true}) {
+      const CPDF_Color* color =
+          stroke ? colors.GetStrokeColor() : colors.GetFillColor();
+      if (!color || !color->IsPattern() || !Paints(object, stroke)) {
+        continue;
+      }
+      RetainPtr<CPDF_Pattern> pattern = color->GetPattern();
+      CPDF_ShadingPattern* shading =
+          pattern ? pattern->AsShadingPattern() : nullptr;
+      if (!shading) {
+        continue;
+      }
+      if (!shading->Load() ||
+          PictureShading(shading, shading->pattern_to_form() * to_page)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   // Whether |object| paints with its fill colour, or with its stroke colour.
@@ -1922,7 +2119,8 @@ class Walker {
       if (!RectMeetsAnyBBox(box, entry_->regions)) {
         continue;
       }
-      if (PatternDrawing(object, to_page, true, chain)) {
+      if (PatternDrawing(object, to_page, true, chain) ||
+          PictureShadingPattern(object, to_page)) {
         return true;
       }
       if (CPDF_PathObject* path = object->AsPath()) {
@@ -1931,7 +2129,9 @@ class Walker {
           return true;
         }
       } else if (CPDF_ShadingObject* shading = object->AsShading()) {
-        if (ShadingCounts(*shading, to_page)) {
+        if (PictureShading(shading->pattern(),
+                           shading->matrix() * to_page) ||
+            ShadingCounts(*shading, to_page)) {
           return true;
         }
       }
@@ -2478,7 +2678,7 @@ void Inspect(Context* context, Entry* entry) {
     return;
   }
   // A region too small to shrink is tested as it is.
-  std::vector<RedactRegion> inset;
+  std::vector<RedactRegion>& inset = entry->inset;
   for (const RedactRegion& region : entry->regions) {
     inset.push_back(Inset(region, kPathInset).value_or(region));
     entry->second.push_back(
