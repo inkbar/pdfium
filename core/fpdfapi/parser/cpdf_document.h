@@ -211,6 +211,9 @@ class CPDF_Document : public Observable,
   // a write; metadata writes reach /Info only through GetMutableInfo().
   virtual RetainPtr<CPDF_Dictionary> GetMutableInfo();
   RetainPtr<CPDF_Dictionary> GetOrCreateInfo();
+  // Inkbar: the next save writes no /Info. Reads find an empty dictionary,
+  // and nothing written to it is saved.
+  void DropInfo();
   RetainPtr<const CPDF_Array> GetFileIdentifier() const;
   // EmbedPDF(annot-appearance): the file identifier a save writes for a
   // created document (one without a parser) instead of generating one: for

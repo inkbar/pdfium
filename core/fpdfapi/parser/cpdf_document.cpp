@@ -905,6 +905,12 @@ RetainPtr<CPDF_Dictionary> CPDF_Document::GetOrCreateInfo() {
   return info_dict_;
 }
 
+// Inkbar: a direct dictionary has no object number, so the save trailer
+// names no /Info and drops the one it read (CPDF_SaveTrailer).
+void CPDF_Document::DropInfo() {
+  SetCachedInfoDict(pdfium::MakeRetain<CPDF_Dictionary>());
+}
+
 // EmbedPDF(layer-seam, annot-appearance): a layer reads its base's parser. A
 // created document may carry a preset identifier, so a canonical stamp
 // drawing exports as the same bytes every time.

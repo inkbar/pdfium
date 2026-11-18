@@ -75,3 +75,9 @@ EPDFForm_RedrawFieldWidgets
 EPDFForm_SetFieldAppearanceText
 EPDFPage_ApplyRedactions
 FPDFPage_GenerateContent
+INK_Redact_SetOverlay
+INK_Redact_ApplyPage
+INK_Sanitize
+INK_Inspect_Page
+INK_Inspect_File
+INK_Inspect_Free

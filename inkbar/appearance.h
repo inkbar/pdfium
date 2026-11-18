@@ -73,10 +73,11 @@ int INK_Appearance_AddImage(INK_APPEARANCE* a,
                             size_t len);
 
 // /Resources /XObject /<name>: a Form XObject of the page's content and
-// resources, with the page box as /BBox. The document holds one per page,
-// shared by every appearance that names it. It is a copy of the page as it was
-// at the first INK_Appearance_AddPage for that page in that document, and does
-// not follow later changes to the page.
+// resources, with the page box as /BBox and /INKB_PageCopy true, which tells
+// the redaction check to read it in the page's own coordinates. The document
+// holds one per page, shared by every appearance that names it. It is a copy
+// of the page as it was at the first INK_Appearance_AddPage for that page in
+// that document, and does not follow later changes to the page.
 int INK_Appearance_AddPage(INK_APPEARANCE* a, const char* name, int page_index);
 
 // /Resources /XObject /<name>: |child|'s stream. Takes |child| whether or not
@@ -103,6 +104,20 @@ int INK_Annot_SetData(FPDF_ANNOTATION annot,
 
 #ifdef __cplusplus
 }  // extern "C"
+#endif
+
+#ifdef __cplusplus
+#include "core/fxcrt/retain_ptr.h"
+
+class CPDF_Document;
+class CPDF_Stream;
+
+// For Inkbar's other C++ files: the document and the not yet installed stream
+// of an appearance. NULL for a NULL appearance.
+namespace inkbar {
+CPDF_Document* AppearanceDocument(const INK_APPEARANCE* a);
+RetainPtr<CPDF_Stream> AppearanceStream(const INK_APPEARANCE* a);
+}  // namespace inkbar
 #endif
 
 #endif  // INKBAR_APPEARANCE_H_

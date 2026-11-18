@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 77)
+assert.equal(names.length, 83)
 
 const m = await createModule()
 for (const name of names) {
@@ -239,6 +239,7 @@ assert.equal(streamFor(saved, 'INKB_Gloss').toString('latin1'), '{"v":1}')
 // Helvetica twice and Times-Roman once add two fonts; page 0 twice adds one form.
 assert.equal(count(saved, '/WinAnsiEncoding') - count(plain, '/WinAnsiEncoding'), 2, 'one font object per base font')
 assert.equal(count(saved, '/FormType') - count(plain, '/FormType'), 1, 'one Form XObject per page')
+assert.equal(count(saved, '/INKB_PageCopy true'), 1, 'the page form is not tagged as a page copy')
 assert.ok(savedText.includes('/SMask'), 'saved bytes lack the PNG /SMask')
 assert.doesNotMatch(savedText, AS_KEY, 'installing the appearance left /AS')
 
@@ -650,12 +651,422 @@ for (const word of ['SECRET', 'ALPHA']) {
 }
 assert.ok(!redactAfter.includes('/Redact'), 'the redact annotation survived')
 
+// The redaction wrapper, the sanitiser and the inspector.
+
+// A PDF of |bodies|, object n at bodies[n - 1], with /Root 1 0 R and |trailer|
+// added to the trailer dictionary.
+function buildPdf(bodies, trailer = '') {
+  const parts = [Buffer.from('%PDF-1.7\n')]
+  const offsets = []
+  let length = parts[0].length
+  bodies.forEach((body, i) => {
+    offsets.push(length)
+    const piece = Buffer.concat([Buffer.from(`${i + 1} 0 obj\n`), Buffer.from(body, 'latin1'), Buffer.from('\nendobj\n')])
+    parts.push(piece)
+    length += piece.length
+  })
+  const xref = [`xref\n0 ${bodies.length + 1}\n`, '0000000000 65535 f \n']
+  for (const offset of offsets) xref.push(`${String(offset).padStart(10, '0')} 00000 n \n`)
+  xref.push(`trailer\n<< /Size ${bodies.length + 1} /Root 1 0 R ${trailer} >>\nstartxref\n${length}\n%%EOF\n`)
+  parts.push(Buffer.from(xref.join('')))
+  return Buffer.concat(parts)
+}
+
+// A stream object: |dict| entries, |data| Flate-compressed unless |plain|.
+function streamObject(dict, data, plain = false) {
+  const raw = Buffer.isBuffer(data) ? data : Buffer.from(data, 'latin1')
+  const body = plain ? raw : deflateSync(raw)
+  return Buffer.concat([
+    Buffer.from(`<< ${dict} /Length ${body.length}${plain ? '' : ' /Filter /FlateDecode'} >>\nstream\n`),
+    body,
+    Buffer.from('\nendstream'),
+  ])
+}
+
+// One 400 x 200 pt page drawing |content| with Helvetica as /F1. Objects 1 to
+// 5 are the catalog, the page tree, the page, its content and the font;
+// |extra| objects follow from 6.
+function onePagePdf(content, { resources = '', catalog = '', page = '', trailer = '' } = {}, extra = []) {
+  return buildPdf(
+    [
+      `<< /Type /Catalog /Pages 2 0 R ${catalog} >>`,
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> ${resources} >> ${page} >>`,
+      streamObject('', content),
+      '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+      ...extra,
+    ],
+    trailer,
+  )
+}
+
+// [left, bottom, right, top] as a quad: x1 y1 (upper left) to x4 y4 (lower right).
+const quadOf = ([l, b, r, t]) => [l, t, r, t, l, b, r, b]
+
+function report(ptr) {
+  assert.notEqual(ptr, 0, 'no report')
+  let end = ptr
+  while (m.HEAPU8[end]) end++
+  const text = Buffer.from(m.HEAPU8.slice(ptr, end)).toString('utf8')
+  m._INK_Inspect_Free(ptr)
+  return JSON.parse(text)
+}
+
+// The inspector's regions for |rects| on page |index|, or its candidates when
+// |rects| is empty.
+function inspectPage(doc, index, rects) {
+  const ptr = m._malloc(Math.max(rects.length * 32, 4))
+  m.HEAPF32.set(rects.flatMap(quadOf), ptr / 4)
+  const result = report(m._INK_Inspect_Page(doc, index, rects.length ? ptr : 0, rects.length))
+  m._free(ptr)
+  return result.regions
+}
+
+function inspectFile(doc, bytes) {
+  const ptr = heapBytes(bytes)
+  const result = report(m._INK_Inspect_File(doc, ptr, bytes.length))
+  m._free(ptr)
+  return result
+}
+
+// A REDACT annotation over |rect| with the rect as its one quad.
+function addMark(page, [l, b, r, t]) {
+  const mark = m._FPDFPage_CreateAnnot(page, FPDF_ANNOT_REDACT)
+  assert.notEqual(mark, 0, 'no redact annotation')
+  const rectPtr = m._malloc(16)
+  m.HEAPF32.set([l, t, r, b], rectPtr / 4)
+  assert.equal(m._FPDFAnnot_SetRect(mark, rectPtr), 1)
+  m._free(rectPtr)
+  const quadPtr = m._malloc(32)
+  m.HEAPF32.set(quadOf([l, b, r, t]), quadPtr / 4)
+  assert.equal(m._FPDFAnnot_AppendAttachmentPoints(mark, quadPtr), 1)
+  m._free(quadPtr)
+  return mark
+}
+
+function setData(annot, json) {
+  const bytes = Buffer.from(json, 'latin1')
+  const ptr = heapBytes(bytes)
+  assert.equal(m._INK_Annot_SetData(annot, ptr, bytes.length), 1)
+  m._free(ptr)
+}
+
+function applyPage(doc, page, marks, ownLocked) {
+  const marksPtr = m._malloc(Math.max(marks.length * 4, 4))
+  m.HEAPU32.set(marks, marksPtr / 4)
+  const out = m._malloc(8)
+  const result = m._INK_Redact_ApplyPage(doc, page, marks.length ? marksPtr : 0, marks.length, ownLocked ? 1 : 0, out, out + 4)
+  const removed = m.HEAPU32[out / 4]
+  const left = m.HEAPU32[out / 4 + 1]
+  m._free(out)
+  m._free(marksPtr)
+  return { result, removed, left }
+}
+
+// Loads |bytes|, runs |fn(doc)|, closes the document.
+function withDoc(bytes, fn) {
+  const opened = load(bytes)
+  try {
+    return fn(opened.doc)
+  } finally {
+    m._FPDF_CloseDocument(opened.doc)
+    m._free(opened.buf)
+  }
+}
+
+// Loads |bytes|, runs |fn(doc, page)| on page 0, saves, and returns the saved bytes.
+function editPage(bytes, fn) {
+  return withDoc(bytes, (doc) => {
+    const page = m._FPDF_LoadPage(doc, 0)
+    assert.notEqual(page, 0)
+    fn(doc, page)
+    m._FPDF_ClosePage(page)
+    return save(doc)
+  })
+}
+
+const SECRET_RECT = [45, 95, 230, 125]
+const BETA_RECT = [245, 95, 360, 125]
+const textContent = 'BT /F1 20 Tf 50 100 Td (SECRET-ALPHA) Tj 200 0 Td (KEEP-BETA) Tj ET'
+
+// inspects text under a region
+{
+  const source = onePagePdf(textContent)
+  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [SECRET_RECT]))
+  assert.equal(before.kind, 'region')
+  assert.deepEqual(before.rect, SECRET_RECT)
+  assert.ok(before.textChars > 0, `text under the region: ${JSON.stringify(before)}`)
+  assert.equal(before.paths + before.imagesNotBlank + before.patternContent, 0)
+  // Only the mark carrying /INKB_Gloss is applied with own_locked; the other stays.
+  let outcome
+  const applied = editPage(source, (doc, page) => {
+    const own = addMark(page, SECRET_RECT)
+    setData(own, '{"v":1}')
+    const other = addMark(page, BETA_RECT)
+    const candidates = inspectPage(doc, 0, [])
+    assert.equal(candidates.filter((c) => c.kind === 'redact-annotation' && c.textChars > 0).length, 2, JSON.stringify(candidates))
+    m._FPDFPage_CloseAnnot(own)
+    m._FPDFPage_CloseAnnot(other)
+    outcome = applyPage(doc, page, [], true)
+    assert.deepEqual(applyPage(doc, page, [], true), { result: 0, removed: 0, left: 1 }, 'a second apply found something')
+    assert.deepEqual(applyPage(doc, page, [], false), { result: 0, removed: 0, left: 1 }, 'nothing named, nothing applied')
+  })
+  assert.deepEqual(outcome, { result: 1, removed: 0, left: 1 })
+  withDoc(applied, (doc) => {
+    const [secret, beta] = inspectPage(doc, 0, [SECRET_RECT, BETA_RECT])
+    assert.equal(secret.textChars, 0, `text left under the applied mark: ${JSON.stringify(secret)}`)
+    assert.ok(beta.textChars > 0, 'the mark without /INKB_Gloss was applied')
+    const left = inspectPage(doc, 0, []).filter((c) => c.kind === 'redact-annotation')
+    assert.equal(left.length, 1, 'the unapplied mark is not a candidate')
+  })
+}
+
+// inspects an image under a region
+{
+  const pixels = Buffer.alloc(16 * 16 * 3)
+  for (let i = 0; i < 256; i++) pixels.set([(i % 16) * 16, Math.floor(i / 16) * 16, 128], i * 3)
+  const source = onePagePdf(
+    'q 100 0 0 100 50 50 cm /Im0 Do Q',
+    { resources: '/XObject << /Im0 6 0 R >>' },
+    [streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8', pixels)],
+  )
+  const under = [60, 60, 100, 100]
+  const beside = [120, 120, 140, 140]
+  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [under]))
+  assert.equal(before.imagesNotBlank, 1, `image under the region: ${JSON.stringify(before)}`)
+  const applied = editPage(source, (doc, page) => {
+    const mark = addMark(page, under)
+    assert.equal(applyPage(doc, page, [mark], false).result, 1)
+    m._FPDFPage_CloseAnnot(mark)
+  })
+  withDoc(applied, (doc) => {
+    const [after, elsewhere] = inspectPage(doc, 0, [under, beside])
+    assert.equal(after.imagesNotBlank, 0, `image samples left under the mark: ${JSON.stringify(after)}`)
+    assert.equal(elsewhere.imagesNotBlank, 1, 'the image beside the mark reads as blank')
+  })
+}
+
+// inspects a path under a region
+{
+  const source = onePagePdf('0 0 1 rg 50 50 100 100 re f q 200 50 100 100 re W n /Sh0 sh Q', {
+    resources:
+      '/Shading << /Sh0 << /ShadingType 2 /ColorSpace /DeviceRGB /Coords [200 50 300 50] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >> >> >>',
+  })
+  const onPath = [80, 80, 120, 120]
+  const onShading = [230, 80, 270, 120]
+  const before = withDoc(source, (doc) => inspectPage(doc, 0, [onPath, onShading]))
+  assert.equal(before[0].paths, 1, `path under the region: ${JSON.stringify(before[0])}`)
+  assert.equal(before[1].paths, 1, `shading under the region: ${JSON.stringify(before[1])}`)
+  const applied = editPage(source, (doc, page) => {
+    const marks = [addMark(page, onPath), addMark(page, onShading)]
+    assert.equal(applyPage(doc, page, marks, false).result, 1)
+    marks.forEach((mark) => m._FPDFPage_CloseAnnot(mark))
+  })
+  withDoc(applied, (doc) => {
+    const after = inspectPage(doc, 0, [onPath, onShading])
+    assert.equal(after[0].paths, 0, `path left under the mark: ${JSON.stringify(after[0])}`)
+    assert.equal(after[1].paths, 0, `shading left under the mark: ${JSON.stringify(after[1])}`)
+    // The cut path still surrounds the hole.
+    assert.equal(inspectPage(doc, 0, [[55, 55, 75, 75]])[0].paths, 1, 'the rest of the path is gone')
+  })
+}
+
+// inspects text inside a tiling pattern
+{
+  const source = onePagePdf(
+    '/Pattern cs /P0 scn 50 50 200 100 re f',
+    { resources: '/Pattern << /P0 6 0 R >>' },
+    [
+      streamObject(
+        '/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 50 20] /XStep 50 /YStep 20 /Resources << /Font << /F1 5 0 R >> >>',
+        'BT /F1 10 Tf 0 5 Td (TILE) Tj ET',
+      ),
+    ],
+  )
+  const region = [60, 60, 100, 100]
+  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [region]))
+  assert.ok(before.patternContent > 0, `pattern text under the region: ${JSON.stringify(before)}`)
+  assert.equal(before.textChars, 0, 'pattern text counted as page text')
+  const applied = editPage(source, (doc, page) => {
+    const mark = addMark(page, region)
+    assert.equal(applyPage(doc, page, [mark], false).result, 1)
+    m._FPDFPage_CloseAnnot(mark)
+  })
+  // The apply does not enter patterns; the check still sees the text.
+  const [after] = withDoc(applied, (doc) => inspectPage(doc, 0, [region]))
+  assert.ok(after.patternContent > 0, 'the check lost the pattern text after the apply')
+}
+
+// ignores the overlay it tagged
+const overlaySaved = editPage(onePagePdf(textContent), (doc, page) => {
+  const mark = addMark(page, SECRET_RECT)
+  const overlay = newAppearance(doc, [0, 0, 185, 30], '0 g 0 0 185 30 re f 1 g BT /F0 12 Tf 4 10 Td (REDACTED) Tj ET', false)
+  withStrings(['F0', 'Helvetica'], (name, base) => assert.equal(m._INK_Appearance_AddFont(overlay, name, base), 1))
+  assert.equal(m._INK_Redact_SetOverlay(doc, mark, overlay), 1)
+  const square = m._FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE)
+  const notRedact = newAppearance(doc, [0, 0, 10, 10], '', false)
+  assert.equal(m._INK_Redact_SetOverlay(doc, square, notRedact), 0, 'an overlay on a square')
+  m._FPDFPage_CloseAnnot(square)
+  assert.equal(applyPage(doc, page, [mark], false).result, 1)
+  m._FPDFPage_CloseAnnot(mark)
+})
+{
+  assert.equal(count(overlaySaved, '/INKB_Overlay true'), 1, 'the flattened overlay lost its tag')
+  const [after] = withDoc(overlaySaved, (doc) => inspectPage(doc, 0, [SECRET_RECT]))
+  assert.deepEqual(
+    [after.textChars, after.paths, after.imagesNotBlank],
+    [0, 0, 0],
+    `the overlay counted as content: ${JSON.stringify(after)}`,
+  )
+  // Blanked to the same length, so the cross-reference offsets stay right.
+  const tag = '/INKB_Overlay true'
+  const untagged = Buffer.from(overlaySaved.toString('latin1').replace(tag, ' '.repeat(tag.length)), 'latin1')
+  const [plainOverlay] = withDoc(untagged, (doc) => inspectPage(doc, 0, [SECRET_RECT]))
+  assert.ok(plainOverlay.paths > 0 && plainOverlay.textChars > 0, `untagged, the overlay is content: ${JSON.stringify(plainOverlay)}`)
+}
+
+// finds a black box over text as a candidate
+{
+  const source = onePagePdf(`${textContent} 0 g 45 95 185 30 re f`)
+  const candidates = withDoc(source, (doc) => inspectPage(doc, 0, []))
+  assert.equal(candidates.length, 1, JSON.stringify(candidates))
+  const [box] = candidates
+  assert.equal(box.kind, 'filled-box')
+  assert.deepEqual(box.rect, SECRET_RECT)
+  assert.ok(box.textChars > 0, `text under the box: ${JSON.stringify(box)}`)
+  assert.equal(box.paths, 0, 'the box counted itself')
+}
+
+// reads annotation appearances and a loupe's page copy
+{
+  const source = onePagePdf(textContent)
+  const withAnnots = editPage(source, (doc, page) => {
+    // A note over the region, its text in its appearance.
+    const note = m._FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE)
+    const noteAp = newAppearance(doc, [60, 100, 120, 120], 'BT /F0 10 Tf 62 105 Td (NOTE) Tj ET', false)
+    withStrings(['F0', 'Helvetica'], (name, base) => assert.equal(m._INK_Appearance_AddFont(noteAp, name, base), 1))
+    assert.equal(m._INK_Annot_SetAppearance(note, noteAp), 1)
+    m._FPDFPage_CloseAnnot(note)
+    // A loupe away from the region, drawing the page at 0.375 of its size.
+    const loupe = m._FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE)
+    const loupeAp = newAppearance(doc, [250, 0, 400, 75], 'q 0.375 0 0 0.375 250 0 cm /P0 Do Q', false)
+    withStrings(['P0'], (name) => assert.equal(m._INK_Appearance_AddPage(loupeAp, name, 0), 1))
+    assert.equal(m._INK_Annot_SetAppearance(loupe, loupeAp), 1)
+    m._FPDFPage_CloseAnnot(loupe)
+  })
+  assert.equal(count(withAnnots, '/INKB_PageCopy true'), 1, 'the page copy is not tagged')
+  withDoc(withAnnots, (doc) => {
+    const [region] = inspectPage(doc, 0, [SECRET_RECT])
+    // NOTE is 4 characters; the page copy holds SECRET-ALPHA in page coordinates.
+    assert.ok(region.annotationText > 4, `annotation text under the region: ${JSON.stringify(region)}`)
+    const [away] = inspectPage(doc, 0, [[0, 0, 40, 40]])
+    assert.equal(away.annotationText, 0, `annotation text away from everything: ${JSON.stringify(away)}`)
+  })
+}
+
+// sanitises metadata, attachments, scripts, thumbnails and private data
+const sanitizeSource = buildPdf(
+  [
+    '<< /Type /Catalog /Pages 2 0 R /Metadata 6 0 R /Names << /EmbeddedFiles << /Names [(a.txt) 7 0 R] >> /JavaScript << /Names [(js) 9 0 R] >> >> /OpenAction 9 0 R /PieceInfo << /App << /Private (CATALOG-PRIVATE) >> >> /OCProperties << /OCGs [14 0 R] /D << /OFF [14 0 R] >> >> /AcroForm << /Fields [15 0 R] >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Thumb 10 0 R /PieceInfo << /App << /Private (PAGE-PRIVATE) >> >> /AA << /O 9 0 R >> /Annots [11 0 R] >>',
+    streamObject('', textContent),
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    streamObject('/Type /Metadata /Subtype /XML', '<x:xmpmeta xmlns:x="adobe:ns:meta/">XMP-SECRET</x:xmpmeta>', true),
+    '<< /Type /Filespec /F (a.txt) /EF << /F 8 0 R >> >>',
+    streamObject('/Type /EmbeddedFile', 'ATTACHED-SECRET', true),
+    '<< /S /JavaScript /JS (app.alert\\(1\\)) >>',
+    streamObject('/Width 1 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8', Buffer.from([0])),
+    '<< /Type /Annot /Subtype /FileAttachment /Rect [0 0 20 20] /FS 12 0 R >>',
+    '<< /Type /Filespec /F (b.txt) /EF << /F 13 0 R >> >>',
+    streamObject('/Type /EmbeddedFile', 'ANNOT-SECRET', true),
+    '<< /Type /OCG /Name (Layer) >>',
+    '<< /FT /Sig /T (Signature) /V << /Type /Sig >> >>',
+    '<< /Title (INFO-SECRET) >>',
+  ],
+  '/Info 16 0 R',
+)
+const sanitizedSaved = withDoc(sanitizeSource, (doc) => {
+  assert.deepEqual(inspectFile(doc, sanitizeSource), {
+    revisions: 1,
+    info: true,
+    xmp: true,
+    attachments: 2,
+    scripts: true,
+    hiddenLayers: true,
+    signed: true,
+  })
+  const out = m._malloc(8)
+  assert.equal(m._INK_Sanitize(doc, out, out + 4), 1)
+  const flags = m.HEAPU32[out / 4]
+  const attachments = m.HEAPU32[out / 4 + 1]
+  m._free(out)
+  assert.equal(flags, 1 | 2 | 4 | 8 | 16, `sanitise flags ${flags}`)
+  assert.equal(attachments, 2)
+  return save(doc)
+})
+{
+  const inflated = inflateStreams(sanitizedSaved)
+  for (const text of ['/Info', '/EmbeddedFiles', '/JavaScript', '/Thumb', '/PieceInfo', '/Metadata', '/FileAttachment', '/OpenAction', '/AA']) {
+    assert.ok(!inflated.includes(text), `the sanitised file holds ${text}`)
+  }
+  for (const text of ['ATTACHED-SECRET', 'ANNOT-SECRET', 'INFO-SECRET', 'XMP-SECRET', 'PRIVATE']) {
+    assert.ok(!inflated.includes(text), `the sanitised file holds ${text}`)
+  }
+  assert.ok(streamTexts(sanitizedSaved).some((t) => t.includes('KEEP-BETA')), 'sanitising lost the page text')
+  withDoc(sanitizedSaved, (doc) => {
+    assert.deepEqual(inspectFile(doc, sanitizedSaved), {
+      revisions: 1,
+      info: false,
+      xmp: false,
+      attachments: 0,
+      scripts: false,
+      hiddenLayers: true,
+      signed: true,
+    })
+  })
+}
+
+// reports file facts
+{
+  const FPDF_INCREMENTAL = 1
+  const first = onePagePdf(textContent)
+  const second = withDoc(first, (doc) => {
+    assert.equal(inspectFile(doc, first).revisions, 1)
+    const page = m._FPDF_LoadPage(doc, 0)
+    m._FPDFPage_CloseAnnot(m._FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE))
+    m._FPDF_ClosePage(page)
+    const writer = m._INK_Save(doc, FPDF_INCREMENTAL)
+    assert.notEqual(writer, 0)
+    const data = m._INK_WriterData(writer)
+    const bytes = Buffer.from(m.HEAPU8.slice(data, data + m._INK_WriterSize(writer)))
+    m._INK_WriterFree(writer)
+    return bytes
+  })
+  assert.equal(count(second, '%%EOF'), 2, 'the incremental save made no second revision')
+  withDoc(second, (doc) => {
+    assert.deepEqual(inspectFile(doc, second), {
+      revisions: 2,
+      info: false,
+      xmp: false,
+      attachments: 0,
+      scripts: false,
+      hiddenLayers: false,
+      signed: false,
+    })
+  })
+}
+
 m._INK_Destroy()
 // SMOKE_OUT, SMOKE_FORM_OUT and SMOKE_IMAGE_OUT name files to receive the saved
 // documents, for qpdf --check: the appearance document, the text box, border
-// and reply one, the enlarged images one, and SMOKE_REDACT_OUT the redacted one.
+// and reply one, the enlarged images one, SMOKE_REDACT_OUT the redacted one,
+// SMOKE_OVERLAY_OUT the one applied with a tagged overlay and SMOKE_SANITIZE_OUT
+// the sanitised one.
 if (process.env.SMOKE_OUT) writeFileSync(process.env.SMOKE_OUT, saved)
 if (process.env.SMOKE_FORM_OUT) writeFileSync(process.env.SMOKE_FORM_OUT, replySaved, 'latin1')
 if (process.env.SMOKE_IMAGE_OUT) writeFileSync(process.env.SMOKE_IMAGE_OUT, imagesSaved)
 if (process.env.SMOKE_REDACT_OUT) writeFileSync(process.env.SMOKE_REDACT_OUT, redactSaved)
+if (process.env.SMOKE_OVERLAY_OUT) writeFileSync(process.env.SMOKE_OVERLAY_OUT, overlaySaved)
+if (process.env.SMOKE_SANITIZE_OUT) writeFileSync(process.env.SMOKE_SANITIZE_OUT, sanitizedSaved)
 console.log('SMOKE_OK')

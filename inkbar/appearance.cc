@@ -45,6 +45,7 @@ struct ink_appearance_t {
 namespace {
 
 constexpr char kDataKey[] = "INKB_Gloss";
+constexpr char kPageCopyKey[] = "INKB_PageCopy";
 
 // The font and page objects a document already holds for appearances, so each
 // base font and page gets one. Forgotten when the document is destroyed.
@@ -167,6 +168,10 @@ uint32_t PageObject(CPDF_Document* doc, int page_index) {
   if (!xobject || !xobject->xobject) {
     return 0;
   }
+  // Tells the redaction check that this form is a page copy, to be read in
+  // the page's own coordinates.
+  xobject->xobject->GetMutableDict()->SetNewFor<CPDF_Boolean>(kPageCopyKey,
+                                                              true);
   const uint32_t objnum = xobject->xobject->GetObjNum();
   if (page_objnum) {
     cache->pages[page_objnum] = objnum;
@@ -175,6 +180,18 @@ uint32_t PageObject(CPDF_Document* doc, int page_index) {
 }
 
 }  // namespace
+
+namespace inkbar {
+
+CPDF_Document* AppearanceDocument(const INK_APPEARANCE* a) {
+  return a ? a->doc : nullptr;
+}
+
+RetainPtr<CPDF_Stream> AppearanceStream(const INK_APPEARANCE* a) {
+  return a ? a->stream : nullptr;
+}
+
+}  // namespace inkbar
 
 extern "C" {
 

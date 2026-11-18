@@ -20,6 +20,9 @@ Everything Inkbar adds lives under `inkbar/`. Changes to files outside that dire
 | --- | --- |
 | `shim.c` | What a JavaScript host needs and PDFium's C API leaves to the embedder: starting the library, saving to memory, form-fill setup. |
 | `appearance.h`, `appearance.cc` | `INK_Appearance_*` and `INK_Annot_*`. They build a Form XObject from content the caller draws, name its fonts, opacities, images, pages and nested forms, and install it as an annotation's `/AP /N`. They also store Inkbar's annotation data as a Flate stream under `/INKB_Gloss`. |
+| `redact.h`, `redact.cc` | `INK_Redact_*`. `INK_Redact_SetOverlay` gives a redact annotation its overlay, tagged `/INKB_Overlay true`. `INK_Redact_ApplyPage` applies a page's redact annotations through `EPDFPage_ApplyRedactions` and regenerates the page content. |
+| `sanitize.h`, `sanitize.cc` | `INK_Sanitize`. It removes metadata, attached files, scripts, thumbnails and private application data from every object of a document. |
+| `inspect.h`, `inspect.cc` | `INK_Inspect_*`, for the redaction check. `INK_Inspect_Page` counts what lies under regions of a page, or finds candidate regions. `INK_Inspect_File` reports what a file carries besides its pages. Reports are JSON with numbers and booleans only, never text from the file. |
 | `exports.txt` | The export allowlist. |
 | `build.sh`, `link.sh` | The build. |
 | `smoke.mjs` | The smoke check. |
@@ -43,7 +46,7 @@ To check the redacted file the smoke check writes, set `SMOKE_REDACT_OUT` to a p
 
 The script uses `podman`. Set `CONTAINER=docker` to use Docker. The first run downloads several gigabytes of dependencies into the checkout. They are ignored by git. A clean build takes about ten minutes.
 
-The checkout is mounted into the container. `scripts/embedpdf-runtime/build-target.sh wasm32` builds `libembedpdf.a`. `inkbar/link.sh` then compiles `inkbar/shim.c` and `inkbar/appearance.cc` and links them with it into `inkbar/out/`. `appearance.cc` uses PDFium's internal classes, so the link step compiles it with the defines, include paths and flags GN gave PDFium's `fpdfsdk` sources. It reads them from `out/embedpdf-runtime/wasm32/obj/fpdfsdk/fpdfsdk.ninja`.
+The checkout is mounted into the container. `scripts/embedpdf-runtime/build-target.sh wasm32` builds `libembedpdf.a`. `inkbar/link.sh` then compiles `inkbar/shim.c` and Inkbar's C++ files and links them with it into `inkbar/out/`. The C++ files use PDFium's internal classes, so the link step compiles them with the defines, include paths and flags GN gave PDFium's `fpdfsdk` sources. It reads them from `out/embedpdf-runtime/wasm32/obj/fpdfsdk/fpdfsdk.ninja`.
 
 | File | Contents |
 | --- | --- |
@@ -55,13 +58,29 @@ The checkout is mounted into the container. `scripts/embedpdf-runtime/build-targ
 
 The binary is single-threaded.
 
-Current size of `inkbar-pdfium.wasm`: 6,623,595 bytes raw, 2,840,796 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
+Current size of `inkbar-pdfium.wasm`: 6,657,473 bytes raw, 2,855,749 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
+
+## The redaction check
+
+`INK_Inspect_Page` walks a page's objects as the redaction does and uses the redaction's own edge rules, so content the apply rightly kept does not count.
+
+- A character counts when its glyph box meets the region on an open interval, in the page content and in Form XObjects at any depth.
+- An image counts when the samples the apply would blank, the bounding box of the region on the image's sample grid, are not one value. The tolerance is 0 when the image's last filter is lossless and 12 levels either way per 8-bit channel when it is `DCTDecode` or `JPXDecode`. An image that cannot be decoded counts.
+- A path or shading counts when PDFium's path redactor would cut it, tested against the region shrunk by 0.01 pt, because the apply cuts a hair outside the region and a save rounds coordinates. A shading counts only when its clip paths meet the region too.
+- A form whose dictionary has `/INKB_Overlay true` is an overlay an apply drew. Nothing inside it counts.
+- Text and images in the content stream of a tiling pattern that an object paints into the region count as pattern content. The redaction does not enter patterns, so this content survives an apply.
+- Annotation appearances count text and images when the annotation's `/Rect` meets the region. A form with `/INKB_PageCopy true` (a loupe's copy of its page, made by `INK_Appearance_AddPage`) is read in the page's own coordinates, wherever the annotation sits.
+
+With no regions, it lists candidates: every redact annotation; filled rectangles in the page content at least 4 pt in each direction, opaque, with normal blending and a fill luminance below 0.2 or above 0.98; and Square, Highlight and Stamp annotations whose appearance is one such opaque filled rectangle. A filled box with nothing under it may be a real redaction or a graphic.
+
+`INK_Inspect_File` counts revisions as one more than the `%%EOF` markers a further `startxref` follows. A linearized file therefore counts two.
 
 ## Changes outside `inkbar/`
 
 Every change this fork's Inkbar commits make outside `inkbar/`. Update this list with any further such change, and re-check each entry after every upstream merge.
 
 - `core/fpdfdoc/cpdf_interactiveform.cpp`, in `InitDict`: a created `/AcroForm` is given an empty `/Fields` array. ISO 32000 requires the entry, and without it Poppler reports "Can't get Fields array". The smoke check guards it.
+- `core/fpdfapi/parser/cpdf_document.{h,cpp}`: `CPDF_Document::DropInfo()`, which `INK_Sanitize` calls so the next save writes no `/Info`. It caches a direct, empty `/Info` dictionary; the save trailer then names none and drops the one it read. The smoke check guards it.
 
 ## Taking upstream
 
