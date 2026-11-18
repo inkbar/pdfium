@@ -58,29 +58,33 @@ The checkout is mounted into the container. `scripts/embedpdf-runtime/build-targ
 
 The binary is single-threaded.
 
-Current size of `inkbar-pdfium.wasm`: 6,657,473 bytes raw, 2,855,749 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
+Current size of `inkbar-pdfium.wasm`: 6,874,112 bytes raw, 2,905,478 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
 
 ## The redaction check
 
-`INK_Inspect_Page` walks a page's objects as the redaction does and uses the redaction's own edge rules, so content the apply rightly kept does not count.
+`INK_Inspect_Page` walks a page's objects as the redaction does and uses the redaction's own edge rules, so content the apply rightly kept does not count. For text and paths it also runs a second test that does not share the redaction's geometry, and a region counts content when either test finds it. The second tests use the region shrunk by 1 pt on every side, or by a quarter of its smaller side when that is less than 1 pt. A rotated region's corners each move that distance toward its centre.
 
-- A character counts when its glyph box meets the region on an open interval, in the page content and in Form XObjects at any depth.
-- An image counts when the samples the apply would blank, the bounding box of the region on the image's sample grid, are not one value. The tolerance is 0 when the image's last filter is lossless and 12 levels either way per 8-bit channel when it is `DCTDecode` or `JPXDecode`. An image that cannot be decoded counts.
-- A path or shading counts when PDFium's path redactor would cut it, tested against the region shrunk by 0.01 pt, because the apply cuts a hair outside the region and a save rounds coordinates. A shading counts only when its clip paths meet the region too.
-- A form whose dictionary has `/INKB_Overlay true` is an overlay an apply drew. Nothing inside it counts.
-- Text and images in the content stream of a tiling pattern that an object paints into the region count as pattern content. The redaction does not enter patterns, so this content survives an apply.
-- Annotation appearances count text and images when the annotation's `/Rect` meets the region. A form with `/INKB_PageCopy true` (a loupe's copy of its page, made by `INK_Appearance_AddPage`) is read in the page's own coordinates, wherever the annotation sits.
+- Text: a character counts when its glyph box meets the region on an open interval, in the page content and in Form XObjects at any depth. In the second test, a character in the page content counts when the box PDFium's text extraction gives it (its tight and loose boxes together) meets the shrunk region. Text in annotation appearances and page copies, which text extraction does not read, is tested against a box built from the character's advance and the font's ascent and descent. The two counts are not merged character by character: the report gives the larger.
+- Images: an image counts when the samples the apply would blank, the bounding box of the region on the image's sample grid, are not one value. The same test runs on its `/SMask` and on a stream `/Mask`, each on its own grid. The tolerance is 0 when the last filter is lossless. After `DCTDecode` or `JPXDecode` it is 12 levels either way per 8-bit channel. Within 8 samples of the edge of the blanked area it is 24 either way, because the apply re-encodes the blocks the edge crosses and the kept content beside the hole rings into them. An image that cannot be decoded counts. Each image is decoded once per call.
+- Paths and shadings: one counts when PDFium's path redactor would cut it, tested against the region shrunk by 0.01 pt, because the apply cuts a hair outside the region and a save rounds coordinates. A shading counts only when its clip paths meet the region too. In the second test, a path counts when a vertex, or a point sampled along its segments at most 1 pt apart, lies inside the shrunk region. Shadings have no second test.
+- When regions are given, a form whose dictionary has `/INKB_Overlay true` is an overlay an apply drew. Nothing inside it counts.
+- Text and images in the content stream of a tiling pattern that an object paints into the region count as pattern content. This includes patterns in annotation appearances and in page copies, and patterns used inside another pattern's content. The redaction does not enter patterns, so this content survives an apply. Vector drawing inside a pattern is not counted.
+- Annotation appearances count text and images when the annotation's `/Rect` meets the region. Every state of `/N`, `/D` and `/R` is read. A form with `/INKB_PageCopy true` (a loupe's copy of its page, made by `INK_Appearance_AddPage`) is read in the page's own coordinates through the inverse of its `/Matrix`, wherever the annotation sits. `INK_Redact_ApplyPage` drops the cached copy of the page it changes, so a later `INK_Appearance_AddPage` copies the redacted page.
 
-With no regions, it lists candidates: every redact annotation; filled rectangles in the page content at least 4 pt in each direction, opaque, with normal blending and a fill luminance below 0.2 or above 0.98; and Square, Highlight and Stamp annotations whose appearance is one such opaque filled rectangle. A filled box with nothing under it may be a real redaction or a graphic.
+`INK_Inspect_Page` returns NULL when it could not inspect: no such page, a bad quad, forms nested deeper than 64, or a region PDFium's path redactor cannot use. NULL never means that nothing was found; a caller treats it as a failed check. A region too small to shrink is tested as it is.
 
-`INK_Inspect_File` counts revisions as one more than the `%%EOF` markers a further `startxref` follows. A linearized file therefore counts two.
+With no regions, it lists candidates: every redact annotation; filled rectangles in the page content at least 4 pt in each direction, opaque, with normal blending and a fill luminance below 0.2 or above 0.98; and Square, Highlight and Stamp annotations whose normal appearance is one such opaque filled rectangle. A candidate counts only content painted before it, in content order with forms taken at their place. Annotations paint after the content, in `/Annots` order. So a white page background has nothing under it, and text drawn on top of a box is not under the box. Without regions, `/INKB_Overlay` is not trusted and content in tagged forms counts. A filled box with nothing under it may be a real redaction or a graphic.
+
+`INK_Inspect_File` counts revisions as one more than the `%%EOF` markers a further `startxref` follows. A linearized file therefore counts two. `info` is true for a non-empty `/Info`, whether the trailer names an object or holds a direct dictionary.
+
+`INK_Sanitize` also removes the `/XFA` of an interactive form and `/URI` actions whose target starts with `javascript:` in any case. It removes the `/EF` of every file specification, those of GoToE, Launch, RichMedia, Screen and Sound included. Each embedded file counts as one attachment, however many places refer to it.
 
 ## Changes outside `inkbar/`
 
 Every change this fork's Inkbar commits make outside `inkbar/`. Update this list with any further such change, and re-check each entry after every upstream merge.
 
 - `core/fpdfdoc/cpdf_interactiveform.cpp`, in `InitDict`: a created `/AcroForm` is given an empty `/Fields` array. ISO 32000 requires the entry, and without it Poppler reports "Can't get Fields array". The smoke check guards it.
-- `core/fpdfapi/parser/cpdf_document.{h,cpp}`: `CPDF_Document::DropInfo()`, which `INK_Sanitize` calls so the next save writes no `/Info`. It caches a direct, empty `/Info` dictionary; the save trailer then names none and drops the one it read. The smoke check guards it.
+- `core/fpdfapi/parser/cpdf_document.{h,cpp}`: `CPDF_Document::DropInfo()`, which `INK_Sanitize` calls so the next save writes no `/Info`. It caches a direct, empty `/Info` dictionary and removes `/Info` from the parser's trailer, so the save trailer names none and copies none, whether the file named an object or held a direct dictionary. The smoke check guards both cases.
 
 ## Taking upstream
 
