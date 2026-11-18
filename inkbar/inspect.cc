@@ -1692,10 +1692,17 @@ class Walker {
         continue;
       }
       if (counted) {
-        Patterns(object, to_page, page);
+        Patterns(object, to_page);
       }
-      if (page && PictureShadingPattern(object, to_page)) {
-        ++entry_->counts.paths;
+      if (page) {
+        // Asked of every object, whether or not its box meets a region.
+        std::set<const CPDF_Object*> chain;
+        if (PatternDrawing(object, to_page, false, &chain)) {
+          ++entry_->counts.paths;
+        }
+        if (PictureShadingPattern(object, to_page)) {
+          ++entry_->counts.paths;
+        }
       }
       if (CPDF_TextObject* text = object->AsText()) {
         if (counted) {
@@ -1798,8 +1805,8 @@ class Walker {
   }
 
   // Text and images in the content streams of tiling patterns an object
-  // paints into the regions with, and, on the page, drawing in them.
-  void Patterns(CPDF_PageObject* object, const CFX_Matrix& to_page, bool page) {
+  // paints into the regions with.
+  void Patterns(CPDF_PageObject* object, const CFX_Matrix& to_page) {
     CFX_FloatRect box = to_page.TransformRect(object->GetRect());
     box.Normalize();
     if (!RectMeetsAnyBBox(box, entry_->regions)) {
@@ -1807,9 +1814,6 @@ class Walker {
     }
     std::set<const CPDF_Object*> chain;
     entry_->counts.pattern_content += PatternsOf(object, &chain);
-    if (page && PatternDrawing(object, to_page, false, &chain)) {
-      ++entry_->counts.paths;
-    }
   }
 
   // Whether a shading that can hold a picture (type 1 or 4 to 7; any type
@@ -1876,6 +1880,58 @@ class Walker {
     return false;
   }
 
+  // A pattern's cell box and steps, and where pattern space lies on the page.
+  struct Tiling {
+    // Pattern space, shifted to tile |i|, |j|, to the page.
+    CFX_Matrix Tile(double i, double j) const {
+      return CFX_Matrix(1, 0, 0, 1, static_cast<float>(i * x_step),
+                        static_cast<float>(j * y_step)) *
+             to_page;
+    }
+
+    // The tiles over the page rectangle |area|: those that may meet it, or,
+    // with |inside|, those that may lie wholly in it. False when they cannot
+    // be numbered.
+    bool Over(const CFX_FloatRect& area,
+              bool inside,
+              double* first,
+              double* last) const {
+      CFX_FloatRect q = to_pattern.TransformRect(area);
+      q.Normalize();
+      if (!Finite(q)) {
+        return false;
+      }
+      const double lows[2] = {q.left, q.bottom};
+      const double highs[2] = {q.right, q.top};
+      const double starts[2] = {bbox.left, bbox.bottom};
+      const double ends[2] = {bbox.right, bbox.top};
+      const double steps[2] = {x_step, y_step};
+      for (int k = 0; k < 2; ++k) {
+        first[k] = inside ? std::ceil((lows[k] - starts[k]) / steps[k])
+                          : std::floor((lows[k] - ends[k]) / steps[k]);
+        last[k] = inside ? std::floor((highs[k] - ends[k]) / steps[k])
+                         : std::ceil((highs[k] - starts[k]) / steps[k]);
+        if (!std::isfinite(first[k]) || !std::isfinite(last[k])) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    CFX_FloatRect bbox;
+    float x_step = 0;
+    float y_step = 0;
+    CFX_Matrix to_page;
+    CFX_Matrix to_pattern;
+  };
+
+  struct Landing {
+    bool lands = false;
+    bool placed = false;
+    Tiling grid;
+    RetainPtr<CPDF_TilingPattern> pattern;
+  };
+
   // Whether |object| paints with its fill colour, or with its stroke colour.
   // Only a path says which; anything else is taken to use both.
   static bool Paints(const CPDF_PageObject* object, bool stroke) {
@@ -1888,9 +1944,13 @@ class Walker {
   // Whether a tiling pattern |object| paints with draws a path or shading
   // under the regions. The redaction does not enter a pattern's stream, so
   // what a cell draws under a mark stays in the file, behind the hole the
-  // apply cut in the fill. |to_page| places |object|'s holder. |nested|: the
-  // object lies in another pattern's cell. True too when the tiling cannot
-  // be worked out, or the work ran out.
+  // apply cut in the fill. On the page the cell is placed over the regions
+  // wherever the object lies: an apply may have cut the object back to where
+  // it no longer meets the mark, and the saved file cannot tell that from a
+  // fill that never did. |to_page| places |object|'s holder. |nested|: the
+  // object lies in another pattern's cell, where nothing is cut and only the
+  // part of a region the object's box meets is asked. True too when the
+  // tiling cannot be worked out, or the work ran out.
   bool PatternDrawing(CPDF_PageObject* object,
                       const CFX_Matrix& to_page,
                       bool nested,
@@ -1931,11 +1991,59 @@ class Walker {
                      const CFX_Matrix& to_page,
                      bool nested,
                      std::set<const CPDF_Object*>* chain) {
+    Landing landing;
+    if (nested) {
+      landing = Land(object, tiling, to_page, true, chain);
+    } else {
+      // On the page the answer is the same for every object painting with
+      // this pattern through this matrix.
+      const float numbers[6] = {to_page.a, to_page.b, to_page.c,
+                                to_page.d, to_page.e, to_page.f};
+      std::pair<const CPDF_Object*, std::array<uint32_t, 6>> key;
+      key.first = tiling->pattern_obj().Get();
+      memcpy(key.second.data(), numbers, sizeof(numbers));
+      auto it = landings_.find(key);
+      if (it == landings_.end()) {
+        landing = Land(object, tiling, to_page, false, chain);
+        if (context_->work.spent) {
+          return true;
+        }
+        // The pattern is kept, so its object's address stays its own.
+        landing.pattern = pdfium::WrapRetain(tiling);
+        it = landings_.emplace(key, landing).first;
+      }
+      landing = it->second;
+    }
+    if (!landing.lands) {
+      return false;
+    }
+    // What the cell draws is no secret when the fill shows a whole tile of
+    // it elsewhere.
+    if (landing.placed && !nested && !stroke) {
+      if (const CPDF_PathObject* path = object->AsPath()) {
+        if (WholeTileBeside(*path, landing.grid, to_page)) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // Whether the cell of |tiling|, tiled over the regions, draws a path or
+  // shading under one. |lands| is true too when the tiling cannot be worked
+  // out; |placed| says whether it could.
+  Landing Land(CPDF_PageObject* object,
+               CPDF_TilingPattern* tiling,
+               const CFX_Matrix& to_page,
+               bool nested,
+               std::set<const CPDF_Object*>* chain) {
+    Landing landing;
     // A pattern's content is parsed on its own, from level 0.
     std::unique_ptr<CPDF_Form> cell = tiling->Load(object);
     if (!cell || !HasDrawing(cell.get(), 0)) {
-      return false;
+      return landing;
     }
+    landing.lands = true;
     CFX_FloatRect bbox = tiling->bbox();
     bbox.Normalize();
     const float x_step = tiling->x_step();
@@ -1947,108 +2055,56 @@ class Walker {
     if (!Finite(bbox) || !(bbox.Width() > 0) || !(bbox.Height() > 0) ||
         !std::isfinite(x_step) || !(x_step > 0) || !std::isfinite(y_step) ||
         !(y_step > 0) || !Invertible(placed) || !Invertible(parent)) {
-      return true;
+      return landing;
     }
-    const Tiling grid{bbox, x_step, y_step, placed, placed.GetInverse()};
-    // What the cell draws is no secret when the fill shows a whole tile of
-    // it elsewhere.
-    if (!nested && !stroke) {
-      if (const CPDF_PathObject* path = object->AsPath()) {
-        if (WholeTileBeside(*path, grid, to_page)) {
-          return false;
-        }
-        if (context_->work.spent) {
-          return true;
-        }
-      }
-    }
+    landing.placed = true;
+    landing.grid = Tiling{bbox, x_step, y_step, placed, placed.GetInverse()};
+    const Tiling& grid = landing.grid;
     CFX_FloatRect object_box = to_page.TransformRect(object->GetRect());
     object_box.Normalize();
-    if (!Finite(object_box)) {
-      return true;
+    if (nested && !Finite(object_box)) {
+      return landing;
     }
     const CFX_Matrix unparent = parent.GetInverse();
     for (const RedactRegion& region : entry_->regions) {
       CFX_FloatRect area = region.bbox;
-      area.Intersect(object_box);
-      if (area.IsEmpty()) {
-        continue;
+      if (nested) {
+        area.Intersect(object_box);
+        if (area.IsEmpty()) {
+          continue;
+        }
       }
       double first[2];
       double last[2];
       if (!grid.Over(area, false, first, last)) {
-        return true;
+        return landing;
       }
       if (!((last[0] - first[0] + 1) * (last[1] - first[1] + 1) <= kMaxTiles)) {
-        return true;
+        return landing;
       }
       for (double i = first[0]; i <= last[0]; ++i) {
         for (double j = first[1]; j <= last[1]; ++j) {
           if (!context_->work.Spend(1)) {
-            return true;
+            return landing;
           }
           const CFX_Matrix tile = grid.Tile(i, j);
           CFX_FloatRect tile_box = tile.TransformRect(bbox);
           tile_box.Normalize();
           if (!Finite(tile_box)) {
-            return true;
+            return landing;
           }
           if (!Intersects(tile_box, region.bbox)) {
             continue;
           }
           if (CellDrawing(cell.get(), unparent * tile, chain, 0)) {
-            return true;
+            return landing;
           }
         }
       }
     }
-    return false;
+    landing.lands = false;
+    return landing;
   }
-
-  // A pattern's cell box and steps, and where pattern space lies on the page.
-  struct Tiling {
-    // Pattern space, shifted to tile |i|, |j|, to the page.
-    CFX_Matrix Tile(double i, double j) const {
-      return CFX_Matrix(1, 0, 0, 1, static_cast<float>(i * x_step),
-                        static_cast<float>(j * y_step)) *
-             to_page;
-    }
-
-    // The tiles over the page rectangle |area|: those that may meet it, or,
-    // with |inside|, those that may lie wholly in it. False when they cannot
-    // be numbered.
-    bool Over(const CFX_FloatRect& area,
-              bool inside,
-              double* first,
-              double* last) const {
-      CFX_FloatRect q = to_pattern.TransformRect(area);
-      q.Normalize();
-      if (!Finite(q)) {
-        return false;
-      }
-      const double lows[2] = {q.left, q.bottom};
-      const double highs[2] = {q.right, q.top};
-      const double starts[2] = {bbox.left, bbox.bottom};
-      const double ends[2] = {bbox.right, bbox.top};
-      const double steps[2] = {x_step, y_step};
-      for (int k = 0; k < 2; ++k) {
-        first[k] = inside ? std::ceil((lows[k] - starts[k]) / steps[k])
-                          : std::floor((lows[k] - ends[k]) / steps[k]);
-        last[k] = inside ? std::floor((highs[k] - ends[k]) / steps[k])
-                         : std::ceil((highs[k] - starts[k]) / steps[k]);
-        if (!std::isfinite(first[k]) || !std::isfinite(last[k])) {
-          return false;
-        }
-      }
-      return true;
-    }
-
-    CFX_FloatRect bbox;
-    float x_step;
-    float y_step;
-    CFX_Matrix to_page;
-    CFX_Matrix to_pattern;
-  };
 
   // Whether a cell holds anything PatternDrawing() looks for: a path, a
   // shading, or an object painted with a pattern of its own.
@@ -2409,6 +2465,8 @@ class Walker {
   const CPDF_PathRedactor* const redactor_;
   Context* const context_;
   std::map<ShadingKey, std::pair<CPDF_ClipPath, bool>> shadings_;
+  std::map<std::pair<const CPDF_Object*, std::array<uint32_t, 6>>, Landing>
+      landings_;
 };
 
 // The second test for page text: the boxes PDFium's text extraction gives

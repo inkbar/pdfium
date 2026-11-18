@@ -1360,14 +1360,14 @@ const pageCell = tiling([0, 0, 400, 200], 400, 200, '1 0 1 rg 170 80 m 230 85 l 
 // A page that fills |fill| (path operators) with /P0, the first of |patterns|.
 const patternPage = (fill, patterns, colour = '/Pattern cs /P0 scn', resources = '') =>
   onePagePdf(`q ${colour} ${fill} Q`, { resources: `/Pattern << /P0 6 0 R >> ${resources}` }, patterns)
-// |source| with PATTERN_MARK applied, and what the check then finds under it.
-function underAppliedMark(source) {
+// |source| with a mark applied, and what the check then finds under it.
+function underAppliedMark(source, rect = PATTERN_MARK) {
   const applied = editPage(source, (doc, page) => {
-    const mark = addMark(page, PATTERN_MARK)
+    const mark = addMark(page, rect)
     assert.equal(applyPage(doc, page, [mark], false).result, 1)
     m._FPDFPage_CloseAnnot(mark)
   })
-  return withDoc(applied, (doc) => inspectPage(doc, 0, [PATTERN_MARK]))[0]
+  return withDoc(applied, (doc) => inspectPage(doc, 0, [rect]))[0]
 }
 
 // counts a shape a page-sized pattern cell draws under a mark the fill reaches past
@@ -1385,6 +1385,28 @@ function underAppliedMark(source) {
   const boxed = patternPage('20 50 360 100 re 150 60 100 80 re f* 0 g 150 60 100 80 re f', [pageCell])
   const box = withDoc(boxed, (doc) => inspectPage(doc, 0, [])).find((c) => c.kind === 'filled-box')
   assert.ok(box && box.paths > 0, `the cell's shape under a black box: ${JSON.stringify(box)}`)
+}
+
+// counts a cell's shape under a mark that took one whole side of the fill
+{
+  // What the apply leaves of the band no longer reaches the mark, and the
+  // pattern still draws the shape there.
+  const cell = tiling([0, 0, 400, 200], 400, 200, '1 0 1 rg 60 80 m 120 85 l 110 120 l 70 115 l h f 0 0 1 rg 300 80 40 40 re f')
+  const after = underAppliedMark(patternPage('20 50 360 100 re f', [cell]), [10, 40, 200, 160])
+  assert.ok(after.paths > 0, `the cell's shape under a mark across the fill's side: ${JSON.stringify(after)}`)
+}
+
+// places a pattern's cell under a region wherever on the page it is painted
+{
+  const away = '20 150 360 40 re f'
+  const under = (cell) => withDoc(patternPage(away, [cell]), (doc) => inspectPage(doc, 0, [PATTERN_MARK]))[0]
+  // An accepted refusal: the fill never came near the region, but a saved
+  // file cannot say so, and the cell does draw where the region is.
+  assert.ok(under(pageCell).paths > 0, 'a large cell painted elsewhere that draws where the region is')
+  const beside = tiling([0, 0, 400, 200], 400, 200, '0 0 1 rg 300 80 40 40 re f')
+  assert.equal(under(beside).paths, 0, 'a large cell that draws nothing where the region is')
+  const hatch = tiling([0, 0, 10, 10], 10, 10, '0 G 1 w 0 0 m 10 10 l S')
+  assert.equal(under(hatch).paths, 0, 'a hatch painted elsewhere, whole tiles in view')
 }
 
 // does not count a hatch that the fill also shows whole beside the mark
@@ -1501,6 +1523,86 @@ function pathsAround(source) {
   const [before, after, beside] = pathsAround(source)
   assert.ok(before > 0 && after > 0, `a mesh pattern fill before the apply (${before}) and after it (${after})`)
   assert.equal(beside, 0, 'a mesh pattern fill beside the mark')
+}
+
+// Leaves nothing in the saved file of a resource whose only use lay wholly
+// under a mark: the apply removes the object, and the rewrite must not write
+// the definition the page's /Resources named.
+{
+  const keep = 'BT /F1 12 Tf 20 20 Td (KEEP) Tj ET'
+  const secretPixels = Buffer.from('IMGSECRET'.repeat(86)).subarray(0, 16 * 16 * 3)
+  const kinds = [
+    [
+      'an image',
+      onePagePdf(`q 80 0 0 60 160 70 cm /Im0 Do Q ${keep}`, { resources: '/XObject << /Im0 6 0 R >>' }, [
+        streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8', secretPixels),
+      ]),
+      // The apply leaves a blanked copy of the image in place.
+      ['IMG', 'SECRET'],
+    ],
+    [
+      'a form holding text',
+      onePagePdf(`/Fm0 Do ${keep}`, { resources: '/XObject << /Fm0 6 0 R >>' }, [
+        streamObject('/Type /XObject /Subtype /Form /BBox [160 70 240 130] /Resources << /Font << /F1 5 0 R >> >>', 'BT /F1 12 Tf 165 100 Td (FORMSECRET) Tj ET'),
+      ]),
+      // The apply leaves an emptied copy of the form in place.
+      ['FORMSECRET'],
+    ],
+    [
+      'a tiling pattern',
+      onePagePdf(`q /Pattern cs /P0 scn 160 70 80 60 re f Q ${keep}`, { resources: '/Pattern << /P0 6 0 R >>' }, [
+        tiling([0, 0, 400, 200], 400, 200, '1 0 1 rg 171.717 81.818 m 230 85 l 220 120 l h f'),
+      ]),
+      ['171.717', '/PatternType 1', '/PatternType/1'],
+    ],
+    [
+      'a mesh shading',
+      onePagePdf(`q 160 70 80 60 re W n /Sh0 sh Q ${keep}`, { resources: '/Shading << /Sh0 6 0 R >>' }, [meshShading]),
+      ['/ShadingType 4', '/ShadingType/4', '/BitsPerFlag'],
+    ],
+    [
+      'a shading pattern',
+      onePagePdf(`q /Pattern cs /P0 scn 160 70 80 60 re f Q ${keep}`, { resources: '/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading 6 0 R >> >>' }, [meshShading]),
+      ['/ShadingType 4', '/ShadingType/4', '/BitsPerFlag', '/PatternType 2', '/PatternType/2'],
+    ],
+    [
+      'a soft mask group holding text',
+      onePagePdf(`q /GS0 gs 0 0 1 rg 160 70 80 60 re f Q ${keep}`, { resources: '/ExtGState << /GS0 << /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >>' }, [
+        streamObject(
+          '/Type /XObject /Subtype /Form /BBox [160 70 240 130] /Group << /S /Transparency /CS /DeviceGray >> /Resources << /Font << /F1 5 0 R >> >>',
+          '1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET',
+        ),
+      ]),
+      ['MASKSECRET', '/SMask', '/Subtype /Form', '/Subtype/Form'],
+    ],
+    [
+      'an image the page inherits from its parent',
+      buildPdf([
+        '<< /Type /Catalog /Pages 2 0 R >>',
+        '<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 6 0 R >> >> >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Contents 4 0 R >>',
+        streamObject('', `q 80 0 0 60 160 70 cm /Im0 Do Q ${keep}`),
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+        streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8', secretPixels),
+      ]),
+      ['IMG', 'SECRET'],
+    ],
+  ]
+  const left = []
+  for (const [name, source, traces] of kinds) {
+    assert.ok(inflateStreams(source).includes(traces[0]), `${name}: the source lacks ${traces[0]}`)
+    const saved = inflateStreams(
+      editPage(source, (doc, page) => {
+        const mark = addMark(page, PATTERN_MARK)
+        assert.equal(applyPage(doc, page, [mark], false).result, 1)
+        m._FPDFPage_CloseAnnot(mark)
+      }),
+    )
+    const found = traces.filter((trace) => shows(saved, trace))
+    if (found.length) left.push(`${name}: ${found.join(', ')}`)
+    assert.ok(shows(saved, 'KEEP'), `${name}: the kept text is gone`)
+  }
+  assert.deepEqual(left, [], 'resources left in the saved file after their only use was removed')
 }
 
 // a region too small to shrink still counts the path under it
