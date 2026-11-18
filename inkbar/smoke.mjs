@@ -998,6 +998,36 @@ function nestedFormsPdf(levels) {
   assert.equal(region.imagesNotBlank, 1, `faint stripes under a narrow region: ${JSON.stringify(region)}`)
 }
 
+// reads a 4:2:0 JPEG by its 16 x 16 blocks
+{
+  // 64 x 64 RGB, 4:2:0 (16 x 16 MCUs), stripes 4 samples wide: strong ones
+  // (255 and 96 in red and green) and faint ones (255 and 215, within 48 of
+  // white).
+  const strong = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCABAAEADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAj/xAAYEAACAwAAAAAAAAAAAAAAAAAACUaExP/EABYBAQEBAAAAAAAAAAAAAAAAAAAFB//EABsRAAEEAwAAAAAAAAAAAAAAAAADBUNFgYTB/9oADAMBAAIRAxEAPwCl2AwO/nDAYHfzhgMDv5wwGB385tLDSbHScrLgMBgd/OGAwO/nDAYHfzhgMDv5ww0mx0Ky4DAYHfzhgMDv5wwGB384YDA7+cMNJsdCsuAwGB384YDA7+cMBgd/OGAwO/nDDSbHQrLgMBgd/OGAwO/nDAYHfzhgMDv5ww0mx0Ky4DAYHfzhgMDv5wwGB384YDA7+cMNJsdCsuAwGB384YDA7+cMBgd/OGAwO/nDDSbHQrLgMBgd/OGAwO/nDAYHfzhgMDv5ww0mx0Ky4DAYHfzhgMDv5wwGB384YDA7+cMNJsdCsuAwGB384YDA7+cMBgd/OGAwO/nDDSbHQrLgMBgd/OGAwO/nDAYHfzhgMDv5ww0mx0Ky4DAYHfzhgMDv5wwGB384YDA7+cMNJsdCsuAwGB384YDA7+cMBgd/OGAwO/nDDSbHQrLgMBgd/OGAwO/nDAYHfzhgMDv5ww0mx0Ky4DAYHfzhgMDv5wwGB384YDA7+cMNJsdCsuAwGB384YDA7+cMBgd/OGAwO/nDDSbHQrLg/9k=', 'base64')
+  const faint = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCABAAEADASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAn/xAAYEAACAwAAAAAAAAAAAAAAAAAAB0WDwv/EABQBAQAAAAAAAAAAAAAAAAAAAAD/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCjrJjrMhkx1mQyY6zIZMdZkAyY6zIZMdZkMmOsyGTHWZAMmOsyGTHWZDJjrMhkx1mQDJjrMhkx1mQyY6zIZMdZkAyY6zIZMdZkMmOsyGTHWZAMmOsyGTHWZDJjrMhkx1mQDJjrMhkx1mQyY6zIZMdZkAyY6zIZMdZkMmOsyGTHWZAMmOsyGTHWZDJjrMhkx1mQDJjrMhkx1mQyY6zIZMdZkAyY6zIZMdZkMmOsyGTHWZAMmOsyGTHWZDJjrMhkx1mQDJjrMhkx1mQyY6zIZMdZkAyY6zIZMdZkMmOsyGTHWZAMmOsyGTHWZDJjrMhkx1mQDJjrMhkx1mQyY6zIZMdZkD//2Q==', 'base64')
+  const jpeg = (data) =>
+    streamObject('/Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode', data, true)
+  // One sample a point: the strong image covers x 300 to 364, the faint one
+  // x 100 to 164, both y 20 to 84 (sample row r from the top is at y 84 - r).
+  const source = onePagePdf('q 64 0 0 64 300 20 cm /Js Do Q q 64 0 0 64 100 20 cm /Jf Do Q', { resources: '/XObject << /Js 6 0 R /Jf 7 0 R >>' }, [jpeg(strong), jpeg(faint)])
+  // Samples 20 to 32 across and down: under 16 wide, inside no whole block.
+  const narrow = (x) => [x + 20, 52, x + 32, 64]
+  // Samples 4 to 44: off the block grid, holding the whole block 16 to 32.
+  const shifted = (x) => [x + 4, 40, x + 44, 80]
+  const regions = [narrow(300), shifted(300), narrow(100), shifted(100)]
+  const before = withDoc(source, (doc) => inspectPage(doc, 0, regions))
+  // The faint stripes under the narrow region lie in crossed blocks and within
+  // 48 of white, so the check does not see them: the stated limit.
+  assert.deepEqual(before.map((r) => r.imagesNotBlank), [1, 1, 0, 1], `before the apply: ${JSON.stringify(before)}`)
+  const applied = editPage(source, (doc, page) => {
+    const marks = regions.map((r) => addMark(page, r))
+    assert.equal(applyPage(doc, page, marks, false).result, 1)
+    marks.forEach((mark) => m._FPDFPage_CloseAnnot(mark))
+  })
+  const after = withDoc(applied, (doc) => inspectPage(doc, 0, regions))
+  assert.deepEqual(after.map((r) => r.imagesNotBlank), [0, 0, 0, 0], `after the apply: ${JSON.stringify(after)}`)
+}
+
 // counts a flat image that is not the apply's fill when regions are given
 {
   const red = Buffer.alloc(16 * 16 * 3)
