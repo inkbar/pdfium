@@ -25,6 +25,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1684,6 +1685,9 @@ class Walker {
                  Scope::kPageCopy, true, depth + 1);
           continue;
         }
+        if (!page || Before(object)) {
+          Group(object, to_page, scope, counted, depth);
+        }
         Holder(form, form_object->form_matrix() * to_page, scope, counted,
                depth + 1);
         continue;
@@ -1691,16 +1695,19 @@ class Walker {
       if (page && !Before(object)) {
         continue;
       }
-      if (counted) {
-        Patterns(object, to_page);
-      }
-      if (page) {
-        // Asked of every object, whether or not its box meets a region.
+      // The next three are asked of every object, whether or not its box
+      // meets a region: an apply may have cut the object away from the mark.
+      Group(object, to_page, scope, counted, depth);
+      if (counted || page) {
         std::set<const CPDF_Object*> chain;
-        if (PatternDrawing(object, to_page, false, &chain)) {
+        const Found found = PatternFound(object, to_page, false, &chain);
+        if (counted) {
+          entry_->counts.pattern_content += found.content;
+        }
+        if (page && found.drawing) {
           ++entry_->counts.paths;
         }
-        if (PictureShadingPattern(object, to_page)) {
+        if (page && PictureShadingPattern(object, to_page)) {
           ++entry_->counts.paths;
         }
       }
@@ -1709,6 +1716,11 @@ class Walker {
           const unsigned chars = TextChars(*text, to_page);
           if (page) {
             entry_->counts.text_chars += chars;
+            if (in_group_) {
+              // Text extraction, the page's second test, does not read a
+              // mask's group.
+              entry_->counts.text_chars_second += AdvanceChars(*text, to_page);
+            }
           } else {
             entry_->counts.annotation_text += chars;
             entry_->counts.annotation_text_second +=
@@ -1804,16 +1816,79 @@ class Walker {
     return it == context_->index.order.end() || it->second < entry_->before;
   }
 
-  // Text and images in the content streams of tiling patterns an object
-  // paints into the regions with.
-  void Patterns(CPDF_PageObject* object, const CFX_Matrix& to_page) {
-    CFX_FloatRect box = to_page.TransformRect(object->GetRect());
-    box.Normalize();
-    if (!RectMeetsAnyBBox(box, entry_->regions)) {
+  // The group of the soft mask in effect on |object|, and where its content
+  // lies on the page: through the matrix in effect when the mask was set.
+  // False when the object has no such group.
+  bool GroupOf(const CPDF_PageObject* object,
+               const CFX_Matrix& to_page,
+               RetainPtr<CPDF_Stream>* stream,
+               CFX_Matrix* placed) {
+    const CPDF_GeneralState& state = object->general_state();
+    if (!state.HasRef()) {
+      return false;
+    }
+    RetainPtr<const CPDF_Dictionary> mask = state.GetSoftMask();
+    RetainPtr<const CPDF_Stream> group = mask ? mask->GetStreamFor("G") : nullptr;
+    if (!group) {
+      return false;
+    }
+    // The form only reads the stream; it takes a mutable one for its type.
+    *stream = pdfium::WrapRetain(const_cast<CPDF_Stream*>(group.Get()));
+    const CFX_Matrix* matrix = state.GetSMaskMatrix();
+    *placed = (matrix ? *matrix : CFX_Matrix()) * to_page;
+    return true;
+  }
+
+  // A mask's group, parsed; the work is charged by its objects.
+  std::unique_ptr<CPDF_Form> ParseGroup(RetainPtr<CPDF_Stream> stream) {
+    auto form = std::make_unique<CPDF_Form>(
+        context_->page->GetDocument(), context_->page->GetMutableResources(),
+        std::move(stream));
+    form->ParseContent();
+    context_->work.Spend(1 + form->GetPageObjectCount());
+    return form;
+  }
+
+  // Counts what the group of a soft mask on |object| holds under the
+  // regions, as content of the holder the object lies in. The apply cuts or
+  // removes the object and leaves the group as it was, so the group is read
+  // wherever the object lies. A group in effect on many objects through one
+  // matrix is read once. A group whose place is not finite counts.
+  void Group(const CPDF_PageObject* object,
+             const CFX_Matrix& to_page,
+             Scope scope,
+             bool counted,
+             int depth) {
+    RetainPtr<CPDF_Stream> stream;
+    CFX_Matrix placed;
+    if (!GroupOf(object, to_page, &stream, &placed)) {
       return;
     }
-    std::set<const CPDF_Object*> chain;
-    entry_->counts.pattern_content += PatternsOf(object, &chain);
+    const float numbers[6] = {placed.a, placed.b, placed.c,
+                              placed.d, placed.e, placed.f};
+    GroupKey key;
+    std::get<0>(key) = stream.Get();
+    memcpy(std::get<1>(key).data(), numbers, sizeof(numbers));
+    std::get<2>(key) = static_cast<int>(scope);
+    std::get<3>(key) = counted;
+    if (!groups_.insert(key).second || group_stack_.count(stream.Get())) {
+      return;
+    }
+    if (!Finite(placed)) {
+      ++(scope == Scope::kPage ? entry_->counts.paths
+                               : entry_->counts.annotation_text);
+      return;
+    }
+    const CPDF_Stream* id = stream.Get();
+    std::unique_ptr<CPDF_Form> form = ParseGroup(std::move(stream));
+    if (context_->work.spent) {
+      return;
+    }
+    group_stack_.insert(id);
+    ++in_group_;
+    Holder(form.get(), placed, scope, counted, depth + 1);
+    --in_group_;
+    group_stack_.erase(id);
   }
 
   // Whether a shading that can hold a picture (type 1 or 4 to 7; any type
@@ -1925,10 +2000,29 @@ class Walker {
     CFX_Matrix to_pattern;
   };
 
+  // What a pattern's cell holds under the regions.
+  struct Found {
+    void Add(const Found& other) {
+      content += other.content;
+      drawing = drawing || other.drawing;
+    }
+
+    unsigned content = 0;  // Characters and images.
+    bool drawing = false;  // A path or a shading.
+  };
+
+  // Stands for a cell that could not be read or placed: it counts.
+  static Found Unknown() {
+    Found found;
+    found.content = 1;
+    found.drawing = true;
+    return found;
+  }
+
   struct Landing {
-    bool lands = false;
     bool placed = false;
     Tiling grid;
+    Found found;
     RetainPtr<CPDF_TilingPattern> pattern;
   };
 
@@ -1941,23 +2035,25 @@ class Walker {
     return true;
   }
 
-  // Whether a tiling pattern |object| paints with draws a path or shading
-  // under the regions. The redaction does not enter a pattern's stream, so
-  // what a cell draws under a mark stays in the file, behind the hole the
-  // apply cut in the fill. On the page the cell is placed over the regions
-  // wherever the object lies: an apply may have cut the object back to where
-  // it no longer meets the mark, and the saved file cannot tell that from a
-  // fill that never did. |to_page| places |object|'s holder. |nested|: the
-  // object lies in another pattern's cell, where nothing is cut and only the
-  // part of a region the object's box meets is asked. True too when the
-  // tiling cannot be worked out, or the work ran out.
-  bool PatternDrawing(CPDF_PageObject* object,
-                      const CFX_Matrix& to_page,
-                      bool nested,
-                      std::set<const CPDF_Object*>* chain) {
+  // What the cells of the tiling patterns |object| paints with hold under
+  // the regions: text and images, and drawing. The redaction does not enter
+  // a pattern's stream, so what a cell holds under a mark stays in the file,
+  // behind the hole the apply cut in the fill. On the page (and in an
+  // appearance) the cell is placed over the regions wherever the object
+  // lies: an apply may have cut the object back to where it no longer meets
+  // the mark, and the saved file cannot tell that from a fill that never
+  // did. |to_page| places |object|'s holder. |nested|: the object lies in
+  // another pattern's cell, where nothing is cut and only the part of a
+  // region the object's box meets is asked. A tiling that cannot be worked
+  // out counts with all the cell holds.
+  Found PatternFound(CPDF_PageObject* object,
+                     const CFX_Matrix& to_page,
+                     bool nested,
+                     std::set<const CPDF_Object*>* chain) {
+    Found found;
     const CPDF_ColorState& colors = object->color_state();
     if (!colors.HasRef()) {
-      return false;
+      return found;
     }
     for (bool stroke : {false, true}) {
       const CPDF_Color* color =
@@ -1972,31 +2068,30 @@ class Walker {
       }
       if (chain->size() >= kMaxPatternChain) {
         context_->failed = true;
-        return true;
+        return Unknown();
       }
       chain->insert(tiling->pattern_obj().Get());
-      const bool counts =
-          TilingDrawing(object, tiling, stroke, to_page, nested, chain);
+      found.Add(TilingFound(object, tiling, stroke, to_page, nested, chain));
       chain->erase(tiling->pattern_obj().Get());
-      if (counts || context_->work.spent) {
-        return true;
+      if (context_->work.spent) {
+        return Unknown();
       }
     }
-    return false;
+    return found;
   }
 
-  bool TilingDrawing(CPDF_PageObject* object,
-                     CPDF_TilingPattern* tiling,
-                     bool stroke,
-                     const CFX_Matrix& to_page,
-                     bool nested,
-                     std::set<const CPDF_Object*>* chain) {
+  Found TilingFound(CPDF_PageObject* object,
+                    CPDF_TilingPattern* tiling,
+                    bool stroke,
+                    const CFX_Matrix& to_page,
+                    bool nested,
+                    std::set<const CPDF_Object*>* chain) {
     Landing landing;
     if (nested) {
       landing = Land(object, tiling, to_page, true, chain);
     } else {
-      // On the page the answer is the same for every object painting with
-      // this pattern through this matrix.
+      // The answer is the same for every object painting with this pattern
+      // through this matrix.
       const float numbers[6] = {to_page.a, to_page.b, to_page.c,
                                 to_page.d, to_page.e, to_page.f};
       std::pair<const CPDF_Object*, std::array<uint32_t, 6>> key;
@@ -2006,7 +2101,7 @@ class Walker {
       if (it == landings_.end()) {
         landing = Land(object, tiling, to_page, false, chain);
         if (context_->work.spent) {
-          return true;
+          return Unknown();
         }
         // The pattern is kept, so its object's address stays its own.
         landing.pattern = pdfium::WrapRetain(tiling);
@@ -2014,24 +2109,24 @@ class Walker {
       }
       landing = it->second;
     }
-    if (!landing.lands) {
-      return false;
+    if (!landing.found.content && !landing.found.drawing) {
+      return {};
     }
-    // What the cell draws is no secret when the fill shows a whole tile of
+    // What the cell holds is no secret when the fill shows a whole tile of
     // it elsewhere.
     if (landing.placed && !nested && !stroke) {
       if (const CPDF_PathObject* path = object->AsPath()) {
         if (WholeTileBeside(*path, landing.grid, to_page)) {
-          return false;
+          return {};
         }
       }
     }
-    return true;
+    return landing.found;
   }
 
-  // Whether the cell of |tiling|, tiled over the regions, draws a path or
-  // shading under one. |lands| is true too when the tiling cannot be worked
-  // out; |placed| says whether it could.
+  // What the cell of |tiling|, tiled over the regions, holds under them.
+  // |placed| says whether the tiling could be worked out; when not, the
+  // landing holds all the cell does.
   Landing Land(CPDF_PageObject* object,
                CPDF_TilingPattern* tiling,
                const CFX_Matrix& to_page,
@@ -2040,10 +2135,16 @@ class Walker {
     Landing landing;
     // A pattern's content is parsed on its own, from level 0.
     std::unique_ptr<CPDF_Form> cell = tiling->Load(object);
-    if (!cell || !HasDrawing(cell.get(), 0)) {
+    if (!cell) {
       return landing;
     }
-    landing.lands = true;
+    // Everything in the cell, wherever it lies.
+    const auto all = [&] {
+      Found found;
+      found.content = PatternContent(cell.get(), chain, 0);
+      found.drawing = HasDrawing(cell.get(), 0);
+      return found;
+    };
     CFX_FloatRect bbox = tiling->bbox();
     bbox.Normalize();
     const float x_step = tiling->x_step();
@@ -2052,20 +2153,19 @@ class Walker {
     // parent matrix, which is undone before a tile's shift.
     const CFX_Matrix placed = tiling->pattern_to_form() * to_page;
     const CFX_Matrix& parent = tiling->parent_matrix();
-    if (!Finite(bbox) || !(bbox.Width() > 0) || !(bbox.Height() > 0) ||
-        !std::isfinite(x_step) || !(x_step > 0) || !std::isfinite(y_step) ||
-        !(y_step > 0) || !Invertible(placed) || !Invertible(parent)) {
-      return landing;
-    }
-    landing.placed = true;
-    landing.grid = Tiling{bbox, x_step, y_step, placed, placed.GetInverse()};
-    const Tiling& grid = landing.grid;
     CFX_FloatRect object_box = to_page.TransformRect(object->GetRect());
     object_box.Normalize();
-    if (nested && !Finite(object_box)) {
+    if (!Finite(bbox) || !(bbox.Width() > 0) || !(bbox.Height() > 0) ||
+        !std::isfinite(x_step) || !(x_step > 0) || !std::isfinite(y_step) ||
+        !(y_step > 0) || !Invertible(placed) || !Invertible(parent) ||
+        (nested && !Finite(object_box))) {
+      landing.found = all();
       return landing;
     }
+    landing.grid = Tiling{bbox, x_step, y_step, placed, placed.GetInverse()};
+    const Tiling& grid = landing.grid;
     const CFX_Matrix unparent = parent.GetInverse();
+    Found found;
     for (const RedactRegion& region : entry_->regions) {
       CFX_FloatRect area = region.bbox;
       if (nested) {
@@ -2076,38 +2176,37 @@ class Walker {
       }
       double first[2];
       double last[2];
-      if (!grid.Over(area, false, first, last)) {
-        return landing;
-      }
-      if (!((last[0] - first[0] + 1) * (last[1] - first[1] + 1) <= kMaxTiles)) {
+      if (!grid.Over(area, false, first, last) ||
+          !((last[0] - first[0] + 1) * (last[1] - first[1] + 1) <= kMaxTiles)) {
+        landing.found = all();
         return landing;
       }
       for (double i = first[0]; i <= last[0]; ++i) {
         for (double j = first[1]; j <= last[1]; ++j) {
           if (!context_->work.Spend(1)) {
+            landing.found = Unknown();
             return landing;
           }
           const CFX_Matrix tile = grid.Tile(i, j);
           CFX_FloatRect tile_box = tile.TransformRect(bbox);
           tile_box.Normalize();
           if (!Finite(tile_box)) {
+            landing.found = all();
             return landing;
           }
-          if (!Intersects(tile_box, region.bbox)) {
-            continue;
-          }
-          if (CellDrawing(cell.get(), unparent * tile, chain, 0)) {
-            return landing;
+          if (Intersects(tile_box, region.bbox)) {
+            Cell(cell.get(), unparent * tile, chain, 0, &found);
           }
         }
       }
     }
-    landing.lands = false;
+    landing.placed = true;
+    landing.found = found;
     return landing;
   }
 
-  // Whether a cell holds anything PatternDrawing() looks for: a path, a
-  // shading, or an object painted with a pattern of its own.
+  // Whether a cell holds a path, a shading, or an object painted with a
+  // pattern of its own.
   bool HasDrawing(CPDF_PageObjectHolder* holder, int depth) {
     if (depth > kFormLevelLimit) {
       context_->failed = true;
@@ -2139,60 +2238,83 @@ class Walker {
     return false;
   }
 
-  // Whether a path or shading of a cell, placed on the page by |to_page|,
-  // counts under the regions by the tests the page's own paths and shadings
-  // get, boxes first. Objects in the cell painted with patterns follow from
-  // this placement.
-  bool CellDrawing(CPDF_PageObjectHolder* holder,
-                   const CFX_Matrix& to_page,
-                   std::set<const CPDF_Object*>* chain,
-                   int depth) {
+  // Adds to |found| what a cell, placed on the page by |to_page|, holds
+  // under the regions, by the tests the page's own content gets, boxes
+  // first: text by its glyphs' boxes, images by their samples, paths and
+  // shadings as on the page. Objects in the cell painted with patterns
+  // follow from this placement, and so do the groups of soft masks.
+  void Cell(CPDF_PageObjectHolder* holder,
+            const CFX_Matrix& to_page,
+            std::set<const CPDF_Object*>* chain,
+            int depth,
+            Found* found) {
     if (depth > kFormLevelLimit) {
       context_->failed = true;
-      return true;
+      found->Add(Unknown());
+      return;
     }
     for (auto it = holder->begin(); it != holder->end(); ++it) {
       CPDF_PageObject* object = it->get();
       if (!context_->work.Spend(1)) {
-        return true;
+        found->Add(Unknown());
+        return;
       }
       if (!object->IsActive()) {
         continue;
       }
+      RetainPtr<CPDF_Stream> stream;
+      CFX_Matrix placed;
+      if (GroupOf(object, to_page, &stream, &placed) &&
+          !group_stack_.count(stream.Get())) {
+        if (!Finite(placed)) {
+          found->Add(Unknown());
+        } else {
+          const CPDF_Stream* id = stream.Get();
+          std::unique_ptr<CPDF_Form> group = ParseGroup(std::move(stream));
+          group_stack_.insert(id);
+          Cell(group.get(), placed, chain, depth + 1, found);
+          group_stack_.erase(id);
+        }
+      }
       if (CPDF_FormObject* form = object->AsForm()) {
-        if (form->form() &&
-            CellDrawing(form->form(), form->form_matrix() * to_page, chain,
-                        depth + 1)) {
-          return true;
+        if (form->form()) {
+          Cell(form->form(), form->form_matrix() * to_page, chain, depth + 1,
+               found);
         }
         continue;
       }
       CFX_FloatRect box = to_page.TransformRect(object->GetRect());
       box.Normalize();
       if (!Finite(box)) {
-        return true;
+        found->Add(Unknown());
+        continue;
       }
       if (!RectMeetsAnyBBox(box, entry_->regions)) {
         continue;
       }
-      if (PatternDrawing(object, to_page, true, chain) ||
-          PictureShadingPattern(object, to_page)) {
-        return true;
+      found->Add(PatternFound(object, to_page, true, chain));
+      if (PictureShadingPattern(object, to_page)) {
+        found->drawing = true;
       }
-      if (CPDF_PathObject* path = object->AsPath()) {
+      if (CPDF_TextObject* text = object->AsText()) {
+        found->content +=
+            std::max(TextChars(*text, to_page), AdvanceChars(*text, to_page));
+      } else if (CPDF_ImageObject* image = object->AsImage()) {
+        if (ImageCounts(*image, to_page)) {
+          ++found->content;
+        }
+      } else if (CPDF_PathObject* path = object->AsPath()) {
         if (PathCrosses(*redactor_, *path, to_page) ||
             PathSampleInside(*path, to_page)) {
-          return true;
+          found->drawing = true;
         }
       } else if (CPDF_ShadingObject* shading = object->AsShading()) {
-        if (PictureShading(shading->pattern(),
-                           shading->matrix() * to_page) ||
+        if (PictureShading(shading->pattern(), shading->matrix() * to_page) ||
             ShadingCounts(*shading, to_page)) {
-          return true;
+          found->drawing = true;
         }
       }
     }
-    return false;
   }
 
   // Appends |path| under |fill|, placed by |to_page|, to |shapes| as edges.
@@ -2467,6 +2589,13 @@ class Walker {
   std::map<ShadingKey, std::pair<CPDF_ClipPath, bool>> shadings_;
   std::map<std::pair<const CPDF_Object*, std::array<uint32_t, 6>>, Landing>
       landings_;
+  // A mask's group, where it lies, the scope and whether it is counted.
+  using GroupKey =
+      std::tuple<const CPDF_Stream*, std::array<uint32_t, 6>, int, bool>;
+  std::set<GroupKey> groups_;
+  // The groups being read, so that one that masks its own content ends.
+  std::set<const CPDF_Stream*> group_stack_;
+  int in_group_ = 0;
 };
 
 // The second test for page text: the boxes PDFium's text extraction gives
@@ -2753,7 +2882,7 @@ void Inspect(Context* context, Entry* entry) {
     context->failed = true;
     return;
   }
-  entry->counts.text_chars_second = ExtractedChars(context, *entry);
+  entry->counts.text_chars_second += ExtractedChars(context, *entry);
 
   const size_t content = context->index.content_count;
   RetainPtr<const CPDF_Array> annots = page->GetAnnotsArray();

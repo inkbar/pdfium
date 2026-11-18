@@ -1353,8 +1353,8 @@ const clippedAway = (points) => `${roundPath(points)} W n 0 0 400 200 re 3 3 394
 // Drawing inside tiling patterns. The redaction does not enter a pattern's
 // stream, so a shape its cell draws under a mark stays in the file.
 const PATTERN_MARK = [150, 60, 250, 140]
-const tiling = (bbox, xStep, yStep, content, entries = '/PaintType 1') =>
-  streamObject(`/Type /Pattern /PatternType 1 ${entries} /TilingType 1 /BBox [${bbox.join(' ')}] /XStep ${xStep} /YStep ${yStep} /Resources << >>`, content)
+const tiling = (bbox, xStep, yStep, content, entries = '/PaintType 1', resources = '') =>
+  streamObject(`/Type /Pattern /PatternType 1 ${entries} /TilingType 1 /BBox [${bbox.join(' ')}] /XStep ${xStep} /YStep ${yStep} /Resources << ${resources} >>`, content)
 // A cell the size of the page: a quadrilateral under the mark and a square beside it.
 const pageCell = tiling([0, 0, 400, 200], 400, 200, '1 0 1 rg 170 80 m 230 85 l 220 120 l 180 115 l h f 0 0 1 rg 300 80 40 40 re f')
 // A page that fills |fill| (path operators) with /P0, the first of |patterns|.
@@ -1407,6 +1407,31 @@ function underAppliedMark(source, rect = PATTERN_MARK) {
   assert.equal(under(beside).paths, 0, 'a large cell that draws nothing where the region is')
   const hatch = tiling([0, 0, 10, 10], 10, 10, '0 G 1 w 0 0 m 10 10 l S')
   assert.equal(under(hatch).paths, 0, 'a hatch painted elsewhere, whole tiles in view')
+}
+
+// counts text and an image in a cell under a mark that took one whole side of the fill
+{
+  const side = [10, 40, 200, 160]
+  const words = tiling([0, 0, 400, 200], 400, 200, 'BT /F1 12 Tf 60 100 Td (CELLSECRET) Tj ET', '/PaintType 1', '/Font << /F1 5 0 R >>')
+  const text = underAppliedMark(patternPage('20 50 360 100 re f', [words]), side)
+  assert.ok(text.patternContent > 0, `a cell's text under a mark across the fill's side: ${JSON.stringify(text)}`)
+  assert.equal(text.textChars, 0, 'pattern text counted as page text')
+  const pixels = Buffer.alloc(16 * 16 * 3)
+  for (let i = 0; i < 256; i++) pixels.set([(i % 16) * 16, Math.floor(i / 16) * 16, 128], i * 3)
+  const picture = tiling([0, 0, 400, 200], 400, 200, 'q 60 0 0 40 60 80 cm /Im0 Do Q', '/PaintType 1', '/XObject << /Im0 7 0 R >>')
+  const image = underAppliedMark(
+    patternPage('20 50 360 100 re f', [picture, streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8', pixels)]),
+    side,
+  )
+  assert.ok(image.patternContent > 0, `a cell's image under a mark across the fill's side: ${JSON.stringify(image)}`)
+  // An inline image is an image like any other.
+  const hex = Array.from({ length: 48 }, (_, i) => ((i * 37) % 256).toString(16).padStart(2, '0')).join('')
+  const inline = tiling([0, 0, 400, 200], 400, 200, `q 60 0 0 40 60 80 cm BI /W 4 /H 4 /CS /RGB /BPC 8 /F /AHx ID ${hex}> EI Q`)
+  const inlined = underAppliedMark(patternPage('20 50 360 100 re f', [inline]), side)
+  assert.ok(inlined.patternContent > 0, `a cell's inline image under a mark across the fill's side: ${JSON.stringify(inlined)}`)
+  // The same cells where they hold nothing under the region.
+  const [beside] = withDoc(patternPage('20 50 360 100 re f', [words]), (doc) => inspectPage(doc, 0, [[300, 60, 380, 140]]))
+  assert.equal(beside.patternContent, 0, `a cell's text beside the region: ${JSON.stringify(beside)}`)
 }
 
 // does not count a hatch that the fill also shows whole beside the mark
@@ -1523,6 +1548,191 @@ function pathsAround(source) {
   const [before, after, beside] = pathsAround(source)
   assert.ok(before > 0 && after > 0, `a mesh pattern fill before the apply (${before}) and after it (${after})`)
   assert.equal(beside, 0, 'a mesh pattern fill beside the mark')
+}
+
+// Soft mask groups. The apply cuts the object painted through a mask and
+// leaves the mask's group as it was.
+const maskedPage = (fill, group, extra = []) =>
+  onePagePdf(`q /GS0 gs 0 0 1 rg ${fill} Q BT /F1 12 Tf 20 20 Td (KEEP) Tj ET`, { resources: '/ExtGState << /GS0 << /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >>' }, [group, ...extra])
+const maskGroup = (content, resources = '/Font << /F1 5 0 R >>') =>
+  streamObject(`/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Group << /S /Transparency /CS /DeviceGray >> /Resources << ${resources} >>`, content)
+
+// counts what a soft mask group holds under a mark its object reaches past
+{
+  const band = '20 50 360 100 re f'
+  const text = underAppliedMark(maskedPage(band, maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET')))
+  assert.ok(text.textChars > 0, `a mask group's text under the applied mark: ${JSON.stringify(text)}`)
+  const pixels = Buffer.alloc(16 * 16)
+  for (let i = 0; i < 256; i++) pixels[i] = i
+  const image = underAppliedMark(
+    maskedPage(band, maskGroup('q 80 0 0 60 160 70 cm /Im0 Do Q', '/XObject << /Im0 7 0 R >>'), [
+      streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceGray /BitsPerComponent 8', pixels),
+    ]),
+  )
+  assert.ok(image.imagesNotBlank > 0, `a mask group's image under the applied mark: ${JSON.stringify(image)}`)
+  const drawing = underAppliedMark(maskedPage(band, maskGroup('1 g 170 80 m 230 85 l 220 120 l h f')))
+  assert.ok(drawing.paths > 0, `a mask group's drawing under the applied mark: ${JSON.stringify(drawing)}`)
+  const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, r.annotationText, r.annotationImages]
+  const outside = underAppliedMark(maskedPage(band, maskGroup('1 g BT /F1 12 Tf 300 100 Td (ELSEWHERE) Tj ET 300 60 40 20 re f')))
+  assert.deepEqual(zeros(outside), [0, 0, 0, 0, 0, 0], `a mask group that holds nothing under the mark: ${JSON.stringify(outside)}`)
+  const removed = underAppliedMark(maskedPage('160 70 80 60 re f', maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET')))
+  assert.deepEqual(zeros(removed), [0, 0, 0, 0, 0, 0], `a masked object the apply removed: ${JSON.stringify(removed)}`)
+  // A mask set inside a form lies where the form's matrix puts it, and one
+  // set in an annotation's appearance counts as annotation text.
+  const masked = '/Resources << /ExtGState << /GS0 << /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >> >>'
+  const group = maskGroup('1 g BT /F1 12 Tf 65 100 Td (MASKSECRET) Tj ET')
+  const inForm = onePagePdf('/Fm0 Do', { resources: '/XObject << /Fm0 7 0 R >>' }, [
+    group,
+    streamObject(`/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Matrix [1 0 0 1 100 0] ${masked}`, '/GS0 gs 0 0 1 rg 0 50 260 100 re f'),
+  ])
+  const formed = underAppliedMark(inForm)
+  assert.ok(formed.textChars > 0, `the group of a mask set inside a form: ${JSON.stringify(formed)}`)
+  const inAppearance = onePagePdf('', { page: '/Annots [7 0 R]' }, [
+    maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET'),
+    '<< /Type /Annot /Subtype /Square /Rect [20 50 380 150] /AP << /N 8 0 R >> >>',
+    streamObject(`/Type /XObject /Subtype /Form /BBox [20 50 380 150] ${masked}`, '/GS0 gs 0 0 1 rg 20 50 360 100 re f'),
+  ])
+  const [appearance] = withDoc(inAppearance, (doc) => inspectPage(doc, 0, [PATTERN_MARK]))
+  assert.ok(appearance.annotationText > 0, `the group of a mask set in an appearance: ${JSON.stringify(appearance)}`)
+}
+
+// Other content defined once and painted through a reference: what an apply
+// over it leaves in the saved file, and what the check then counts.
+{
+  const keep = 'BT /F1 12 Tf 20 20 Td (KEEP) Tj ET'
+  const pixels = Buffer.alloc(16 * 16 * 3)
+  for (let i = 0; i < 256; i++) pixels.set([(i % 16) * 16, Math.floor(i / 16) * 16, 128], i * 3)
+  const type3 = [
+    '<< /Type /Font /Subtype /Type3 /FontBBox [0 0 1000 1000] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 7 0 R /b 8 0 R >> /Encoding << /Type /Encoding /Differences [97 /a /b] >> /FirstChar 97 /LastChar 98 /Widths [1000 1000] >>',
+    streamObject('', '1000 0 0 0 1000 1000 d1 111.5 222.5 m 900 100 l 500 933.5 l h f'),
+    streamObject('', '1000 0 0 0 1000 1000 d1 100 100 800 800 re f'),
+  ]
+  // Each: a name, a page, what must be gone from the saved file, and what may stay.
+  const cases = [
+    ['a Type 3 glyph used only under the mark', onePagePdf(`BT /T3 40 Tf 180 80 Td (a) Tj ET BT /T3 40 Tf 300 80 Td (b) Tj ET ${keep}`, { resources: '/Font << /T3 6 0 R >>' }, type3), ['111.5 222.5'], []],
+    // The glyph the page still shows beside the mark keeps its procedure.
+    ['a Type 3 glyph used under the mark and beside it', onePagePdf(`BT /T3 40 Tf 205 80 Td (a) Tj ET BT /T3 40 Tf 300 80 Td (a) Tj ET ${keep}`, { resources: '/Font << /T3 6 0 R >>' }, type3), [], ['111.5 222.5']],
+    // The use beside the mark still shows the form's text.
+    [
+      'a form painted under the mark and beside it',
+      onePagePdf(`q 1 0 0 1 160 90 cm /Fm0 Do Q q 1 0 0 1 20 160 cm /Fm0 Do Q ${keep}`, { resources: '/XObject << /Fm0 6 0 R >>' }, [
+        streamObject('/Type /XObject /Subtype /Form /BBox [0 0 100 30] /Resources << /Font << /F1 5 0 R >> >>', 'BT /F1 12 Tf 5 10 Td (FORMSECRET) Tj ET'),
+      ]),
+      [],
+      ['FORMSECRET'],
+    ],
+    [
+      'a transparency group form',
+      onePagePdf(`/Fm0 Do ${keep}`, { resources: '/XObject << /Fm0 6 0 R >>' }, [
+        streamObject(
+          '/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Group << /S /Transparency /CS /DeviceRGB /I true >> /PieceInfo << /App << /Private (PRIVATESECRET) >> >> /Resources << /Font << /F1 5 0 R >> >>',
+          'BT /F1 12 Tf 165 100 Td (GROUPSECRET) Tj 150 0 Td (GROUPKEEP) Tj ET',
+        ),
+      ]),
+      ['GROUPSECRET', 'PRIVATESECRET'],
+      ['GROUPKEEP'],
+    ],
+    [
+      'text on a hidden layer',
+      onePagePdf(`/OC /MC0 BDC BT /F1 12 Tf 165 100 Td (HIDDENSECRET) Tj ET EMC ${keep}`, { resources: '/Properties << /MC0 6 0 R >>', catalog: '/OCProperties << /OCGs [6 0 R] /D << /OFF [6 0 R] /Order [6 0 R] >> >>' }, [
+        '<< /Type /OCG /Name (Hidden) >>',
+      ]),
+      ['HIDDENSECRET'],
+      [],
+    ],
+    // The annotation beside the mark still shows the appearance.
+    [
+      'an appearance two annotations share',
+      onePagePdf(keep, { page: '/Annots [6 0 R 7 0 R]' }, [
+        '<< /Type /Annot /Subtype /Stamp /Rect [160 90 240 120] /AP << /N 8 0 R >> >>',
+        '<< /Type /Annot /Subtype /Stamp /Rect [20 160 100 190] /AP << /N 8 0 R >> >>',
+        streamObject('/Type /XObject /Subtype /Form /BBox [0 0 80 30] /Resources << /Font << /F1 5 0 R >> >>', 'BT /F1 12 Tf 5 10 Td (APSECRET) Tj ET'),
+      ]),
+      [],
+      ['APSECRET'],
+    ],
+    ['replacement text on a span', onePagePdf(`/Span << /ActualText (ACTUALSECRET) /Alt (ALTSECRET) >> BDC BT /F1 12 Tf 165 100 Td (xx) Tj ET EMC ${keep}`), ['ACTUALSECRET', 'ALTSECRET'], []],
+    ['replacement text on a span partly under the mark', onePagePdf(`/Span << /ActualText (PARTSECRET) >> BDC BT /F1 12 Tf 230 100 Td (xxxxxxxx) Tj ET EMC ${keep}`), ['PARTSECRET'], []],
+    [
+      'replacement text in /Properties',
+      onePagePdf(`/Span /MC0 BDC BT /F1 12 Tf 165 100 Td (xx) Tj ET EMC ${keep}`, { resources: '/Properties << /MC0 << /ActualText (PROPSECRET) /Alt (PROPALT) >> >>' }),
+      ['PROPSECRET', 'PROPALT'],
+      [],
+    ],
+    [
+      'replacement text on a structure element',
+      onePagePdf(`/P << /MCID 0 >> BDC BT /F1 12 Tf 165 100 Td (xx) Tj ET EMC ${keep}`, { catalog: '/StructTreeRoot 6 0 R /MarkInfo << /Marked true >>', page: '/StructParents 0' }, [
+        '<< /Type /StructTreeRoot /K 7 0 R /ParentTree << /Nums [0 [7 0 R]] >> >>',
+        '<< /Type /StructElem /S /P /P 6 0 R /Pg 3 0 R /K 0 /ActualText (STRUCTSECRET) /Alt (STRUCTALT) >>',
+      ]),
+      ['STRUCTSECRET', 'STRUCTALT'],
+      [],
+    ],
+    [
+      'a field value',
+      onePagePdf(keep, { catalog: '/AcroForm << /Fields [6 0 R] >>', page: '/Annots [6 0 R]' }, [
+        '<< /Type /Annot /Subtype /Widget /FT /Tx /T (name) /V (FIELDSECRET) /Rect [160 90 240 120] /DA (/F1 12 Tf 0 g) >>',
+      ]),
+      ['FIELDSECRET'],
+      [],
+    ],
+    [
+      'a note and its popup',
+      onePagePdf(keep, { page: '/Annots [6 0 R 7 0 R]' }, [
+        '<< /Type /Annot /Subtype /Text /Rect [160 90 180 110] /Contents (NOTESECRET) /Popup 7 0 R >>',
+        '<< /Type /Annot /Subtype /Popup /Rect [300 150 380 190] /Parent 6 0 R /Contents (POPSECRET) >>',
+      ]),
+      ['NOTESECRET', 'POPSECRET'],
+      [],
+    ],
+    [
+      'an attached file',
+      onePagePdf(keep, { page: '/Annots [6 0 R]' }, [
+        '<< /Type /Annot /Subtype /FileAttachment /Rect [160 90 180 110] /FS << /Type /Filespec /F (a.txt) /EF << /F 7 0 R >> >> >>',
+        streamObject('/Type /EmbeddedFile', 'ATTACHSECRET', true),
+      ]),
+      ['ATTACHSECRET'],
+      [],
+    ],
+    [
+      'an image with an alternate, metadata and private data',
+      onePagePdf(`q 360 0 0 100 20 50 cm /Im0 Do Q ${keep}`, { resources: '/XObject << /Im0 6 0 R >>' }, [
+        streamObject(
+          '/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Alternates [<< /Image 7 0 R /DefaultForPrinting true >>] /Metadata 8 0 R /PieceInfo << /App << /Private (IMAGEPRIVATESECRET) >> >>',
+          pixels,
+        ),
+        streamObject('/Type /XObject /Subtype /Image /Width 16 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8', Buffer.from('ALTIMAGESECRET'.repeat(60)).subarray(0, 768), true),
+        streamObject('/Type /Metadata /Subtype /XML', '<x>IMAGEMETASECRET</x>', true),
+      ]),
+      ['ALTIMAGESECRET', 'IMAGEMETASECRET', 'IMAGEPRIVATESECRET'],
+      [],
+    ],
+    [
+      'a page thumbnail and private data',
+      onePagePdf(`BT /F1 12 Tf 165 100 Td (xx) Tj ET ${keep}`, { page: '/Thumb 6 0 R /PieceInfo << /App << /Private (PAGEPRIVATESECRET) >> >>' }, [
+        streamObject('/Width 16 /Height 16 /ColorSpace /DeviceRGB /BitsPerComponent 8', Buffer.from('THUMBSECRET'.repeat(70)).subarray(0, 768), true),
+      ]),
+      ['THUMBSECRET', 'PAGEPRIVATESECRET'],
+      [],
+    ],
+    ['text used as a clip', onePagePdf(`q BT /F1 40 Tf 7 Tr 160 80 Td (CLIP) Tj ET 0 0 1 rg 0 0 400 200 re f Q ${keep}`), ['CLIP'], []],
+  ]
+  const wrong = []
+  for (const [name, source, gone, stays] of cases) {
+    for (const trace of [...gone, ...stays]) assert.ok(shows(inflateStreams(source), trace), `${name}: the source lacks ${trace}`)
+    const applied = editPage(source, (doc, page) => {
+      const mark = addMark(page, PATTERN_MARK)
+      assert.equal(applyPage(doc, page, [mark], false).result, 1)
+      m._FPDFPage_CloseAnnot(mark)
+    })
+    const saved = inflateStreams(applied)
+    const [after] = withDoc(applied, (doc) => inspectPage(doc, 0, [PATTERN_MARK]))
+    for (const trace of gone) if (shows(saved, trace)) wrong.push(`${name}: ${trace} is still in the file`)
+    for (const trace of stays) if (!shows(saved, trace)) wrong.push(`${name}: ${trace} is gone`)
+    if (after.textChars + after.imagesNotBlank + after.paths + after.patternContent + after.annotationText + after.annotationImages) wrong.push(`${name}: ${JSON.stringify(after)}`)
+    assert.ok(shows(saved, 'KEEP'), `${name}: the kept text is gone`)
+  }
+  assert.deepEqual(wrong, [], 'what an apply left behind')
 }
 
 // Leaves nothing in the saved file of a resource whose only use lay wholly
@@ -1657,39 +1867,45 @@ function pathsAround(source) {
 
 // inspects text inside a tiling pattern
 {
-  const source = onePagePdf(
-    '/Pattern cs /P0 scn 50 50 200 100 re f',
-    { resources: '/Pattern << /P0 6 0 R >>' },
-    [
-      streamObject(
-        '/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 50 20] /XStep 50 /YStep 20 /Resources << /Font << /F1 5 0 R >> >>',
-        'BT /F1 10 Tf 0 5 Td (TILE) Tj ET',
-      ),
-    ],
-  )
+  // A cell wider than the part of the fill beside the region: no whole tile
+  // of it shows elsewhere.
+  const cell = (bbox) =>
+    streamObject(
+      `/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 ${bbox}] /XStep ${bbox.split(' ')[0]} /YStep ${bbox.split(' ')[1]} /Resources << /Font << /F1 5 0 R >> >>`,
+      'BT /F1 10 Tf 5 5 Td (TILE) Tj ET',
+    )
+  const page = (bbox) => onePagePdf('/Pattern cs /P0 scn 50 50 200 100 re f', { resources: '/Pattern << /P0 6 0 R >>' }, [cell(bbox)])
   const region = [60, 60, 100, 100]
-  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [region]))
+  const source = page('150 80')
+  const [before] = withDoc(source, (doc) => inspectPage(doc, 0, [[140, 70, 200, 100]]))
   assert.ok(before.patternContent > 0, `pattern text under the region: ${JSON.stringify(before)}`)
   assert.equal(before.textChars, 0, 'pattern text counted as page text')
-  const applied = editPage(source, (doc, page) => {
-    const mark = addMark(page, region)
-    assert.equal(applyPage(doc, page, [mark], false).result, 1)
-    m._FPDFPage_CloseAnnot(mark)
-  })
+  const apply = (bytes, rect) =>
+    editPage(bytes, (doc, page) => {
+      const mark = addMark(page, rect)
+      assert.equal(applyPage(doc, page, [mark], false).result, 1)
+      m._FPDFPage_CloseAnnot(mark)
+    })
   // The apply does not enter patterns; the check still sees the text.
-  const [after] = withDoc(applied, (doc) => inspectPage(doc, 0, [region]))
+  const [after] = withDoc(apply(source, [140, 70, 200, 100]), (doc) => inspectPage(doc, 0, [[140, 70, 200, 100]]))
   assert.ok(after.patternContent > 0, 'the check lost the pattern text after the apply')
+  // A small cell tiled many times: the fill shows whole tiles of the same
+  // text beside the mark, so what lies under it is no secret.
+  const tiled = page('50 20')
+  const [shown] = withDoc(apply(tiled, region), (doc) => inspectPage(doc, 0, [region]))
+  assert.equal(shown.patternContent, 0, `text the fill shows whole elsewhere: ${JSON.stringify(shown)}`)
 }
 
 // reads tiling patterns inside patterns and inside annotation appearances
 {
-  const tile = '/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 50 20] /XStep 50 /YStep 20'
+  // Cells 150 pt wide, so that neither fill shows a whole tile beside its region.
+  const tile = '/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 150 80] /XStep 150 /YStep 80'
   const source = onePagePdf(
     '/Pattern cs /P1 scn 50 50 200 100 re f',
     { resources: '/Pattern << /P1 7 0 R >>', page: '/Annots [8 0 R]' },
     [
-      streamObject(`${tile} /Resources << /Font << /F1 5 0 R >> >>`, 'BT /F1 10 Tf 0 5 Td (TILE) Tj ET'),
-      streamObject(`${tile} /Resources << /Pattern << /P0 6 0 R >> >>`, '/Pattern cs /P0 scn 0 0 50 20 re f'),
+      streamObject(`${tile} /Resources << /Font << /F1 5 0 R >> >>`, 'BT /F1 10 Tf 65 65 Td (TILE) Tj 65 0 Td (TILE) Tj ET'),
+      streamObject(`${tile} /Resources << /Pattern << /P0 6 0 R >> >>`, '/Pattern cs /P0 scn 0 0 150 80 re f'),
       '<< /Type /Annot /Subtype /Square /Rect [260 50 360 150] /AP << /N 9 0 R >> >>',
       streamObject('/Type /XObject /Subtype /Form /BBox [260 50 360 150] /Resources << /Pattern << /P0 6 0 R >> >>', '/Pattern cs /P0 scn 260 50 100 100 re f'),
     ],
