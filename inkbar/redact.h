@@ -76,11 +76,10 @@ int INK_Redact_OwnLockedQuads(FPDF_DOCUMENT doc,
 //
 // Counted are the objects, in the page content and in forms at any depth,
 // that paint in the region (their shape and every clip in effect, those of
-// enclosing form objects included) and are one of the kinds below. Not
-// counted is an object whose shape lies wholly inside one region of the
-// call when every other object painting with the same pattern, shading or
-// mask group does too: the apply removes those outright, and what they
-// carry leaves the file. The kinds:
+// enclosing form objects included) and are one of the kinds below. One
+// counts even when the region covers its whole shape: the apply cannot be
+// shown to remove every reference that keeps what it carries in the file.
+// The kinds:
 //   patterns: painting with a tiling pattern;
 //   shadings: a shading that is not a plain ramp (types 1 and 4 to 7, and
 //     an axial or radial shading whose function is not plain), painted with

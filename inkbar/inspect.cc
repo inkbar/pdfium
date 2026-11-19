@@ -1524,8 +1524,6 @@ struct Entry {
   std::vector<RedactRegion> second;
   // The regions shrunk as the path redactor's are.
   std::vector<RedactRegion> inset;
-  // Whether the regions were cut to the page: they are then not the mark's.
-  bool changed = false;
   // What INK_Redact_Unremovable counts.
   unsigned patterns = 0;
   unsigned shadings = 0;
@@ -1570,13 +1568,6 @@ struct Context {
   };
   std::map<std::tuple<const CPDF_Font*, uint32_t, const CPDF_Dictionary*>, Glyph>
       glyphs;
-  // For the gate: the regions of the call that are the marks' own (shrunk by
-  // the path inset), how many times each form is drawn, and for each carrier
-  // (a pattern, a shading, a mask's group) whether every object painting
-  // with it lies wholly inside one of those regions and is drawn once.
-  std::vector<RedactRegion> exact;
-  std::map<const CPDF_Stream*, unsigned> form_draws;
-  std::map<const CPDF_Object*, bool> carriers;
   // Where each shading read so far can paint, by its shading object.
   std::map<const CPDF_Object*, OwnBox> shading_boxes;
   bool failed = false;
@@ -1892,9 +1883,7 @@ class Walker {
 
   // What INK_Redact_Unremovable counts in |holder|: the objects that paint
   // in a region and carry what the apply cannot rewrite. Forms are read
-  // whatever tags they carry: before an apply none is ours to trust. An
-  // object whose own shape lies wholly inside a region is not counted: the
-  // apply removes it outright, and what it carries leaves the file with it.
+  // whatever tags they carry: before an apply none is ours to trust.
   void Unremovable(CPDF_PageObjectHolder* holder,
                    const CFX_Matrix& to_page,
                    int depth,
@@ -1917,7 +1906,6 @@ class Walker {
         if (!form) {
           continue;
         }
-        // A form is emptied, not removed, and keeps its mask: no exemption.
         if (PaintsIn(object, to_page, clips) &&
             GroupHolds(object, to_page, inherited, 0)) {
           ++entry_->mask_groups;
@@ -1937,103 +1925,30 @@ class Walker {
           ++entry_->glyphs;
         }
       }
+      // A carrier counts wherever its object's shape ends, even wholly inside
+      // the region: the apply cannot be shown to remove every reference
+      // that keeps what the object carries in the file.
       if (!Carries(object) || !PaintsIn(object, to_page, clips)) {
         continue;
       }
-      // Not counted: an object the apply removes outright, when everything
-      // else painting with the same carrier goes too.
-      const bool inside = InsideOne(*context_, object, to_page);
-      if (PaintsWithTiling(object) &&
-          !(inside && AllGo(PatternIds(object, false)))) {
+      if (PaintsWithTiling(object)) {
         ++entry_->patterns;
       }
       const CPDF_ShadingObject* shading = object->AsShading();
-      bool picture = false;
-      if (shading &&
-          PictureShading(shading->pattern(), shading->matrix() * to_page)) {
-        picture = !(inside && AllGo({ShadingId(object)}));
-      }
-      if (PictureShadingPattern(object, to_page) &&
-          !(inside && AllGo(PatternIds(object, true)))) {
-        picture = true;
-      }
-      if (picture) {
+      if ((shading && PictureShading(shading->pattern(),
+                                     shading->matrix() * to_page)) ||
+          PictureShadingPattern(object, to_page)) {
         ++entry_->shadings;
       }
       // A mask the object inherits is counted once, at the form object it
-      // comes through, which stays on the page with its mask.
+      // comes through.
       const CPDF_GeneralState& state = object->general_state();
       const bool own_mask =
           !inherited || !state.HasRef() ||
           state.GetSoftMask().Get() != inherited->mask ||
           !state.GetSMaskMatrix() || !(*state.GetSMaskMatrix() == inherited->matrix);
-      if (own_mask && GroupHolds(object, to_page, inherited, 0) &&
-          !(inside && AllGo({MaskId(object)}))) {
+      if (own_mask && GroupHolds(object, to_page, inherited, 0)) {
         ++entry_->mask_groups;
-      }
-    }
-  }
-
-  // Counts how many times each form is drawn in |holder|, forms in forms
-  // once for each time their parent is.
-  static void CountForms(Context* context,
-                         CPDF_PageObjectHolder* holder,
-                         int depth) {
-    if (depth > kFormLevelLimit) {
-      context->failed = true;
-      return;
-    }
-    for (auto it = holder->begin(); it != holder->end(); ++it) {
-      if (!context->work.Spend(1)) {
-        return;
-      }
-      CPDF_FormObject* form_object = it->get()->AsForm();
-      if (form_object && form_object->form() && it->get()->IsActive()) {
-        ++context->form_draws[form_object->form()->GetStream().Get()];
-        CountForms(context, form_object->form(), depth + 1);
-      }
-    }
-  }
-
-  // Notes, for every carrier an object of |holder| paints with, whether that
-  // object lies wholly inside one of the call's regions. |repeated|: the
-  // holder is a form drawn more than once, or lies in one; nothing in it
-  // counts as inside, since each drawing may land elsewhere.
-  static void Survey(Context* context,
-                     CPDF_PageObjectHolder* holder,
-                     const CFX_Matrix& to_page,
-                     int depth,
-                     bool repeated) {
-    if (depth > kFormLevelLimit) {
-      context->failed = true;
-      return;
-    }
-    for (auto it = holder->begin(); it != holder->end(); ++it) {
-      if (!context->work.Spend(1)) {
-        return;
-      }
-      CPDF_PageObject* object = it->get();
-      if (!object->IsActive()) {
-        continue;
-      }
-      const bool inside = !repeated && InsideOne(*context, object, to_page);
-      std::vector<const CPDF_Object*> ids = PatternIds(object, false);
-      for (const CPDF_Object* id : PatternIds(object, true)) {
-        ids.push_back(id);
-      }
-      ids.push_back(ShadingId(object));
-      ids.push_back(MaskId(object));
-      for (const CPDF_Object* id : ids) {
-        if (id) {
-          auto found = context->carriers.emplace(id, true).first;
-          found->second = found->second && inside;
-        }
-      }
-      if (CPDF_FormObject* form_object = object->AsForm()) {
-        if (CPDF_Form* form = form_object->form()) {
-          Survey(context, form, form_object->form_matrix() * to_page, depth + 1,
-                 repeated || context->form_draws[form->GetStream().Get()] > 1);
-        }
       }
     }
   }
@@ -2219,18 +2134,22 @@ class Walker {
     group_stack_.erase(id);
   }
 
-  // Whether a group draws nothing but a fade: plain ramps and at most four
-  // filled axis-aligned rectangles, each under no clip but one axis-aligned
-  // rectangle, which is how gradient transparency is drawn. Text, an image,
-  // any other path, a shading that can hold a picture, a pattern, a form, a
-  // mask of its own or a clip to a shape makes it more than that: a ramp
-  // through a shape is the shape, and many rectangles can draw anything.
+  // Whether a group draws nothing but a fade, which is how gradient
+  // transparency is drawn: at most four objects, each a filled axis-aligned
+  // rectangle or a plain ramp, under no clip but one axis-aligned rectangle.
+  // Text, an image, any other path, a fifth object, a shading that can hold
+  // a picture, a pattern, a form, a mask of its own or a clip to a shape
+  // makes it more than that: a ramp through a shape is the shape, and many
+  // small rectangles or clipped ramps can draw anything.
   bool FadeOnly(const CPDF_Form& form) {
-    int rectangles = 0;
+    int objects = 0;
     for (auto it = form.begin(); it != form.end(); ++it) {
       const CPDF_PageObject* object = it->get();
       if (!object->IsActive()) {
         continue;
+      }
+      if (++objects > 4) {
+        return false;
       }
       const CPDF_GeneralState& state = object->general_state();
       if (state.HasRef() && state.GetSoftMask()) {
@@ -2251,8 +2170,7 @@ class Walker {
       }
       const CPDF_PathObject* path = object->AsPath();
       if (!path || path->has_no_filltype() || path->stroke() ||
-          !path->path().GetRectOppositeCorner().has_value() ||
-          ++rectangles > 4) {
+          !path->path().GetRectOppositeCorner().has_value()) {
         return false;
       }
       const CFX_Matrix& m = path->matrix();
@@ -2466,97 +2384,6 @@ class Walker {
     }
     box.Inflate(grow, grow);
     return box;
-  }
-
-  // Whether |object|'s own shape lies wholly inside one of the call's
-  // regions that are a mark's own, a hundredth of a point clear of its edge:
-  // the apply then removes the object outright. Clips do not help: a shape
-  // that reaches outside a region and is clipped to the inside is cut, not
-  // removed. A shading painted with sh has the rectangle the apply sees: its
-  // clip's box, or the page's or form's without a clip, cut to a mesh's
-  // vertices. A form is emptied and stays, and an image is blanked and
-  // stays, so neither is ever wholly inside.
-  static bool InsideOne(const Context& context,
-                        const CPDF_PageObject* object,
-                        const CFX_Matrix& to_page) {
-    if (object->AsForm() || object->AsImage()) {
-      return false;
-    }
-    const CFX_FloatRect box = ShapeBox(object, to_page);
-    if (!Finite(box)) {
-      return false;
-    }
-    for (const RedactRegion& region : context.exact) {
-      if (!region.bbox.Contains(box)) {
-        continue;
-      }
-      if (!region.has_quad) {
-        return true;
-      }
-      bool inside = true;
-      for (const CFX_PointF& corner : QuadFromRect(box)) {
-        inside = inside && PointInside(corner, region);
-      }
-      if (inside) {
-        return true;
-      }
-    }
-    return false;
-  }
-
-  // The patterns |object| paints with: the tiling patterns, or with
-  // |shading| the shadings of its shading patterns.
-  static std::vector<const CPDF_Object*> PatternIds(const CPDF_PageObject* object,
-                                                    bool shading) {
-    std::vector<const CPDF_Object*> ids;
-    const CPDF_ColorState& colors = object->color_state();
-    if (!colors.HasRef()) {
-      return ids;
-    }
-    for (bool stroke : {false, true}) {
-      const CPDF_Color* color =
-          stroke ? colors.GetStrokeColor() : colors.GetFillColor();
-      if (!color || !color->IsPattern() || !Paints(object, stroke)) {
-        continue;
-      }
-      RetainPtr<CPDF_Pattern> pattern = color->GetPattern();
-      if (!pattern) {
-        continue;
-      }
-      if (shading && pattern->AsShadingPattern()) {
-        ids.push_back(pattern->AsShadingPattern()->GetShadingObject().Get());
-      } else if (!shading && pattern->AsTilingPattern()) {
-        ids.push_back(pattern->pattern_obj().Get());
-      }
-    }
-    return ids;
-  }
-
-  // The shading |object| paints with sh, or null.
-  static const CPDF_Object* ShadingId(const CPDF_PageObject* object) {
-    const CPDF_ShadingObject* shading = object->AsShading();
-    return shading && shading->pattern()
-               ? shading->pattern()->GetShadingObject().Get()
-               : nullptr;
-  }
-
-  // The group of the soft mask on |object|, or null.
-  static const CPDF_Object* MaskId(const CPDF_PageObject* object) {
-    const CPDF_GeneralState& state = object->general_state();
-    RetainPtr<const CPDF_Dictionary> mask =
-        state.HasRef() ? state.GetSoftMask() : nullptr;
-    return mask ? mask->GetStreamFor("G").Get() : nullptr;
-  }
-
-  // Whether every object painting with each of |ids| goes with the apply.
-  bool AllGo(const std::vector<const CPDF_Object*>& ids) const {
-    for (const CPDF_Object* id : ids) {
-      auto it = context_->carriers.find(id);
-      if (!id || it == context_->carriers.end() || !it->second) {
-        return false;
-      }
-    }
-    return true;
   }
 
   // Whether |object| paints with a pattern colour: a tiling pattern, or
@@ -2794,8 +2621,8 @@ class Walker {
   // font with resources of its own is read with those; one without, with
   // |shown_with|, the resources of the content that shows the glyph. A
   // procedure naming a resource those do not hold is not readable. One that
-  // paints a shading, which has no box of its own there, is taken to paint
-  // the font's box.
+  // paints a shading, whose box there is not its paint's, is taken to paint
+  // the font's box as well.
   const Context::Glyph& GlyphOf(CPDF_Type3Font* font,
                                 uint32_t code,
                                 RetainPtr<CPDF_Dictionary> shown_with) {
@@ -2843,11 +2670,12 @@ class Walker {
           }
           CFX_FloatRect rect = object->GetRect();
           if (object->AsShading()) {
-            rect = dict->GetRectFor("FontBBox");
-            rect.Normalize();
-            if (!(rect.Width() > 0) || !(rect.Height() > 0)) {
+            CFX_FloatRect font_box = dict->GetRectFor("FontBBox");
+            font_box.Normalize();
+            if (!(font_box.Width() > 0) || !(font_box.Height() > 0)) {
               glyph.readable = false;
             }
+            rect.Union(font_box);
           }
           if (glyph.bounds.has_value()) {
             glyph.bounds->Union(rect);
@@ -3314,7 +3142,6 @@ std::unique_ptr<CPDF_PathRedactor> Prepare(Context* context, Entry* entry) {
     cut.bbox = region.bbox;
     cut.bbox.Intersect(page_box);
     held.push_back(cut);
-    entry->changed = true;
   }
   entry->regions = std::move(held);
   if (entry->regions.empty()) {
@@ -3361,35 +3188,18 @@ void ChargePage(Context* context) {
 int UnremovableUnder(CPDF_Page* page, std::vector<Entry>* entries) {
   Context context(page, /*strict=*/true);
   ChargePage(&context);
-  std::vector<std::unique_ptr<CPDF_PathRedactor>> redactors;
-  for (Entry& entry : *entries) {
-    redactors.push_back(Prepare(&context, &entry));
-    if (context.failed) {
-      return -1;
-    }
-    // A region the page cut is a rectangle of the page, not the mark: no
-    // shape is wholly inside the mark on its account.
-    if (redactors.back() && !entry.changed) {
-      context.exact.insert(context.exact.end(), entry.inset.begin(),
-                           entry.inset.end());
-    }
-  }
-  // Which carriers leave the file when the objects inside the marks go.
-  Walker::CountForms(&context, page, 0);
-  Walker::Survey(&context, page, CFX_Matrix(), 0, false);
   // Annotation appearances are not read. The apply removes every annotation
   // whose /Rect meets a region, and one whose /Rect does not is drawn inside
   // that rectangle and cannot paint in the region.
-  for (size_t i = 0; i < entries->size() && !context.failed; ++i) {
-    if (context.work.spent) {
-      context.failed = true;
-    } else if (redactors[i]) {
-      Walker walker(&(*entries)[i], redactors[i].get(), &context);
+  for (Entry& entry : *entries) {
+    std::unique_ptr<CPDF_PathRedactor> redactor = Prepare(&context, &entry);
+    if (redactor) {
+      Walker walker(&entry, redactor.get(), &context);
       walker.Unremovable(page, CFX_Matrix(), 0, Clips(), nullptr);
     }
-  }
-  if (context.failed || context.work.spent) {
-    return -1;
+    if (context.failed || context.work.spent) {
+      return -1;
+    }
   }
   for (const Entry& entry : *entries) {
     if (entry.patterns || entry.shadings || entry.mask_groups || entry.glyphs) {
