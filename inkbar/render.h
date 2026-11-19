@@ -2,7 +2,7 @@
 // Copyright 2026 Edward Coleridge Smith
 //
 // Draws a page in time slices, leaving out the annotations a caller lists, and
-// reads a page's /UserUnit.
+// reads a page's /UserUnit, box and rotation.
 //
 // An InkRender is one render of one page into one bitmap. INK_Render_Start
 // begins it, INK_Render_Continue runs it a slice at a time and
@@ -56,6 +56,17 @@ void INK_Render_Close(InkRender* r);
 // The page's /UserUnit: 1 when absent, not a number, not finite or not
 // positive, and for a NULL page.
 float INK_Page_UserUnit(FPDF_PAGE page);
+
+// Reads page |page_index|'s facts from its dictionary without loading its
+// content, so no font is loaded: PDFium picks a page's substitute fonts when
+// the page is loaded and keeps them for the document's life. |out| receives
+// six floats: left, bottom, right and top of the page box (the rectangle
+// FPDF_GetPageBoundingBox reports for the loaded page), the rotation in
+// degrees (0, 90, 180 or 270: FPDFPage_GetRotation times 90) and the user unit
+// (as INK_Page_UserUnit reports it). The loaded page's width and height are the
+// box's, swapped when it is turned 90 or 270 degrees. Returns 1 on success, 0
+// for a NULL document or |out|, a bad index or a page that cannot be read.
+int INK_Page_Facts(FPDF_DOCUMENT doc, int page_index, float* out);
 
 #ifdef __cplusplus
 }  // extern "C"

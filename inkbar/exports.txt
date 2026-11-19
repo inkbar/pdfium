@@ -90,3 +90,4 @@ INK_Page_UserUnit
 INK_Fonts_Register
 INK_Fonts_PageNeeds
 INK_Fonts_TakeMisses
+INK_Page_Facts

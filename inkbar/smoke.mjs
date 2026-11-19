@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 92)
+assert.equal(names.length, 93)
 
 const m = await createModule()
 for (const name of names) {
@@ -3346,6 +3346,113 @@ for (const name of ['Calibri', 'SymbolMT with Greek /Differences']) {
   const all = await withFreshModule(pdf, every, draw)
   assert.ok(inkInBand({ bytes: none, width: 300, height: 100 }, 15, 75) > 0, `${name} drew nothing`)
   assert.ok(none.equals(all), `registered fonts changed how ${name} draws`)
+}
+
+// INK_Page_Facts reads a page's box, rotation and user unit from its
+// dictionary, without loading the page: the same values a loaded page reports.
+
+// The six floats INK_Page_Facts writes for page |index|, or null when it returns 0.
+function pageFacts(module, doc, index) {
+  const out = module._malloc(24)
+  const ok = module._INK_Page_Facts(doc, index, out)
+  const facts = [...module.HEAPF32.slice(out / 4, out / 4 + 6)]
+  module._free(out)
+  return ok === 1 ? facts : null
+}
+
+// What a loaded page reports: FPDF_GetPageBoundingBox (an FS_RECTF: left, top,
+// right, bottom), FPDFPage_GetRotation, INK_Page_UserUnit and the page's size.
+function loadedFacts(module, doc, index) {
+  const page = module._FPDF_LoadPage(doc, index)
+  if (!page) return null
+  const rect = module._malloc(16)
+  assert.equal(module._FPDF_GetPageBoundingBox(page, rect), 1)
+  const [left, top, right, bottom] = module.HEAPF32.slice(rect / 4, rect / 4 + 4)
+  module._free(rect)
+  const facts = {
+    box: [left, bottom, right, top],
+    rotation: module._FPDFPage_GetRotation(page) * 90,
+    unit: module._INK_Page_UserUnit(page),
+    width: module._FPDF_GetPageWidthF(page),
+    height: module._FPDF_GetPageHeightF(page),
+  }
+  module._FPDF_ClosePage(page)
+  return facts
+}
+
+// Asserts INK_Page_Facts agrees with a loaded page, field by field. The loaded
+// width and height are the box's, swapped for a page turned 90 or 270 degrees.
+function checkFacts(module, doc, index, label) {
+  const facts = pageFacts(module, doc, index)
+  const loaded = loadedFacts(module, doc, index)
+  assert.ok(facts && loaded, `${label}: one of the two could not read the page`)
+  const [left, bottom, right, top, rotation, unit] = facts
+  assert.deepEqual([left, bottom, right, top], loaded.box, `${label}: box`)
+  assert.equal(rotation, loaded.rotation, `${label}: rotation`)
+  assert.equal(unit, loaded.unit, `${label}: user unit`)
+  const turned = rotation === 90 || rotation === 270
+  assert.equal(Math.fround(turned ? top - bottom : right - left), loaded.width, `${label}: width`)
+  assert.equal(Math.fround(turned ? right - left : top - bottom), loaded.height, `${label}: height`)
+}
+
+{
+  const pages = [
+    ['a plain page', '/MediaBox [0 0 400 200]'],
+    ['/Rotate 90', '/MediaBox [0 0 400 200] /Rotate 90'],
+    ['/Rotate 180', '/MediaBox [0 0 400 200] /Rotate 180'],
+    ['/Rotate 270', '/MediaBox [0 0 400 200] /Rotate 270'],
+    ['/Rotate -90', '/MediaBox [0 0 400 200] /Rotate -90'],
+    ['/Rotate 450', '/MediaBox [0 0 400 200] /Rotate 450'],
+    ['/Rotate 45', '/MediaBox [0 0 400 200] /Rotate 45'],
+    ['a CropBox inside the MediaBox', '/MediaBox [0 0 400 200] /CropBox [50 20 300 150]'],
+    ['a CropBox larger than the MediaBox', '/MediaBox [0 0 400 200] /CropBox [-100 -100 1000 1000]'],
+    ['no MediaBox of its own', ''],
+    ['/UserUnit 2', '/MediaBox [0 0 400 200] /UserUnit 2'],
+    ['a MediaBox with swapped corners', '/MediaBox [400 200 10 20]'],
+  ]
+  // Object 2 is the root of the page tree, with a MediaBox to inherit; object 3
+  // a node with /Rotate 90 holding the last page; pages follow from object 4.
+  const first = 4
+  const inheritedRotate = first + pages.length
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    `<< /Type /Pages /MediaBox [0 0 500 300] /Kids [${pages.map((_, i) => `${first + i} 0 R`).join(' ')} 3 0 R] /Count ${pages.length + 1} >>`,
+    `<< /Type /Pages /Parent 2 0 R /Rotate 90 /Kids [${inheritedRotate} 0 R] /Count 1 >>`,
+    ...pages.map(([, entries]) => `<< /Type /Page /Parent 2 0 R ${entries} >>`),
+    '<< /Type /Page /Parent 3 0 R /MediaBox [0 0 400 200] >>',
+  ])
+  withDoc(pdf, (doc) => {
+    assert.equal(m._FPDF_GetPageCount(doc), pages.length + 1)
+    pages.forEach(([label], i) => checkFacts(m, doc, i, label))
+    checkFacts(m, doc, pages.length, 'an inherited /Rotate')
+    assert.equal(pageFacts(m, doc, pages.length + 1), null, 'a page past the end')
+    assert.equal(pageFacts(m, doc, -1), null, 'a negative index')
+    assert.equal(m._INK_Page_Facts(doc, 0, 0), 0, 'a NULL out')
+  })
+  const out = m._malloc(24)
+  assert.equal(m._INK_Page_Facts(0, 0, out), 0, 'a NULL document')
+  m._free(out)
+}
+
+// INK_Page_Facts loads no font: reading every page of the Japan1 file before
+// registering leaves no miss, and the font registered after it draws.
+{
+  const fresh = await createModule()
+  fresh._INK_Init()
+  const buf = fresh._malloc(japan1.length)
+  fresh.HEAPU8.set(japan1, buf)
+  const doc = fresh._FPDF_LoadMemDocument64(buf, japan1.length, 0)
+  assert.notEqual(doc, 0)
+  for (let i = 0; i < fresh._FPDF_GetPageCount(doc); i++) assert.ok(pageFacts(fresh, doc, i))
+  assert.equal(fresh._INK_Fonts_TakeMisses(), 0, 'INK_Page_Facts loaded a font')
+  if (cjkFontPath) {
+    assert.equal(registerFont(fresh, FONT_KEYS.japanese, cjkFont), 1)
+    assert.ok(inkInBand(freshRender(fresh, doc), 15, 75) > 0, 'a font registered after INK_Page_Facts drew nothing')
+    assert.equal(fresh._INK_Fonts_TakeMisses(), 0, 'a font registered after INK_Page_Facts was missed')
+  }
+  fresh._FPDF_CloseDocument(doc)
+  fresh._free(buf)
+  fresh._INK_Destroy()
 }
 
 m._INK_Destroy()

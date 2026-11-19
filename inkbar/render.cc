@@ -26,6 +26,7 @@
 #include "core/fpdfapi/page/cpdf_page.h"
 #include "core/fpdfapi/parser/cpdf_array.h"
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
+#include "core/fpdfapi/parser/cpdf_document.h"
 #include "core/fpdfapi/parser/cpdf_number.h"
 #include "core/fxcrt/retain_ptr.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
@@ -126,6 +127,11 @@ void Restore(std::vector<SavedFlags>& saved) {
   saved.clear();
 }
 
+float UserUnitOf(const CPDF_Dictionary* page) {
+  const float value = page ? page->GetFloatFor("UserUnit") : 0.0f;
+  return std::isfinite(value) && value > 0 ? value : 1.0f;
+}
+
 int ToResult(int status) {
   if (status == FPDF_RENDER_DONE) {
     return 1;
@@ -214,12 +220,34 @@ void INK_Render_Close(InkRender* r) {
 float INK_Page_UserUnit(FPDF_PAGE page) {
   ScopedFPDFPageView view(page);
   const CPDF_Page* pdf_page = view.Get();
-  if (!pdf_page) {
-    return 1.0f;
+  return pdf_page ? UserUnitOf(pdf_page->GetDict().Get()) : 1.0f;
+}
+
+int INK_Page_Facts(FPDF_DOCUMENT doc, int page_index, float* out) {
+  ScopedFPDFDocumentView view(doc);
+  CPDF_Document* pdf = view.Get();
+  if (!pdf || !out || page_index < 0 || page_index >= pdf->GetPageCount()) {
+    return 0;
   }
-  RetainPtr<const CPDF_Dictionary> dict = pdf_page->GetDict();
-  const float value = dict ? dict->GetFloatFor("UserUnit") : 0.0f;
-  return std::isfinite(value) && value > 0 ? value : 1.0f;
+  // As FPDF_LoadPage makes the page (NewPage() in fpdf_view.cpp), without
+  // ParseContent(): the constructor reads the boxes, /Rotate and /Group, and
+  // nothing reads the content stream or loads a font.
+  RetainPtr<const CPDF_Dictionary> const_dict =
+      pdf->GetPageDictionary(page_index);
+  RetainPtr<CPDF_Dictionary> dict =
+      pdfium::WrapRetain(const_cast<CPDF_Dictionary*>(const_dict.Get()));
+  if (!CPDF_Document::IsPageTreeLeaf(dict.Get())) {
+    return 0;
+  }
+  auto page = pdfium::MakeRetain<CPDF_Page>(pdf, dict);
+  const CFX_FloatRect& box = page->GetBBox();
+  out[0] = box.left;
+  out[1] = box.bottom;
+  out[2] = box.right;
+  out[3] = box.top;
+  out[4] = static_cast<float>(page->GetPageRotation() * 90);
+  out[5] = UserUnitOf(dict.Get());
+  return 1;
 }
 
 }  // extern "C"
