@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 85)
+assert.equal(names.length, 89)
 
 const m = await createModule()
 for (const name of names) {
@@ -2865,6 +2865,226 @@ const sanitizedSaved = withDoc(sanitizeSource, (doc) => {
       hiddenLayers: false,
       signed: false,
     })
+  })
+}
+
+// Page rendering.
+
+// The BGRA bytes of |bitmap|, |height| rows, top row first.
+function bitmapBytes(bitmap, height) {
+  const data = m._FPDFBitmap_GetBuffer(bitmap)
+  return Buffer.from(m.HEAPU8.slice(data, data + m._FPDFBitmap_GetStride(bitmap) * height))
+}
+
+// Renders page |index| of |doc| at one pixel per point with FPDF_RenderPageBitmap
+// and |flags| onto white.
+function renderPixels(doc, index = 0, flags = FPDF_ANNOT) {
+  const page = m._FPDF_LoadPage(doc, index)
+  assert.notEqual(page, 0)
+  const width = Math.round(m._FPDF_GetPageWidthF(page))
+  const height = Math.round(m._FPDF_GetPageHeightF(page))
+  const bitmap = m._FPDFBitmap_CreateEx(width, height, 4, 0, 0)
+  m._FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0xffffffff)
+  m._FPDF_RenderPageBitmap(bitmap, page, 0, 0, width, height, 0, flags)
+  const bytes = bitmapBytes(bitmap, height)
+  m._FPDFBitmap_Destroy(bitmap)
+  m._FPDF_ClosePage(page)
+  return { bytes, width, height }
+}
+
+// The number of pixels that are not white between |bottom| and |top| points.
+function inkInBand({ bytes, width, height }, bottom, top) {
+  let n = 0
+  for (let row = Math.max(height - Math.ceil(top), 0); row < height - Math.floor(bottom); row++) {
+    for (let x = 0; x < width; x++) {
+      const o = (row * width + x) * 4
+      if (bytes[o] < 250 || bytes[o + 1] < 250 || bytes[o + 2] < 250) n++
+    }
+  }
+  return n
+}
+
+// The standard fonts draw from PDFium's built-in faces with no font registered:
+// one line each of Helvetica, Times, Courier, Symbol and ZapfDingbats.
+const STANDARD_FONTS = ['Helvetica', 'Times-Roman', 'Courier', 'Symbol', 'ZapfDingbats']
+const standardPdf = buildPdf([
+  '<< /Type /Catalog /Pages 2 0 R >>',
+  '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+  `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 260] /Contents 4 0 R /Resources << /Font << ${STANDARD_FONTS.map((_, i) => `/F${i} ${i + 5} 0 R`).join(' ')} >> >> >>`,
+  streamObject('', STANDARD_FONTS.map((_, i) => `BT /F${i} 20 Tf 20 ${20 + i * 50} Td (abcABC) Tj ET`).join(' ')),
+  ...STANDARD_FONTS.map((name) => `<< /Type /Font /Subtype /Type1 /BaseFont /${name} >>`),
+])
+withDoc(standardPdf, (doc) => {
+  const pixels = renderPixels(doc)
+  STANDARD_FONTS.forEach((name, i) => {
+    assert.ok(inkInBand(pixels, 15 + i * 50, 45 + i * 50) > 0, `${name} drew nothing`)
+  })
+})
+
+// INK_Render_Start, INK_Render_Continue and INK_Render_Close draw what
+// FPDF_RenderPageBitmap draws, in slices, and can leave out annotations.
+
+// Renders page |index| through the INK_Render_* calls, |slice| ms a call, onto
+// white, with FPDF_RenderPageBitmap's arguments |args| (start_x, start_y,
+// size_x, size_y, rotate) and |flags|, leaving out the annotations numbered in
+// |skip|. Returns the bytes and the statuses INK_Render_Continue returned.
+function inkRender(doc, { index = 0, flags = FPDF_ANNOT, skip = [], slice = 1000, args } = {}) {
+  const page = m._FPDF_LoadPage(doc, index)
+  assert.notEqual(page, 0)
+  const width = Math.round(m._FPDF_GetPageWidthF(page))
+  const height = Math.round(m._FPDF_GetPageHeightF(page))
+  const [startX, startY, sizeX, sizeY, rotate] = args ?? [0, 0, width, height, 0]
+  const bitmap = m._FPDFBitmap_CreateEx(width, height, 4, 0, 0)
+  m._FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0xffffffff)
+  const skipPtr = skip.length ? m._malloc(skip.length * 4) : 0
+  if (skipPtr) m.HEAPU32.set(skip, skipPtr / 4)
+  const r = m._INK_Render_Start(bitmap, page, startX, startY, sizeX, sizeY, rotate, flags, skipPtr, skip.length)
+  // Start reads the list before it returns.
+  if (skipPtr) m._free(skipPtr)
+  assert.notEqual(r, 0, 'INK_Render_Start failed')
+  const statuses = []
+  for (;;) {
+    const status = m._INK_Render_Continue(r, slice)
+    statuses.push(status)
+    if (status !== 0) break
+    assert.ok(statuses.length < 1_000_000, 'the render does not end')
+  }
+  m._INK_Render_Close(r)
+  const bytes = bitmapBytes(bitmap, height)
+  m._FPDFBitmap_Destroy(bitmap)
+  m._FPDF_ClosePage(page)
+  return { bytes, width, height, statuses }
+}
+
+// FPDF_RenderPageBitmap with the same arguments as inkRender.
+function referenceRender(doc, { index = 0, flags = FPDF_ANNOT, args } = {}) {
+  const page = m._FPDF_LoadPage(doc, index)
+  assert.notEqual(page, 0)
+  const width = Math.round(m._FPDF_GetPageWidthF(page))
+  const height = Math.round(m._FPDF_GetPageHeightF(page))
+  const [startX, startY, sizeX, sizeY, rotate] = args ?? [0, 0, width, height, 0]
+  const bitmap = m._FPDFBitmap_CreateEx(width, height, 4, 0, 0)
+  m._FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0xffffffff)
+  m._FPDF_RenderPageBitmap(bitmap, page, startX, startY, sizeX, sizeY, rotate, flags)
+  const bytes = bitmapBytes(bitmap, height)
+  m._FPDFBitmap_Destroy(bitmap)
+  m._FPDF_ClosePage(page)
+  return bytes
+}
+
+// Whether two saves wrote the same bytes. A save writes a fresh random second
+// /ID string each time, so the /ID arrays are left out of the comparison.
+function sameSave(a, b) {
+  const unid = (bytes) => bytes.toString('latin1').replace(/\/ID\s*\[\s*<[0-9A-Fa-f]*>\s*<[0-9A-Fa-f]*>\s*\]/g, '/ID[]')
+  return unid(a) === unid(b)
+}
+
+function saveWith(doc, flags) {
+  const writer = m._INK_Save(doc, flags)
+  assert.notEqual(writer, 0, 'save failed')
+  const data = m._INK_WriterData(writer)
+  const bytes = Buffer.from(m.HEAPU8.slice(data, data + m._INK_WriterSize(writer)))
+  m._INK_WriterFree(writer)
+  return bytes
+}
+
+// A page of text and a grey box under a Square annotation, object 6, whose
+// appearance (object 7) fills a red box. /F 4 is Print, which the render must
+// put back as it was.
+const squarePdf = onePagePdf(
+  'BT /F1 20 Tf 20 150 Td (Rendered in slices) Tj ET 0.6 g 40 40 120 60 re f',
+  { page: '/Annots [6 0 R]' },
+  [
+    '<< /Type /Annot /Subtype /Square /F 4 /Rect [100 20 300 120] /C [1 0 0] /AP << /N 7 0 R >> >>',
+    streamObject('/Type /XObject /Subtype /Form /BBox [100 20 300 120]', '1 0 0 rg 100 20 200 100 re f'),
+  ],
+)
+const SQUARE_OBJ = 6
+
+withDoc(squarePdf, (doc) => {
+  // The whole page, and a region that starts off the page and is drawn larger and turned.
+  for (const args of [undefined, [-50, -30, 800, 400, 1]]) {
+    const reference = referenceRender(doc, { args })
+    const sliced = inkRender(doc, { args })
+    assert.ok(sliced.bytes.equals(reference), `a render with ${JSON.stringify(args)} differs from FPDF_RenderPageBitmap`)
+    assert.equal(sliced.statuses.at(-1), 1)
+  }
+})
+
+// A page drawing one 2000 x 2000 image pauses when given no time, and ends
+// with the bytes of a render at once.
+const bigImage = Buffer.alloc(2000 * 2000)
+for (let y = 0; y < 2000; y++) for (let x = 0; x < 2000; x++) bigImage[y * 2000 + x] = (x ^ y) & 0xff
+const bigImagePdf = onePagePdf('q 400 0 0 400 0 0 cm /Im0 Do Q', { mediaBox: '[0 0 400 400]', resources: '/XObject << /Im0 6 0 R >>' }, [
+  streamObject('/Type /XObject /Subtype /Image /Width 2000 /Height 2000 /ColorSpace /DeviceGray /BitsPerComponent 8', bigImage),
+])
+withDoc(bigImagePdf, (doc) => {
+  const reference = referenceRender(doc)
+  const sliced = inkRender(doc, { slice: 0 })
+  console.log(`a render given no time ended after ${sliced.statuses.length} slices`)
+  assert.ok(sliced.statuses.includes(0), 'a render given no time never paused')
+  assert.equal(sliced.statuses.at(-1), 1)
+  assert.ok(sliced.bytes.equals(reference), 'a render in slices differs from a render at once')
+
+  // Closed before it finished, a render leaves the page free: a fresh whole
+  // render gives the reference bytes.
+  const page = m._FPDF_LoadPage(doc, 0)
+  const bitmap = m._FPDFBitmap_CreateEx(400, 400, 4, 0, 0)
+  m._FPDFBitmap_FillRect(bitmap, 0, 0, 400, 400, 0xffffffff)
+  const r = m._INK_Render_Start(bitmap, page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0)
+  assert.notEqual(r, 0)
+  assert.equal(m._INK_Render_Continue(r, 0), 0, 'the render ended in its first slice')
+  m._INK_Render_Close(r)
+  m._FPDFBitmap_Destroy(bitmap)
+  m._FPDF_ClosePage(page)
+  assert.ok(inkRender(doc).bytes.equals(reference), 'a render after an unfinished one differs')
+  assert.ok(referenceRender(doc).equals(reference), 'FPDF_RenderPageBitmap after an unfinished render differs')
+})
+m._INK_Render_Close(0)
+
+// Leaving out the square draws the page as a render without annotations, and
+// a save afterwards writes the bytes of a save of the file never rendered.
+{
+  const neverRendered = withDoc(squarePdf, (doc) => [saveWith(doc, NO_INCREMENTAL), saveWith(doc, 1)])
+  withDoc(squarePdf, (doc) => {
+    const withAnnots = referenceRender(doc)
+    const withoutAnnots = referenceRender(doc, { flags: 0 })
+    assert.ok(!withAnnots.equals(withoutAnnots), 'the square draws nothing')
+    const skipped = inkRender(doc, { skip: [SQUARE_OBJ] })
+    assert.ok(skipped.bytes.equals(withoutAnnots), 'the left-out square was drawn')
+    // An unlisted number leaves the square in.
+    assert.ok(inkRender(doc, { skip: [SQUARE_OBJ + 100] }).bytes.equals(withAnnots), 'an unlisted annotation was left out')
+    assert.ok(referenceRender(doc).equals(withAnnots), 'the square stays hidden after the render')
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), neverRendered[0]), 'a render changed what a save writes')
+    assert.ok(sameSave(saveWith(doc, 1), neverRendered[1]), 'a render changed what an incremental save writes')
+  })
+  // Saved while a render that leaves the square out is unfinished.
+  withDoc(squarePdf, (doc) => {
+    const page = m._FPDF_LoadPage(doc, 0)
+    const bitmap = m._FPDFBitmap_CreateEx(400, 200, 4, 0, 0)
+    const skipPtr = m._malloc(4)
+    m.HEAPU32[skipPtr / 4] = SQUARE_OBJ
+    const r = m._INK_Render_Start(bitmap, page, 0, 0, 400, 200, 0, FPDF_ANNOT, skipPtr, 1)
+    m._free(skipPtr)
+    assert.notEqual(r, 0)
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), neverRendered[0]), 'a save during a render differs')
+    m._INK_Render_Close(r)
+    m._FPDFBitmap_Destroy(bitmap)
+    m._FPDF_ClosePage(page)
+  })
+}
+
+// /UserUnit: 2 when the page says 2, else 1.
+for (const [entry, expected] of [
+  ['/UserUnit 2', 2],
+  ['', 1],
+  ['/UserUnit -3', 1],
+  ['/UserUnit 0', 1],
+]) {
+  withDoc(onePagePdf('', { page: entry }), (doc) => {
+    const page = m._FPDF_LoadPage(doc, 0)
+    assert.equal(m._INK_Page_UserUnit(page), expected, `INK_Page_UserUnit for "${entry}"`)
+    m._FPDF_ClosePage(page)
   })
 }
 

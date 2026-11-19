@@ -83,3 +83,7 @@ INK_Sanitize
 INK_Inspect_Page
 INK_Inspect_File
 INK_Inspect_Free
+INK_Render_Start
+INK_Render_Continue
+INK_Render_Close
+INK_Page_UserUnit
