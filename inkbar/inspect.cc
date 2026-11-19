@@ -782,11 +782,16 @@ bool ImageBlank(SampleCache* cache,
 
 // -- Paths -------------------------------------------------------------------
 
-// The largest factor by which |m| stretches a length.
-float Stretch(const CFX_Matrix& m) {
-  const float sum = m.a * m.a + m.b * m.b + m.c * m.c + m.d * m.d;
-  const float difference = m.a * m.a + m.b * m.b - m.c * m.c - m.d * m.d;
-  const float cross = m.a * m.c + m.b * m.d;
+// The largest factor by which |m| stretches a length. In double: the squares
+// of a very small or very large matrix leave a float's range.
+double Stretch(const CFX_Matrix& m) {
+  const double a = m.a;
+  const double b = m.b;
+  const double c = m.c;
+  const double d = m.d;
+  const double sum = a * a + b * b + c * c + d * d;
+  const double difference = a * a + b * b - c * c - d * d;
+  const double cross = a * c + b * d;
   return std::sqrt(
       (sum + std::sqrt(difference * difference + 4 * cross * cross)) / 2);
 }
@@ -818,7 +823,8 @@ CFX_FloatRect PathPaintBox(const CPDF_PathObject& path,
       if (state.GetLineCap() == CFX_GraphStateData::LineCap::kSquare) {
         factor = std::max(factor, 1.4143f);
       }
-      grow = width / 2 * factor * Stretch(placed);
+      grow = static_cast<float>(static_cast<double>(width) / 2 * factor *
+                                Stretch(placed));
     }
     box.Inflate(grow, grow);
   }
@@ -2000,9 +2006,12 @@ class Walker {
       if (PaintsWithTiling(object)) {
         ++entry_->patterns;
       }
+      // A shading its holder gave no rectangle counts whatever its type:
+      // the apply passes it by.
       const CPDF_ShadingObject* shading = object->AsShading();
-      if ((shading && PictureShading(shading->pattern(),
-                                     shading->matrix() * to_page)) ||
+      if ((shading && (Boxless(*shading) ||
+                       PictureShading(shading->pattern(),
+                                      shading->matrix() * to_page))) ||
           PictureShadingPattern(object, to_page)) {
         ++entry_->shadings;
       }
@@ -2441,6 +2450,14 @@ class Walker {
       return stroke ? path->stroke() : !path->has_no_filltype();
     }
     if (const CPDF_TextObject* text = object->AsText()) {
+      // Type 3 text is painted with the fill colour whatever its mode says,
+      // unless it is invisible: readers draw its glyph procedures, and
+      // PDFium's parser sets the mode to fill.
+      RetainPtr<CPDF_Font> font = text->GetFont();
+      if (font && font->IsType3Font()) {
+        return !stroke &&
+               text->GetTextRenderMode() != TextRenderingMode::MODE_INVISIBLE;
+      }
       switch (text->GetTextRenderMode()) {
         case TextRenderingMode::MODE_FILL:
         case TextRenderingMode::MODE_FILL_CLIP:
@@ -2484,11 +2501,8 @@ class Walker {
       return PathPaintBox(*path, to_page);
     }
     if (const CPDF_ShadingObject* shading = object->AsShading()) {
-      const CFX_FloatRect rect = shading->GetRect();
-      const CPDF_ClipPath& clip = shading->clip_path();
-      if ((rect.Width() > 0 && rect.Height() > 0) ||
-          (clip.HasRef() && clip.GetPathCount() > 0)) {
-        CFX_FloatRect box = to_page.TransformRect(rect);
+      if (!Boxless(*shading)) {
+        CFX_FloatRect box = to_page.TransformRect(shading->GetRect());
         box.Normalize();
         return box;
       }
@@ -2507,10 +2521,12 @@ class Walker {
       if (Paints(object, true)) {
         const float width = std::fabs(object->graph_state().GetLineWidth());
         const float grow =
-            width > 0 ? width / 2 *
-                            std::max(Stretch(to_page),
-                                     Stretch(text->GetTextMatrix() * to_page))
-                      : 0.5f;
+            width > 0
+                ? static_cast<float>(
+                      static_cast<double>(width) / 2 *
+                      std::max(Stretch(to_page),
+                               Stretch(text->GetTextMatrix() * to_page)))
+                : 0.5f;
         box.Inflate(grow, grow);
       }
     }
@@ -2543,6 +2559,17 @@ class Walker {
     return PaintsWithPattern(object, false);
   }
 
+  // Whether a shading painted with sh was given no rectangle by its holder:
+  // it lies in a form or group without /BBox, under no clip. PDFium paints
+  // nothing of it and the apply does not clip it; a reader that applies no
+  // clip paints all of it, a plain ramp too.
+  static bool Boxless(const CPDF_ShadingObject& shading) {
+    const CFX_FloatRect rect = shading.GetRect();
+    const CPDF_ClipPath& clip = shading.clip_path();
+    return !(rect.Width() > 0 && rect.Height() > 0) &&
+           !(clip.HasRef() && clip.GetPathCount() > 0);
+  }
+
   // Whether |object| brings with it something the redaction does not enter:
   // a pattern, a shading that can hold a picture, or a soft mask's group.
   static bool Carries(const CPDF_PageObject* object) {
@@ -2550,7 +2577,7 @@ class Walker {
       return true;
     }
     if (const CPDF_ShadingObject* shading = object->AsShading()) {
-      if (!Ramp(shading->pattern())) {
+      if (!Ramp(shading->pattern()) || Boxless(*shading)) {
         return true;
       }
     }
@@ -2838,8 +2865,9 @@ class Walker {
                       CPDF_PageObjectHolder* holder) {
     RetainPtr<CPDF_Font> font = text.GetFont();
     CPDF_Type3Font* type3 = font ? font->AsType3Font() : nullptr;
-    // Text in a mode that neither fills nor strokes paints nothing.
-    if (!type3 || (!Paints(&text, false) && !Paints(&text, true))) {
+    // Invisible text paints nothing. In every other mode a Type 3 glyph's
+    // procedure is drawn.
+    if (!type3 || !Paints(&text, false)) {
       return 0;
     }
     const float size = text.GetFontSize();

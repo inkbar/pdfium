@@ -2037,6 +2037,99 @@ const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, 
   assert.deepEqual(zeros(under(copiedAfter)), [0, 0, 0, 0, 0, 0], `a page copy made after the apply: ${JSON.stringify(under(copiedAfter))}`)
 }
 
+// reads Type 3 text in every mode but the invisible one
+{
+  // PDFium and other readers paint Type 3 text with its fill colour whatever
+  // the rendering mode, except mode 3.
+  const wide = [
+    '<< /Type /Font /Subtype /Type3 /FontBBox [0 0 3000 1000] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 7 0 R >> /Encoding << /Type /Encoding /Differences [97 /a] >> /FirstChar 97 /LastChar 97 /Widths [100] >>',
+    streamObject('', '100 0 0 0 100 100 d1 q 3000 0 0 1000 0 0 cm BI /IM true /W 8 /H 8 /BPC 1 /D [1 0] /F /AHx ID 8142241818244281> EI Q', true),
+  ]
+  const shown = (mode) => onePagePdf(`BT /T3 40 Tf ${mode} Tr 100 80 Td (a) Tj ET`, { resources: '/Font << /T3 6 0 R >>' }, wide)
+  assert.deepEqual(unremovable(shown(7)), [[0, 0, 0, 1]], 'an out-of-box glyph shown in mode 7')
+  assert.ok(under(shown(7)).textChars > 0, 'an out-of-box glyph shown in mode 7, in the inspector')
+  assert.deepEqual(unremovable(shown(3)), [[0, 0, 0, 0]], 'an out-of-box glyph shown in mode 3')
+  assert.equal(under(shown(3)).textChars, 0, 'an out-of-box glyph shown in mode 3, in the inspector')
+  // A procedure whose paint has no bound reaches every mark its box misses.
+  const procFont = (proc, resources) => [
+    `<< /Type /Font /Subtype /Type3 /FontBBox [0 0 100 100] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << /a 7 0 R >> /Encoding << /Type /Encoding /Differences [97 /a] >> /FirstChar 97 /LastChar 97 /Widths [100] /Resources << ${resources} >> >>`,
+    streamObject('', proc, true),
+    streamObject(`/Type /XObject /Subtype /Form /Resources << /Shading << /Sh0 << ${axial} >> >> >>`, '/Sh0 sh'),
+  ]
+  const far = (font) => onePagePdf('BT /T3 40 Tf 20 20 Td (a) Tj ET', { resources: '/Font << /T3 6 0 R >>' }, font)
+  assert.deepEqual(unremovable(far(procFont('100 0 d0 /Sh0 sh', `/Shading << /Sh0 << ${axial} >> >>`))), [[0, 0, 0, 1]], 'a glyph painting a shading with no box of its own')
+  assert.deepEqual(unremovable(far(procFont('100 0 d0 /Fm0 Do', '/XObject << /Fm0 8 0 R >>'))), [[0, 0, 0, 1]], 'a glyph drawing a form without /BBox')
+}
+
+// refuses a ramp painted where its holder has no box
+{
+  // PDFium gives such a shading an empty rectangle and paints nothing; the
+  // apply does not clip it; a reader that applies no clip paints all of it.
+  const radial = '/ShadingType 3 /ColorSpace /DeviceRGB /Coords [200 100 0 200 100 30] /Function << /FunctionType 2 /Domain [0 1] /C0 [1 0 0] /C1 [0 0 1] /N 1 >>'
+  const inForm = (box) =>
+    onePagePdf('/Fm0 Do BT /F1 12 Tf 20 20 Td (KEEP) Tj ET', { resources: '/XObject << /Fm0 6 0 R >>' }, [
+      streamObject(`/Type /XObject /Subtype /Form ${box} /Resources << /Shading << /Sh0 << ${radial} >> >> >>`, '/Sh0 sh'),
+    ])
+  assert.deepEqual(unremovable(inForm('')), [[0, 1, 0, 0]], 'a radial ramp in a form without /BBox')
+  assert.equal(tryApply(inForm('')).result, -1)
+  assert.deepEqual(unremovable(inForm('/BBox [160 70 240 130]')), [[0, 0, 0, 0]], 'a radial ramp in a form with a /BBox')
+  const applied = tryApply(inForm('/BBox [160 70 240 130]'))
+  assert.equal(applied.result, 1)
+  assert.equal(under(applied.bytes).paths, 0, 'a ramp in a form with a /BBox left under the mark')
+}
+
+// keeps its arithmetic where a matrix is very small or very large
+{
+  const solid = tiling([0, 0, 10, 10], 10, 10, '0 0 1 rg 0 0 9.75 10 re f')
+  // Written as reals: PDFium clamps an integer that long.
+  const e27 = (n) => `${n}${'0'.repeat(26)}.0`
+  const shrink = Array(5).fill('0.00001 0 0 0.00001 0 0 cm').join(' ')
+  // Under a scale of 1e-25 a line at x 300 with a width of 300 on the page:
+  // its stroke covers the mark, its outline lies beside it.
+  const tiny = onePagePdf(`q /Pattern CS /P0 SCN ${shrink} ${e27(30)} w ${e27(30)} ${e27(6)} m ${e27(30)} ${e27(14)} l S Q`, { resources: '/Pattern << /P0 6 0 R >>' }, [solid])
+  assert.ok(unremovablePointer(tiny) === 0 || unremovable(tiny)[0][0] > 0, 'a wide pattern stroke under a tiny matrix passed the gate')
+  assert.equal(tryApply(tiny).result, -1)
+  const tinyBlack = onePagePdf(`q 0 G ${shrink} ${e27(30)} w ${e27(30)} ${e27(6)} m ${e27(30)} ${e27(14)} l S Q BT /F1 12 Tf 20 20 Td (KEEP) Tj ET`)
+  assert.ok(withDoc(tinyBlack, (doc) => inspectPointer(doc, 0, [quadOf(PATTERN_MARK)])) === 0 || under(tinyBlack).paths > 0, 'a wide black stroke under a tiny matrix was not seen')
+  // A large matrix on a path away from the mark does not stop the apply.
+  const large = onePagePdf(`${textContent} q 5000000000 0 0 5000000000 0 0 cm 0 G 0.0000000002 w 0.00000001 0.000000036 m 0.00000002 0.000000036 l S Q`)
+  const applied = tryApply(large, SECRET_RECT)
+  assert.equal(applied.result, 1, 'a path under a large matrix, away from the mark, stopped the apply')
+  assert.equal(under(applied.bytes, SECRET_RECT).textChars, 0)
+}
+
+// closes the last gaps in the gate's checks
+{
+  const none = [0, 0, 0, 0]
+  const band = '20 50 360 100 re f'
+  const patterned = (content) => onePagePdf(`q ${content} Q`, { resources: '/Pattern << /P0 6 0 R >>' }, [hatchCell])
+  // A square cap reaches half a line width past the end of its line.
+  assert.deepEqual(unremovable(patterned('/Pattern CS /P0 SCN 2 J 20 w 100 100 m 145 100 l S')), [[1, 0, 0, 0]], 'the square cap of a pattern-stroked line')
+  assert.deepEqual(unremovable(patterned('/Pattern CS /P0 SCN 0 J 20 w 100 100 m 145 100 l S')), [none], 'the butt end of a pattern-stroked line')
+  // Rectangular clips do not make a shape of a fade.
+  const fadeGroup = (content) => maskedPage(band, maskGroup(content, `/Shading << /Sh0 << ${axial} >> >>`))
+  assert.deepEqual(unremovable(fadeGroup('q 100 40 200 120 re W n 150 20 200 160 re W n /Sh0 sh Q')), [none], 'a ramp under two crossing rectangular clips')
+  assert.deepEqual(unremovable(fadeGroup('q 0.8 0.6 -0.6 0.8 100 -40 cm 100 60 80 40 re W n Q q 0.8 0.6 -0.6 0.8 100 -40 cm 100 60 80 40 re W n /Sh0 sh Q')), [none], 'a ramp under a small rotated rectangular clip')
+  // Without regions the overlay tag is not trusted, in a page copy either.
+  const copied = editPage(onePagePdf('0 g 200 130 m 240 100 l 200 70 l 160 100 l h f BT /F1 12 Tf 20 20 Td (KEEP) Tj ET'), (doc, page) => {
+    const mark = addMark(page, PATTERN_MARK)
+    const overlay = newAppearance(doc, [0, 0, 100, 80], '0 g 0 0 100 80 re f', false)
+    assert.equal(m._INK_Redact_SetOverlay(doc, mark, overlay), 1)
+    assert.equal(applyPage(doc, page, [mark], false).result, 1)
+    m._FPDFPage_CloseAnnot(mark)
+    const loupe = m._FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE)
+    const appearance = newAppearance(doc, [260, 150, 390, 195], 'q 0.3 0 0 0.3 260 150 cm /P0 Do Q', false)
+    withStrings(['P0'], (name) => assert.equal(m._INK_Appearance_AddPage(appearance, name, 0), 1))
+    assert.equal(m._INK_Annot_SetAppearance(loupe, appearance), 1)
+    m._FPDFPage_CloseAnnot(loupe)
+    const later = addMark(page, PATTERN_MARK)
+    m._FPDFPage_CloseAnnot(later)
+  })
+  assert.deepEqual(zeros(under(copied)), [0, 0, 0, 0, 0, 0], 'the page and its copy with regions given')
+  const candidate = withDoc(copied, (doc) => inspectPage(doc, 0, [])).find((c) => c.kind === 'redact-annotation')
+  assert.ok(candidate && candidate.paths >= 2, `the overlay on the page and in its copy, without regions: ${JSON.stringify(candidate)}`)
+}
+
 // ends when patterns paint with patterns many times over
 {
   // Eight patterns, each cell painting eight rectangles with the next: read
