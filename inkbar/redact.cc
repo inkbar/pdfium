@@ -233,6 +233,9 @@ int INK_Redact_ApplyPage(FPDF_DOCUMENT doc,
   // that can hold a picture or a soft mask's group, and leaves what it
   // carries in the file. Nothing is changed when one lies under a mark, or
   // when the page could not be read to tell.
+  // A page not yet rendered or inspected is parsed first, as upstream's apply
+  // does: an unparsed page would read as empty.
+  pdf_page->ParseContent();
   std::vector<std::array<float, 8>> quads;
   for (FPDF_ANNOTATION mark : apply) {
     for (const std::array<float, 8>& quad :
