@@ -531,6 +531,46 @@ bool CPDF_PathRedactor::IsValid() const {
   return impl_ && impl_->redaction_path.has_value();
 }
 
+namespace {
+
+// Inkbar: the bounds of |path|'s outline on the page, grown for a stroke by
+// half the line width, taken without its sign, times the miter limit for
+// mitred joins or the square root of 2 for square caps, under the largest
+// stretch of the matrix. A hairline is a point wide on the page.
+CFX_FloatRect PaintBox(const CPDF_PathObject& path,
+                       const CFX_Matrix& parent_to_page) {
+  const CFX_Matrix m = path.matrix() * parent_to_page;
+  CFX_FloatRect box = path.path().HasRef()
+                          ? m.TransformRect(path.path().GetBoundingBox())
+                          : CFX_FloatRect();
+  box.Normalize();
+  if (path.stroke()) {
+    const CFX_GraphState& state = path.graph_state();
+    const float width = std::fabs(state.GetLineWidth());
+    float grow = 0.5f;
+    if (width > 0) {
+      float factor = 1;
+      if (state.GetLineJoin() == CFX_GraphStateData::LineJoin::kMiter) {
+        factor = std::max(factor, state.GetMiterLimit());
+      }
+      if (state.GetLineCap() == CFX_GraphStateData::LineCap::kSquare) {
+        factor = std::max(factor, 1.4143f);
+      }
+      const float sum = m.a * m.a + m.b * m.b + m.c * m.c + m.d * m.d;
+      const float difference = m.a * m.a + m.b * m.b - m.c * m.c - m.d * m.d;
+      const float cross = m.a * m.c + m.b * m.d;
+      grow = width / 2 * factor *
+             std::sqrt((sum + std::sqrt(difference * difference +
+                                        4 * cross * cross)) /
+                       2);
+    }
+    box.Inflate(grow, grow);
+  }
+  return box;
+}
+
+}  // namespace
+
 PathRedactionResult CPDF_PathRedactor::Redact(
     CPDF_PathObject* path,
     const CFX_Matrix& parent_to_page) const {
@@ -543,8 +583,12 @@ PathRedactionResult CPDF_PathRedactor::Redact(
     return {};
   }
 
-  CFX_FloatRect page_bbox = parent_to_page.TransformRect(path->GetRect());
-  page_bbox.Normalize();
+  // Inkbar: the first look is by a box that holds everything the path
+  // paints, not by GetRect(). CPDF_PathObject::CalcBoundingBox() takes the
+  // line width with its sign, so a negative width pulls that box inward, off
+  // the fill, and CFX_Path::GetBoundingBoxForStrokePath() leaves out the
+  // miter where a closed subpath starts. A path skipped here is not cut.
+  CFX_FloatRect page_bbox = PaintBox(*path, parent_to_page);
   if (!IsFiniteRect(page_bbox)) {
     return {.succeeded = false};
   }
