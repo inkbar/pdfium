@@ -556,13 +556,20 @@ CFX_FloatRect PaintBox(const CPDF_PathObject& path,
       if (state.GetLineCap() == CFX_GraphStateData::LineCap::kSquare) {
         factor = std::max(factor, 1.4143f);
       }
-      const float sum = m.a * m.a + m.b * m.b + m.c * m.c + m.d * m.d;
-      const float difference = m.a * m.a + m.b * m.b - m.c * m.c - m.d * m.d;
-      const float cross = m.a * m.c + m.b * m.d;
-      grow = width / 2 * factor *
-             std::sqrt((sum + std::sqrt(difference * difference +
-                                        4 * cross * cross)) /
-                       2);
+      // In double: the squares of a very small or very large matrix leave
+      // a float's range.
+      const double a = m.a;
+      const double b = m.b;
+      const double c = m.c;
+      const double d = m.d;
+      const double sum = a * a + b * b + c * c + d * d;
+      const double difference = a * a + b * b - c * c - d * d;
+      const double cross = a * c + b * d;
+      grow = static_cast<float>(
+          static_cast<double>(width) / 2 * factor *
+          std::sqrt((sum + std::sqrt(difference * difference +
+                                     4 * cross * cross)) /
+                    2));
     }
     box.Inflate(grow, grow);
   }
