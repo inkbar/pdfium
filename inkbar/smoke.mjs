@@ -3022,7 +3022,6 @@ const bigImagePdf = onePagePdf('q 400 0 0 400 0 0 cm /Im0 Do Q', { mediaBox: '[0
 withDoc(bigImagePdf, (doc) => {
   const reference = referenceRender(doc)
   const sliced = inkRender(doc, { slice: 0 })
-  console.log(`a render given no time ended after ${sliced.statuses.length} slices`)
   assert.ok(sliced.statuses.includes(0), 'a render given no time never paused')
   assert.equal(sliced.statuses.at(-1), 1)
   assert.ok(sliced.bytes.equals(reference), 'a render in slices differs from a render at once')
@@ -3059,21 +3058,55 @@ m._INK_Render_Close(0)
     assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), neverRendered[0]), 'a render changed what a save writes')
     assert.ok(sameSave(saveWith(doc, 1), neverRendered[1]), 'a render changed what an incremental save writes')
   })
-  // Saved while a render that leaves the square out is unfinished.
+  // Saved while a render that leaves the square out is unfinished; the render
+  // then ends without the square.
   withDoc(squarePdf, (doc) => {
+    const withoutAnnots = referenceRender(doc, { flags: 0 })
     const page = m._FPDF_LoadPage(doc, 0)
     const bitmap = m._FPDFBitmap_CreateEx(400, 200, 4, 0, 0)
+    m._FPDFBitmap_FillRect(bitmap, 0, 0, 400, 200, 0xffffffff)
     const skipPtr = m._malloc(4)
     m.HEAPU32[skipPtr / 4] = SQUARE_OBJ
     const r = m._INK_Render_Start(bitmap, page, 0, 0, 400, 200, 0, FPDF_ANNOT, skipPtr, 1)
     m._free(skipPtr)
     assert.notEqual(r, 0)
     assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), neverRendered[0]), 'a save during a render differs')
+    let status
+    while ((status = m._INK_Render_Continue(r, 1000)) === 0);
+    assert.equal(status, 1)
     m._INK_Render_Close(r)
+    assert.ok(bitmapBytes(bitmap, 200).equals(withoutAnnots), 'a render saved during drew the left-out square')
     m._FPDFBitmap_Destroy(bitmap)
     m._FPDF_ClosePage(page)
   })
 }
+
+// A stale handle touches no other render. R1 starts; FPDF_RenderPageBitmap on
+// the same page ends it; R2 starts. R1 then fails and its Close leaves R2,
+// which ends with the bytes of a render at once.
+withDoc(bigImagePdf, (doc) => {
+  const reference = referenceRender(doc)
+  const page = m._FPDF_LoadPage(doc, 0)
+  const bitmaps = [0, 1, 2].map(() => {
+    const bitmap = m._FPDFBitmap_CreateEx(400, 400, 4, 0, 0)
+    m._FPDFBitmap_FillRect(bitmap, 0, 0, 400, 400, 0xffffffff)
+    return bitmap
+  })
+  const r1 = m._INK_Render_Start(bitmaps[0], page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0)
+  assert.notEqual(r1, 0)
+  m._FPDF_RenderPageBitmap(bitmaps[1], page, 0, 0, 400, 400, 0, FPDF_ANNOT)
+  const r2 = m._INK_Render_Start(bitmaps[2], page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0)
+  assert.notEqual(r2, 0, 'a render could not start after a stale one')
+  assert.equal(m._INK_Render_Continue(r1, 1000), -1, 'a stale render continued')
+  m._INK_Render_Close(r1)
+  let status
+  while ((status = m._INK_Render_Continue(r2, 1000)) === 0);
+  assert.equal(status, 1, 'closing a stale render ended the current one')
+  m._INK_Render_Close(r2)
+  assert.ok(bitmapBytes(bitmaps[2], 400).equals(reference), 'the render after a stale one differs')
+  bitmaps.forEach((bitmap) => m._FPDFBitmap_Destroy(bitmap))
+  m._FPDF_ClosePage(page)
+})
 
 // /UserUnit: 2 when the page says 2, else 1.
 for (const [entry, expected] of [

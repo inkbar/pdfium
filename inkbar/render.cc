@@ -15,6 +15,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <memory>
 #include <unordered_set>
 #include <utility>
@@ -33,11 +34,33 @@
 struct InkRender {
   IFSDK_PAUSE pause;
   FPDF_PAGE page;
+  // The context Start put on the page. Continue and Close act only while the
+  // page holds it and this is the page's latest render.
+  const void* context;
   std::chrono::steady_clock::time_point deadline;
   int status;
 };
 
 namespace {
+
+// The latest InkRender started on each page. An older one is stale even when
+// a newer context took its address.
+std::map<FPDF_PAGE, InkRender*>& Latest() {
+  static auto* latest = new std::map<FPDF_PAGE, InkRender*>;
+  return *latest;
+}
+
+const void* ContextOf(FPDF_PAGE page) {
+  ScopedFPDFPageView view(page);
+  return view ? view.Get()->GetRenderContext() : nullptr;
+}
+
+// Whether |r| still owns the render its page holds.
+bool Current(const InkRender* r) {
+  auto it = Latest().find(r->page);
+  return it != Latest().end() && it->second == r &&
+         ContextOf(r->page) == r->context;
+}
 
 FPDF_BOOL PastDeadline(IFSDK_PAUSE* pause) {
   const auto* r = static_cast<const InkRender*>(pause->user);
@@ -153,12 +176,18 @@ InkRender* INK_Render_Start(FPDF_BITMAP bitmap,
     FPDF_RenderPage_Close(page);
     return nullptr;
   }
+  r->context = ContextOf(page);
+  Latest()[page] = r.get();
   return r.release();
 }
 
 int INK_Render_Continue(InkRender* r, int slice_ms) {
   if (!r) {
     return -1;
+  }
+  // A render another one replaced fails; a finished one stays finished.
+  if (r->status == FPDF_RENDER_TOBECONTINUED && !Current(r)) {
+    r->status = FPDF_RENDER_FAILED;
   }
   if (r->status == FPDF_RENDER_TOBECONTINUED) {
     r->deadline = std::chrono::steady_clock::now() +
@@ -172,7 +201,13 @@ void INK_Render_Close(InkRender* r) {
   if (!r) {
     return;
   }
-  FPDF_RenderPage_Close(r->page);
+  if (Current(r)) {
+    FPDF_RenderPage_Close(r->page);
+  }
+  auto it = Latest().find(r->page);
+  if (it != Latest().end() && it->second == r) {
+    Latest().erase(it);
+  }
   delete r;
 }
 

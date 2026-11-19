@@ -10,6 +10,8 @@
 // open until INK_Render_Close. A page holds one render at a time: Start fails
 // while another InkRender on the page is open, and FPDF_RenderPageBitmap on
 // the page while one is open ends that render, whose next Continue returns -1.
+// Such a stale handle never touches a later render of the page: its Continue
+// returns -1 and its Close only frees it.
 
 #ifndef INKBAR_RENDER_H_
 #define INKBAR_RENDER_H_
