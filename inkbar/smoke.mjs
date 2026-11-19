@@ -1848,7 +1848,196 @@ const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, 
   assert.notEqual(withDoc(light, (doc) => inspectPointer(doc, 0, [quadOf(PATTERN_MARK)])), 0, 'three such cells spent the budget')
 }
 
-// ends when patterns paint with patterns many times over// ends when patterns paint with patterns many times over
+// reads a path's box from its outline and its stroke, not from PDFium's
+{
+  const none = [0, 0, 0, 0]
+  const solid = tiling([0, 0, 10, 10], 10, 10, '0 0 1 rg 0 0 9.75 10 re f')
+  const patterned = (content) => onePagePdf(`q ${content} Q`, { resources: '/Pattern << /P0 6 0 R >>' }, [solid])
+  // A negative line width pulls PDFium's box inward, off the fill it bounds.
+  const inner = [255, 70, 295, 130]
+  assert.deepEqual(unremovable(patterned('/Pattern cs /P0 scn -50 w 100 60 200 80 re B'), [inner]), [[1, 0, 0, 0]], 'a pattern fill stroked with a negative width')
+  assert.equal(tryApply(patterned('/Pattern cs /P0 scn -50 w 100 60 200 80 re B'), inner).result, -1)
+  const black = onePagePdf('0 g -50 w 100 60 200 80 re B BT /F1 12 Tf 20 20 Td (KEEP) Tj ET')
+  assert.equal(under(black, inner).paths, 1, 'a black fill stroked with a negative width, under the region')
+  const cut = tryApply(black, inner)
+  assert.equal(cut.result, 1)
+  assert.equal(under(cut.bytes, inner).paths, 0, 'a black fill stroked with a negative width was not cut by the apply')
+  withDoc(cut.bytes, (doc) => assert.deepEqual(pixelAt(doc, 275, 100).slice(0, 3), [255, 255, 255], 'the fill is still painted under the mark'))
+  // A sharp corner where a closed outline starts reaches far past its box.
+  const tip = [20, 92, 48, 108]
+  const spike = '10 w 60 100 m 260 121 l 260 79 l h S'
+  assert.deepEqual(unremovable(patterned(`/Pattern CS /P0 SCN ${spike}`), [tip]), [[1, 0, 0, 0]], 'the mitred tip of a pattern-stroked triangle')
+  assert.equal(tryApply(patterned(`/Pattern CS /P0 SCN ${spike}`), tip).result, -1)
+  const blackSpike = onePagePdf(`0 G ${spike} BT /F1 12 Tf 20 20 Td (KEEP) Tj ET`)
+  assert.equal(under(blackSpike, tip).paths, 1, 'the mitred tip of a black triangle, under the region')
+  const trimmed = tryApply(blackSpike, tip)
+  assert.equal(trimmed.result, 1)
+  assert.equal(under(trimmed.bytes, tip).paths, 0, 'the mitred tip was not cut by the apply')
+  // The box is a first look, not the answer: a thin stroke beside the mark
+  // does not count.
+  assert.deepEqual(unremovable(patterned('/Pattern CS /P0 SCN 1 w 255 60 40 80 re S')), [none], 'a thin pattern-stroked box 4 pt beside the mark')
+}
+
+// reads a shading painted where its holder has no box
+{
+  // A form or a mask group without /BBox gives a shading painted in it an
+  // empty rectangle, and PDFium still paints it. It is bounded by its own
+  // geometry, or by nothing.
+  const band = '20 50 360 100 re f'
+  const boxless = onePagePdf('/Fm0 Do', { resources: '/XObject << /Fm0 7 0 R >>' }, [meshShading, streamObject('/Type /XObject /Subtype /Form /Resources << /Shading << /Sh0 6 0 R >> >>', '/Sh0 sh')])
+  assert.deepEqual(unremovable(boxless, [PATTERN_MARK, BESIDE_MARK]), [[0, 1, 0, 0], [0, 0, 0, 0]], 'a mesh painted in a form without /BBox')
+  const group = streamObject('/Type /XObject /Subtype /Form /Group << /S /Transparency /CS /DeviceGray >> /Resources << /Shading << /Sh0 7 0 R >> >>', '/Sh0 sh')
+  const masked = onePagePdf(`q /GS0 gs 0 0 1 rg ${band} Q`, { resources: '/ExtGState << /GS0 << /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >>' }, [group, meshShading])
+  assert.deepEqual(unremovable(masked), [[0, 0, 1, 0]], 'a mesh painted in a mask group without /BBox')
+  // A glyph's shading is bounded by the shading, not by the font's box,
+  // which the file supplies and nothing clips to.
+  const font = [
+    '<< /Type /Font /Subtype /Type3 /FontBBox [0 0 100 100] /FontMatrix [0.01 0 0 0.01 0 0] /CharProcs << /a 7 0 R >> /Encoding << /Type /Encoding /Differences [97 /a] >> /FirstChar 97 /LastChar 97 /Widths [100] /Resources << /Shading << /Sh0 << /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] /Matrix [100 0 0 100 150 0] /Function 8 0 R >> >> >> >>',
+    streamObject('', '100 0 d0 /Sh0 sh', true),
+    streamObject('/FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1]', '{ 2 copy add 2 div }', true),
+  ]
+  const glyph = onePagePdf('BT /T3 40 Tf 100 80 Td (a) Tj ET', { resources: '/Font << /T3 6 0 R >>' }, font)
+  assert.deepEqual(unremovable(glyph), [[0, 0, 0, 1]], 'a glyph whose shading paints outside its font box')
+  // Rendering modes that paint nothing reach nowhere.
+  assert.deepEqual(unremovable(type3Page('3 Tr 100 80 Td (a) Tj')), [[0, 0, 0, 0]], 'an invisible out-of-box glyph')
+}
+
+// counts for each region of a call, and refuses for any
+{
+  const band = '20 50 360 100 re f'
+  const source = patternPage(band, [hatchCell])
+  const clear = [20, 160, 100, 195]
+  assert.deepEqual(unremovable(source, [clear, PATTERN_MARK]), [[0, 0, 0, 0], [1, 0, 0, 0]], 'a carrier under the second of two regions')
+  assert.equal(tryApplyMarks(source, [clear, PATTERN_MARK]).result, -1, 'an apply whose second mark covers a carrier went ahead')
+  // An explicit mark over nothing and an own mark over the carrier.
+  let outcome
+  editPage(source, (doc, page) => {
+    const own = addMark(page, PATTERN_MARK)
+    setData(own, '{"v":1}')
+    m._FPDFPage_CloseAnnot(own)
+    const explicit = addMark(page, clear)
+    outcome = applyPage(doc, page, [explicit], true)
+    m._FPDFPage_CloseAnnot(explicit)
+  })
+  assert.equal(outcome.result, -1, 'an apply whose own mark covers a carrier went ahead')
+  const twice = onePagePdf('q 1 0 0 1 160 70 cm /Fm0 Do Q q 1 0 0 1 200 100 cm /Fm0 Do Q', { resources: '/XObject << /Fm0 7 0 R >>' }, [
+    hatchCell,
+    streamObject('/Type /XObject /Subtype /Form /BBox [0 0 30 20] /Resources << /Pattern << /P0 6 0 R >> >>', '/Pattern cs /P0 scn 0 0 30 20 re f'),
+  ])
+  assert.deepEqual(unremovable(twice), [[2, 0, 0, 0]], 'a pattern fill in a form drawn twice under the mark')
+}
+
+// tells a fade from a picture in a mask group
+{
+  const none = [0, 0, 0, 0]
+  const counts = [0, 0, 1, 0]
+  const band = '20 50 360 100 re f'
+  const resources = `/Shading << /Sh0 << ${axial} >> >> /Font << /F1 5 0 R >> /Pattern << /P0 7 0 R >> /XObject << /Fm0 8 0 R /Im0 9 0 R >> /ExtGState << /GS1 << /SMask << /Type /Mask /S /Luminosity /G 8 0 R >> >> >>`
+  const group = (content, dict = '/BBox [0 0 400 200]') =>
+    onePagePdf(`q /GS0 gs 0 0 1 rg ${band} Q`, { resources: '/ExtGState << /GS0 << /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >>' }, [
+      streamObject(`/Type /XObject /Subtype /Form ${dict} /Group << /S /Transparency /CS /DeviceGray >> /Resources << ${resources} >>`, content),
+      hatchCell,
+      streamObject('/Type /XObject /Subtype /Form /BBox [0 0 400 200]', '0 0 400 200 re f'),
+      streamObject('/Type /XObject /Subtype /Image /Width 8 /Height 8 /ColorSpace /DeviceGray /BitsPerComponent 8', Buffer.alloc(64, 0x55)),
+    ])
+  for (const [name, content] of [
+    ['a ramp under a text clip', 'q BT /F1 60 Tf 7 Tr 160 80 Td (AB) Tj ET /Sh0 sh Q'],
+    ['a stroked rectangle', '1 G 4 w 160 70 80 60 re S'],
+    ['a pattern-filled rectangle', '/Pattern cs /P0 scn 160 70 80 60 re f'],
+    ['a sheared rectangle', 'q 1 0 0.5 1 0 0 cm 160 70 80 60 re f Q'],
+    ['an object under a mask of its own', '/GS1 gs 160 70 80 60 re f'],
+    ['a form', '/Fm0 Do'],
+    ['an image', 'q 80 0 0 60 160 70 cm /Im0 Do Q'],
+  ]) {
+    assert.deepEqual(unremovable(group(content)), [counts], `a mask group holding ${name}`)
+  }
+  // An empty group holds nothing, so there is nothing to keep.
+  assert.deepEqual(unremovable(group('')), [none], 'an empty mask group')
+  assert.deepEqual(unremovable(group('q 100 40 200 120 re W n /Sh0 sh Q')), [none], 'a ramp under a rectangle smaller than the group box')
+  // Clips a fade's writer adds without meaning a shape: a rectangle larger
+  // than the group's box, and the box itself under a rotated matrix.
+  assert.deepEqual(unremovable(group('q -50 -50 500 300 re W n /Sh0 sh Q')), [none], 'a ramp under a rectangle larger than the group box')
+  assert.deepEqual(unremovable(group('/Sh0 sh', '/BBox [0 -400 400 400] /Matrix [0.8 0.6 -0.6 0.8 0 0]')), [none], 'a ramp in a group with a rotated matrix')
+  // A group's names are read against its own resources.
+  const nameless = onePagePdf(`q /GS0 gs 0 0 1 rg ${band} Q`, { resources: '/ExtGState << /GS0 << /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >>' }, [
+    streamObject('/Type /XObject /Subtype /Form /BBox [0 0 400 200] /Group << /S /Transparency /CS /DeviceGray >>', '/Nowhere Do'),
+  ])
+  assert.deepEqual(unremovable(nameless), [counts], 'a mask group naming a resource nothing defines')
+  // A group whose place on the page is not finite.
+  const huge = `1${'0'.repeat(30)}.0`
+  const adrift = onePagePdf(`q ${huge} 0 0 ${huge} 0 0 cm ${huge} 0 0 ${huge} 0 0 cm /GS0 gs 0 0 1 rg 0 0 1 1 re f Q`, { resources: '/ExtGState << /GS0 << /Type /ExtGState /SMask << /Type /Mask /S /Luminosity /G 6 0 R >> >> >>' }, [
+    maskGroup('1 g BT /F1 12 Tf 165 100 Td (MASKSECRET) Tj ET'),
+  ])
+  assert.ok(unremovablePointer(adrift) === 0 || unremovable(adrift)[0][2] > 0, 'a mask group set under a matrix that is not finite')
+}
+
+// counts a shading PDFium cannot load, and a picture by its own box
+{
+  const none = [0, 0, 0, 0]
+  const band = '20 50 360 100 re f'
+  const unloadable = onePagePdf(`q /Pattern cs /P0 scn ${band} Q`, { resources: '/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading << /ShadingType 2 /Coords [0 0 400 0] >> >> >>' })
+  assert.deepEqual(unremovable(unloadable), [[0, 1, 0, 0]], 'a shading pattern that does not load')
+  const badBox = onePagePdf(`q /Pattern cs /P0 scn ${band} Q`, { resources: '/Pattern << /P0 << /Type /Pattern /PatternType 2 /Shading 6 0 R >> >>' }, [
+    streamObject(
+      '/ShadingType 4 /ColorSpace /DeviceRGB /BBox [0 0 1] /BitsPerCoordinate 8 /BitsPerComponent 8 /BitsPerFlag 8 /Decode [0 400 0 200 0 1 0 1 0 1]',
+      Buffer.from([0, 96, 77, 255, 0, 0, 0, 159, 77, 0, 255, 0, 0, 128, 179, 0, 0, 255]),
+    ),
+  ])
+  assert.deepEqual(unremovable(badBox), [[0, 1, 0, 0]], 'a mesh whose /BBox is not four numbers')
+  // A function-based shading paints only inside its domain. Its clip's box
+  // meets the region and its domain does not: nothing of it is under the
+  // mark, so it does not count, and the apply clips it.
+  const elsewhere = onePagePdf('q 20 20 360 160 re W n /Sh0 sh Q', {
+    resources: '/Shading << /Sh0 << /ShadingType 1 /ColorSpace /DeviceRGB /Domain [0 1 0 1] /Matrix [60 0 0 60 300 70] /Function 6 0 R >> >>',
+  }, [streamObject('/FunctionType 4 /Domain [0 1 0 1] /Range [0 1 0 1 0 1]', '{ 2 copy add 2 div }', true)])
+  assert.deepEqual(unremovable(elsewhere), [none], 'a function-based shading whose domain lies beside the mark')
+  assert.equal(tryApply(elsewhere).result, 1)
+}
+
+// counts drawing in a loupe's copy of the page
+{
+  // A loupe keeps a copy of its page. One made before an apply still holds
+  // what lay under the mark, the drawing as well as the text, whatever part
+  // of the page its lens shows.
+  const star = '0 g 200 130 m 215 105 l 240 100 l 220 85 l 228 62 l 200 75 l 172 62 l 180 85 l 160 100 l 185 105 l h f'
+  const loupeOn = (doc, page, content) => {
+    const loupe = m._FPDFPage_CreateAnnot(page, FPDF_ANNOT_SQUARE)
+    const appearance = newAppearance(doc, [260, 150, 390, 195], content, false)
+    withStrings(['P0'], (name) => assert.equal(m._INK_Appearance_AddPage(appearance, name, 0), 1))
+    assert.equal(m._INK_Annot_SetAppearance(loupe, appearance), 1)
+    m._FPDFPage_CloseAnnot(loupe)
+  }
+  const lensOnStar = 'q 0.3 0 0 0.3 260 150 cm /P0 Do Q'
+  const lensElsewhere = 'q 1 0 0 1 260 150 cm /P0 Do Q'
+  const copiedBefore = (content, lens) =>
+    editPage(onePagePdf(`${content} BT /F1 12 Tf 20 20 Td (KEEP) Tj ET`, { resources: `/Shading << /Sh0 << ${axial} >> >>` }), (doc, page) => {
+      loupeOn(doc, page, lens)
+      const mark = addMark(page, PATTERN_MARK)
+      assert.equal(applyPage(doc, page, [mark], false).result, 1)
+      m._FPDFPage_CloseAnnot(mark)
+    })
+  for (const [name, content, lens] of [
+    ['a star, the lens on it', star, lensOnStar],
+    ['a star, the lens elsewhere', star, lensElsewhere],
+    ['an axial shading', 'q 160 70 80 60 re W n /Sh0 sh Q', lensOnStar],
+  ]) {
+    const after = under(copiedBefore(content, lens))
+    assert.ok(after.paths > 0, `${name} in a page copy made before the apply: ${JSON.stringify(after)}`)
+  }
+  // A copy made after the apply holds the redacted page, its overlay
+  // included, and reads clean.
+  const copiedAfter = editPage(onePagePdf(`${star} BT /F1 12 Tf 20 20 Td (KEEP) Tj ET`), (doc, page) => {
+    const mark = addMark(page, PATTERN_MARK)
+    const overlay = newAppearance(doc, [0, 0, 100, 80], '0 g 0 0 100 80 re f', false)
+    assert.equal(m._INK_Redact_SetOverlay(doc, mark, overlay), 1)
+    assert.equal(applyPage(doc, page, [mark], false).result, 1)
+    m._FPDFPage_CloseAnnot(mark)
+    loupeOn(doc, page, lensOnStar)
+  })
+  assert.deepEqual(zeros(under(copiedAfter)), [0, 0, 0, 0, 0, 0], `a page copy made after the apply: ${JSON.stringify(under(copiedAfter))}`)
+}
+
+// ends when patterns paint with patterns many times over
 {
   // Eight patterns, each cell painting eight rectangles with the next: read
   // naively, eight to the eighth cells.

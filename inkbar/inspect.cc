@@ -782,8 +782,53 @@ bool ImageBlank(SampleCache* cache,
 
 // -- Paths -------------------------------------------------------------------
 
+// The largest factor by which |m| stretches a length.
+float Stretch(const CFX_Matrix& m) {
+  const float sum = m.a * m.a + m.b * m.b + m.c * m.c + m.d * m.d;
+  const float difference = m.a * m.a + m.b * m.b - m.c * m.c - m.d * m.d;
+  const float cross = m.a * m.c + m.b * m.d;
+  return std::sqrt(
+      (sum + std::sqrt(difference * difference + 4 * cross * cross)) / 2);
+}
+
+// A box that holds everything |path| paints, placed by |to_page| from its
+// holder's space: the bounds of its outline, grown for a stroke by half the
+// line width, taken without its sign, times the miter limit when the joins
+// are mitred (a corner may reach that far) or the square root of 2 for
+// square caps, under the largest stretch in effect. A hairline, of width 0,
+// is a point wide on the page. PDFium's own box for a path is not used: a
+// negative width pulls it inward, off the fill, and it leaves out the miter
+// where a closed outline starts.
+CFX_FloatRect PathPaintBox(const CPDF_PathObject& path,
+                           const CFX_Matrix& to_page) {
+  const CFX_Matrix placed = path.matrix() * to_page;
+  CFX_FloatRect box = path.path().HasRef()
+                          ? placed.TransformRect(path.path().GetBoundingBox())
+                          : CFX_FloatRect();
+  box.Normalize();
+  if (path.stroke()) {
+    const CFX_GraphState& state = path.graph_state();
+    const float width = std::fabs(state.GetLineWidth());
+    float grow = 0.5f;
+    if (width > 0) {
+      float factor = 1;
+      if (state.GetLineJoin() == CFX_GraphStateData::LineJoin::kMiter) {
+        factor = std::max(factor, state.GetMiterLimit());
+      }
+      if (state.GetLineCap() == CFX_GraphStateData::LineCap::kSquare) {
+        factor = std::max(factor, 1.4143f);
+      }
+      grow = width / 2 * factor * Stretch(placed);
+    }
+    box.Inflate(grow, grow);
+  }
+  return box;
+}
+
 // A copy of |source| to hand to PDFium's path redactor, which cuts what it is
-// given: the redactor says whether it would cut the original.
+// given: the redactor says whether it would cut the original. The copy's
+// box is widened to PathPaintBox(), so the redactor's first look by the box
+// does not pass over a path whose own box is too small.
 std::unique_ptr<CPDF_PathObject> Probe(const CPDF_PathObject& source) {
   auto probe = std::make_unique<CPDF_PathObject>();
   probe->mutable_graph_state() = source.graph_state();
@@ -794,6 +839,10 @@ std::unique_ptr<CPDF_PathObject> Probe(const CPDF_PathObject& source) {
   probe->path() = source.path();
   probe->SetPathMatrix(source.matrix());
   probe->CalcBoundingBox();
+  CFX_FloatRect rect = probe->GetRect();
+  rect.Normalize();
+  rect.Union(PathPaintBox(source, CFX_Matrix()));
+  probe->SetRect(rect);
   return probe;
 }
 
@@ -1093,6 +1142,17 @@ OwnBox ShadingOwnBox(const CPDF_ShadingPattern& pattern, Work* work) {
   }
   std::optional<CFX_FloatRect> box;
   if (dict->KeyExist("BBox")) {
+    // Not four numbers: another reader ignores it and paints.
+    RetainPtr<const CPDF_Array> array = dict->GetArrayFor("BBox");
+    if (!array || array->size() != 4) {
+      return {};
+    }
+    for (size_t i = 0; i < 4; ++i) {
+      RetainPtr<const CPDF_Object> number = array->GetDirectObjectAt(i);
+      if (!number || !number->IsNumber()) {
+        return {};
+      }
+    }
     box = dict->GetRectFor("BBox");
     box->Normalize();
   }
@@ -1790,6 +1850,12 @@ class Walker {
       return;
     }
     const bool page = scope == Scope::kPage;
+    // Drawing counts on the page and in a loupe's copy of it, which holds
+    // what the page held when the copy was made. An ordinary appearance is
+    // read for text and images only: the apply removes every annotation
+    // whose rectangle meets a region, and an appearance cannot paint
+    // outside its rectangle.
+    const bool draws = page || scope == Scope::kPageCopy;
     for (auto it = holder->begin(); it != holder->end(); ++it) {
       if (context_->work.spent) {
         return;
@@ -1829,16 +1895,16 @@ class Walker {
       // shading pattern) counts when the object itself paints in a region.
       if (Carries(object) && PaintsIn(object, to_page, clips)) {
         Group(object, to_page, inherited, scope, counted, depth);
-        if (counted || page) {
+        if (counted || draws) {
           std::set<const CPDF_Object*> chain;
           const Found found = CellsOf(object, &chain);
           if (counted) {
             entry_->counts.pattern_content += found.content;
           }
-          if (page && found.drawing) {
+          if (draws && found.drawing) {
             ++entry_->counts.paths;
           }
-          if (page && PictureShadingPattern(object, to_page)) {
+          if (draws && PictureShadingPattern(object, to_page)) {
             ++entry_->counts.paths;
           }
         }
@@ -1867,12 +1933,12 @@ class Walker {
                   : entry_->counts.annotation_images);
         }
       } else if (CPDF_PathObject* path = object->AsPath()) {
-        if (page && (PathCrosses(*redactor_, *path, to_page) ||
+        if (draws && (PathCrosses(*redactor_, *path, to_page) ||
                      PathSampleInside(*path, to_page))) {
           ++entry_->counts.paths;
         }
       } else if (CPDF_ShadingObject* shading = object->AsShading()) {
-        if (page && (PictureShading(shading->pattern(),
+        if (draws && (PictureShading(shading->pattern(),
                                     shading->matrix() * to_page) ||
                      ShadingCounts(*shading, to_page))) {
           ++entry_->counts.paths;
@@ -1958,8 +2024,7 @@ class Walker {
   // inside a shrunk region. Paths whose box misses the regions are skipped.
   bool PathSampleInside(const CPDF_PathObject& path,
                         const CFX_Matrix& to_page) {
-    CFX_FloatRect box = to_page.TransformRect(path.GetRect());
-    box.Normalize();
+    const CFX_FloatRect box = PathPaintBox(path, to_page);
     std::optional<CFX_FloatRect> clip;
     for (const RedactRegion& region : entry_->second) {
       if (!Intersects(box, region.bbox)) {
@@ -2079,12 +2144,22 @@ class Walker {
         context_->work.spent) {
       return nullptr;
     }
+    // A group without resources of its own is read with the page's. A name
+    // those do not hold is dropped by PDFium, and another reader may find it
+    // in a form's: the group is then not read.
+    RetainPtr<const CPDF_Dictionary> own =
+        stream->GetDict()->GetDictFor("Resources");
+    RetainPtr<const CPDF_Dictionary> names =
+        own ? own : context_->page->GetResources();
+    auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(stream);
+    acc->LoadAllDataFiltered();
+    const bool resolves = NamesResolve(acc->GetSpan(), names.Get());
     auto form = std::make_unique<CPDF_Form>(
         context_->page->GetDocument(), context_->page->GetMutableResources(),
         std::move(stream));
     form->ParseContent();
     context_->work.Spend(form->GetPageObjectCount());
-    if (Unreadable(fell_back, *form)) {
+    if (!resolves || Unreadable(fell_back, *form)) {
       return nullptr;
     }
     return form;
@@ -2134,9 +2209,46 @@ class Walker {
     group_stack_.erase(id);
   }
 
+  // Whether |path| is one rectangle, at any angle: a clip a fade's writer
+  // adds without meaning a shape, such as the group's own box under a
+  // rotated matrix.
+  static bool Rectangle(const CPDF_Path& path) {
+    if (!path.HasRef()) {
+      return false;
+    }
+    if (path.GetRectOppositeCorner().has_value()) {
+      return true;
+    }
+    const std::vector<CFX_Path::Point>& points = path.GetPoints();
+    std::vector<CFX_PointF> corners;
+    for (size_t i = 0; i < points.size(); ++i) {
+      if (points[i].type_ == CFX_Path::Point::Type::kBezier ||
+          (i > 0 && points[i].type_ == CFX_Path::Point::Type::kMove)) {
+        return false;
+      }
+      if (corners.empty() || !(points[i].point_ == corners.back())) {
+        corners.push_back(points[i].point_);
+      }
+    }
+    if (corners.size() == 5 && corners[4] == corners[0]) {
+      corners.pop_back();
+    }
+    if (corners.size() != 4) {
+      return false;
+    }
+    const CFX_PointF side = corners[1] - corners[0];
+    const CFX_PointF next = corners[2] - corners[1];
+    const CFX_PointF closing = corners[0] + corners[2] - corners[1] - corners[3];
+    const float scale = side.x * side.x + side.y * side.y + next.x * next.x +
+                        next.y * next.y;
+    return scale > 0 &&
+           std::fabs(side.x * next.x + side.y * next.y) <= 0.001f * scale &&
+           closing.x * closing.x + closing.y * closing.y <= 0.000001f * scale;
+  }
+
   // Whether a group draws nothing but a fade, which is how gradient
   // transparency is drawn: at most four objects, each a filled axis-aligned
-  // rectangle or a plain ramp, under no clip but one axis-aligned rectangle.
+  // rectangle or a plain ramp, under no clip but rectangles.
   // Text, an image, any other path, a fifth object, a shading that can hold
   // a picture, a pattern, a form, a mask of its own or a clip to a shape
   // makes it more than that: a ramp through a shape is the shape, and many
@@ -2156,11 +2268,15 @@ class Walker {
         return false;
       }
       const CPDF_ClipPath& clip = object->clip_path();
-      if (clip.HasRef() &&
-          (clip.GetTextCount() > 0 || clip.GetPathCount() > 1 ||
-           (clip.GetPathCount() == 1 &&
-            !clip.GetPath(0).GetRectOppositeCorner().has_value()))) {
-        return false;
+      if (clip.HasRef()) {
+        if (clip.GetTextCount() > 0) {
+          return false;
+        }
+        for (size_t i = 0; i < clip.GetPathCount(); ++i) {
+          if (!Rectangle(clip.GetPath(i))) {
+            return false;
+          }
+        }
       }
       if (const CPDF_ShadingObject* shading = object->AsShading()) {
         if (!Ramp(shading->pattern())) {
@@ -2225,8 +2341,7 @@ class Walker {
         if (!inner->IsActive()) {
           continue;
         }
-        CFX_FloatRect box = placed.TransformRect(inner->GetRect());
-        box.Normalize();
+        const CFX_FloatRect box = ShapeBox(inner, placed);
         holds = !Finite(box) || RectMeetsAnyBBox(box, entry_->inset) ||
                 GroupHolds(inner, placed, nullptr, depth + 1);
       }
@@ -2350,39 +2465,55 @@ class Walker {
     return false;
   }
 
-  // The largest factor by which |m| stretches a length.
-  static float Stretch(const CFX_Matrix& m) {
-    const float sum = m.a * m.a + m.b * m.b + m.c * m.c + m.d * m.d;
-    const float difference = m.a * m.a + m.b * m.b - m.c * m.c - m.d * m.d;
-    const float cross = m.a * m.c + m.b * m.d;
-    return std::sqrt(
-        (sum + std::sqrt(difference * difference + 4 * cross * cross)) / 2);
+  // A box, stretching past any region.
+  static CFX_FloatRect Everywhere() {
+    return CFX_FloatRect(-1e30f, -1e30f, 1e30f, 1e30f);
   }
 
   // The box of |object|'s own shape on the page, clips aside, its stroke
-  // included. A path's box holds its stroke already. Text's does not, and
-  // grows by half the line width under the largest stretch in effect. A
-  // hairline, of width 0, is a point wide on the page whatever the matrix,
-  // as the redactor draws it.
-  static CFX_FloatRect ShapeBox(const CPDF_PageObject* object,
-                                const CFX_Matrix& to_page) {
+  // included. A path's is built from its outline and stroke. Text grows by
+  // half its line width under the largest stretch in effect when its mode
+  // strokes; a hairline is a point wide on the page. A shading painted with
+  // sh has the rectangle its holder gave it: its clip's box, or the page's
+  // or the form's. In a form or group without /BBox, and under no clip,
+  // that rectangle is empty though PDFium paints the shading: it is then
+  // bounded by the shading's own box, or by nothing when that is not known.
+  CFX_FloatRect ShapeBox(const CPDF_PageObject* object,
+                         const CFX_Matrix& to_page) {
+    if (const CPDF_PathObject* path = object->AsPath()) {
+      return PathPaintBox(*path, to_page);
+    }
+    if (const CPDF_ShadingObject* shading = object->AsShading()) {
+      const CFX_FloatRect rect = shading->GetRect();
+      const CPDF_ClipPath& clip = shading->clip_path();
+      if ((rect.Width() > 0 && rect.Height() > 0) ||
+          (clip.HasRef() && clip.GetPathCount() > 0)) {
+        CFX_FloatRect box = to_page.TransformRect(rect);
+        box.Normalize();
+        return box;
+      }
+      const OwnBox own =
+          shading->pattern() ? OwnBoxOf(*shading->pattern()) : OwnBox();
+      if (!own.known) {
+        return Everywhere();
+      }
+      CFX_FloatRect box = (shading->matrix() * to_page).TransformRect(own.box);
+      box.Normalize();
+      return box;
+    }
     CFX_FloatRect box = to_page.TransformRect(object->GetRect());
     box.Normalize();
-    const float width = object->graph_state().GetLineWidth();
-    float grow = 0;
     if (const CPDF_TextObject* text = object->AsText()) {
       if (Paints(object, true)) {
-        grow = width > 0 ? width / 2 *
-                               std::max(Stretch(to_page),
-                                        Stretch(text->GetTextMatrix() * to_page))
-                         : 0.5f;
-      }
-    } else if (const CPDF_PathObject* path = object->AsPath()) {
-      if (path->stroke() && !(width > 0)) {
-        grow = 0.5f;
+        const float width = std::fabs(object->graph_state().GetLineWidth());
+        const float grow =
+            width > 0 ? width / 2 *
+                            std::max(Stretch(to_page),
+                                     Stretch(text->GetTextMatrix() * to_page))
+                      : 0.5f;
+        box.Inflate(grow, grow);
       }
     }
-    box.Inflate(grow, grow);
     return box;
   }
 
@@ -2620,9 +2751,7 @@ class Walker {
   // image, and the answer must not turn on whether the page was drawn. A
   // font with resources of its own is read with those; one without, with
   // |shown_with|, the resources of the content that shows the glyph. A
-  // procedure naming a resource those do not hold is not readable. One that
-  // paints a shading, whose box there is not its paint's, is taken to paint
-  // the font's box as well.
+  // procedure naming a resource those do not hold is not readable.
   const Context::Glyph& GlyphOf(CPDF_Type3Font* font,
                                 uint32_t code,
                                 RetainPtr<CPDF_Dictionary> shown_with) {
@@ -2668,14 +2797,24 @@ class Walker {
           if (!object->IsActive()) {
             continue;
           }
+          // A path by its outline and stroke. A shading by its own box:
+          // a glyph is drawn under no clip but the text's, and the font's
+          // box, which the file supplies, bounds nothing. A shading with no
+          // box of its own, and a form without one, reach anywhere.
           CFX_FloatRect rect = object->GetRect();
-          if (object->AsShading()) {
-            CFX_FloatRect font_box = dict->GetRectFor("FontBBox");
-            font_box.Normalize();
-            if (!(font_box.Width() > 0) || !(font_box.Height() > 0)) {
+          if (const CPDF_PathObject* path = object->AsPath()) {
+            rect = PathPaintBox(*path, CFX_Matrix());
+          } else if (const CPDF_ShadingObject* shading = object->AsShading()) {
+            const OwnBox box =
+                shading->pattern() ? OwnBoxOf(*shading->pattern()) : OwnBox();
+            if (!box.known) {
               glyph.readable = false;
             }
-            rect.Union(font_box);
+            rect = shading->matrix().TransformRect(box.box);
+            rect.Normalize();
+          } else if (object->AsForm() &&
+                     !(rect.Width() > 0 && rect.Height() > 0)) {
+            glyph.readable = false;
           }
           if (glyph.bounds.has_value()) {
             glyph.bounds->Union(rect);
@@ -2699,7 +2838,8 @@ class Walker {
                       CPDF_PageObjectHolder* holder) {
     RetainPtr<CPDF_Font> font = text.GetFont();
     CPDF_Type3Font* type3 = font ? font->AsType3Font() : nullptr;
-    if (!type3) {
+    // Text in a mode that neither fills nor strokes paints nothing.
+    if (!type3 || (!Paints(&text, false) && !Paints(&text, true))) {
       return 0;
     }
     const float size = text.GetFontSize();
