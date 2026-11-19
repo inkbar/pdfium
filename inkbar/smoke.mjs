@@ -3178,6 +3178,15 @@ const fontCases = [
     needs: FONT_KEYS.default,
   },
   {
+    // The Symbol font keeps its Greek: PDFium draws it from the built-in Symbol face.
+    name: 'SymbolMT with Greek /Differences',
+    pdf: fontPagePdf('(ABCD)', [
+      '<< /Type /Font /Subtype /TrueType /BaseFont /SymbolMT /FirstChar 65 /LastChar 68 /Widths [600 600 600 600] /FontDescriptor 6 0 R /Encoding << /Type /Encoding /Differences [65 /alpha /beta /gamma /delta] >> >>',
+      '<< /Type /FontDescriptor /FontName /SymbolMT /Flags 4 /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 >>',
+    ]),
+    needs: 0,
+  },
+  {
     name: 'Calibri',
     pdf: fontPagePdf('(Calibri) ', [
       '<< /Type /Font /Subtype /TrueType /BaseFont /Calibri /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>',
@@ -3322,15 +3331,21 @@ for (const name of ['a simple font with Cyrillic /Differences', 'a simple font w
   })
 }
 
-// A WinAnsi font with a name PDFium does not know draws the same bytes
-// whether every key has a font or none does: the mapper never asks for it.
-{
-  const { pdf } = fontCases.find((c) => c.name === 'Calibri')
+// A WinAnsi font with a name PDFium does not know, and SymbolMT with Greek
+// /Differences, draw the same bytes whether every key has a font or none does,
+// and miss nothing: the mapper never asks for them.
+for (const name of ['Calibri', 'SymbolMT with Greek /Differences']) {
+  const { pdf } = fontCases.find((c) => c.name === name)
   const every = Object.values(FONT_KEYS).map((key) => [key, key === FONT_KEYS.default ? defaultFont : cjkFont])
-  const none = await withFreshModule(pdf, [], (fresh, doc) => freshRender(fresh, doc).bytes)
-  const all = await withFreshModule(pdf, every, (fresh, doc) => freshRender(fresh, doc).bytes)
-  assert.ok(inkInBand({ bytes: none, width: 300, height: 100 }, 15, 75) > 0, 'Calibri drew nothing')
-  assert.ok(none.equals(all), 'registered fonts changed how Calibri draws')
+  const draw = (fresh, doc) => {
+    const { bytes } = freshRender(fresh, doc)
+    assert.equal(fresh._INK_Fonts_TakeMisses(), 0, `${name} missed a key`)
+    return bytes
+  }
+  const none = await withFreshModule(pdf, [], draw)
+  const all = await withFreshModule(pdf, every, draw)
+  assert.ok(inkInBand({ bytes: none, width: 300, height: 100 }, 15, 75) > 0, `${name} drew nothing`)
+  assert.ok(none.equals(all), `registered fonts changed how ${name} draws`)
 }
 
 m._INK_Destroy()

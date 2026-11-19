@@ -33,6 +33,7 @@
 #include "core/fxcrt/fx_codepage.h"
 #include "core/fxcrt/fx_string.h"
 #include "core/fxcrt/retain_ptr.h"
+#include "core/fxge/cfx_fontmapper.h"
 #include "core/fxge/cfx_standardfont.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
 #include "public/fpdf_sysfontinfo.h"
@@ -163,12 +164,10 @@ FX_CodePage CodePageOf(CIDSet set) {
 // The key the mapper asks for when CFX_FontMapper::FindSubstFace substitutes
 // |name| with |code_page|. Symbol and ZapfDingbats draw from built-in faces
 // before it asks. kDefANSI gives ANSI or Symbol, which it never asks for.
-int KeyForSubstitute(ByteString name, bool is_truetype, FX_CodePage code_page) {
-  if (is_truetype && !name.IsEmpty() && name.Front() == '@') {
-    name.Delete(0);
-  } else {
-    name.Remove(' ');
-  }
+int KeyForSubstitute(const ByteString& base_font,
+                     bool is_truetype,
+                     FX_CodePage code_page) {
+  const ByteString name = CFX_FontMapper::GetSubstName(base_font, is_truetype);
   if ((name == "Symbol" && !is_truetype) || name == "ZapfDingbats") {
     return 0;
   }
@@ -341,7 +340,8 @@ class NeedsWalker {
       name = CFX_StandardFont::GetCanonicalFontName(standard.value());
     }
     keys_ |= KeyForSubstitute(name, truetype,
-                              CPDF_FaceBasedSimpleFont::SubstCodePage(font));
+                              CPDF_FaceBasedSimpleFont::SubstCodePage(
+                                  font, name, truetype));
   }
 
   // Held, so an address is not reused while the walk runs.

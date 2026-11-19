@@ -13,6 +13,7 @@
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fxcrt/fx_codepage.h"
 #include "core/fxge/cfx_face.h"
+#include "core/fxge/cfx_fontmapper.h"
 #include "core/fxge/cfx_substfont.h"
 #include "core/fxge/fx_font.h"
 
@@ -229,20 +230,26 @@ void CPDF_FaceBasedSimpleFont::LoadSubstFont() {
     weight = pdfium::kFontWeightNormal;
   }
   font_.LoadSubstFace(base_font_name_, IsTrueTypeFont(), flags_, weight,
-                      italic_angle_, SubstCodePage(font_dict_.Get()),
+                      italic_angle_,
+                      SubstCodePage(font_dict_.Get(), base_font_name_,
+                                    IsTrueTypeFont()),
                       /*bVertical=*/false);
 }
 
 // Inkbar(fonts): Cyrillic or Greek when the /Differences name a letter of
-// that script (Greek not for the Symbol font), so the mapper asks for a face
-// that has it. Otherwise kDefANSI, as upstream.
+// that script, so the mapper asks for a face that has it. Otherwise, and for
+// the Symbol font under any of its names, kDefANSI, as upstream.
 // static
 FX_CodePage CPDF_FaceBasedSimpleFont::SubstCodePage(
-    const CPDF_Dictionary* font_dict) {
+    const CPDF_Dictionary* font_dict,
+    const ByteString& base_font,
+    bool is_truetype) {
+  if (CFX_FontMapper::GetSubstName(base_font, is_truetype) == "Symbol") {
+    return FX_CodePage::kDefANSI;
+  }
   RetainPtr<const CPDF_Dictionary> encoding = font_dict->GetDictFor("Encoding");
   RetainPtr<const CPDF_Array> differences =
       encoding ? encoding->GetArrayFor("Differences") : nullptr;
-  const bool symbol = font_dict->GetByteStringFor("BaseFont") == "Symbol";
   bool greek = false;
   for (size_t i = 0; differences && i < differences->size(); ++i) {
     RetainPtr<const CPDF_Object> item = differences->GetDirectObjectAt(i);
@@ -253,7 +260,7 @@ FX_CodePage CPDF_FaceBasedSimpleFont::SubstCodePage(
     if (unicode >= 0x400 && unicode <= 0x4ff) {
       return FX_CodePage::kMSWin_Cyrillic;
     }
-    greek |= !symbol && unicode >= 0x370 && unicode <= 0x3ff;
+    greek |= unicode >= 0x370 && unicode <= 0x3ff;
   }
   return greek ? FX_CodePage::kMSWin_Greek : FX_CodePage::kDefANSI;
 }

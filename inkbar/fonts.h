@@ -35,9 +35,11 @@ extern "C" {
 #endif
 
 // Serves |len| bytes of a font file (TrueType or OpenType, not a collection)
-// for |key_bit|, replacing any font registered for it. Copies the bytes.
-// Returns 1 on success, 0 for a key that is not one of the five bits or for
-// NULL or empty data. Registrations outlive INK_Destroy and INK_Init.
+// for |key_bit|. Copies the bytes. Returns 1 on success, 0 for a key that is
+// not one of the five bits or for NULL or empty data. Registrations outlive
+// INK_Destroy and INK_Init. Register a key once in a module's life: PDFium
+// caches the face it made from a key's font, and registering the key again
+// does not replace a face a loaded document already holds.
 int INK_Fonts_Register(int key_bit, const unsigned char* data, size_t len);
 
 // The keys page |page_index| of |doc| needs for its unembedded fonts,
@@ -48,6 +50,10 @@ int INK_Fonts_Register(int key_bit, const unsigned char* data, size_t len);
 // no FontFile, FontFile2 or FontFile3 stream. Each font is classified as
 // PDFium's font loader and mapper would ask for it. Reads the file without
 // loading any font. Returns 0 for a NULL document or no such page.
+//
+// Limit: an embedded font whose file PDFium cannot load is substituted, and
+// may ask for a key, but counts here as embedded. In that one case misses can
+// exceed needs.
 int INK_Fonts_PageNeeds(FPDF_DOCUMENT doc, int page_index);
 
 // The keys the font mapper asked for since the last call and found

@@ -262,22 +262,6 @@ FX_Charset GetCharset(FX_CodePage code_page,
   return FX_Charset::kANSI;
 }
 
-ByteString GetSubstName(const ByteString& name, bool is_truetype) {
-  ByteString subst_name = name;
-  if (is_truetype && name.Front() == '@') {
-    subst_name.Delete(0);
-  } else {
-    subst_name.Remove(' ');
-  }
-  MaybeRemoveSubsettedFontPrefix(subst_name);
-  std::optional<CFX_StandardFont::Index> std_font =
-      CFX_StandardFont::GetStandardFontIndex(subst_name);
-  if (std_font) {
-    subst_name = CFX_StandardFont::GetCanonicalFontName(*std_font);
-  }
-  return subst_name;
-}
-
 ByteString GetFontNameFromFace(const CFX_Face& face) {
   ByteString family_name = face.GetFamilyName();
   if (family_name.IsEmpty()) {
@@ -327,6 +311,26 @@ class [[maybe_unused, nodiscard]] ScopedFontDeleter {
 };
 
 }  // namespace
+
+// Inkbar(fonts): a static member, so the font shim names a font as the
+// mapper does.
+// static
+ByteString CFX_FontMapper::GetSubstName(const ByteString& name,
+                                         bool is_truetype) {
+  ByteString subst_name = name;
+  if (is_truetype && name.Front() == '@') {
+    subst_name.Delete(0);
+  } else {
+    subst_name.Remove(' ');
+  }
+  MaybeRemoveSubsettedFontPrefix(subst_name);
+  std::optional<CFX_StandardFont::Index> std_font =
+      CFX_StandardFont::GetStandardFontIndex(subst_name);
+  if (std_font) {
+    subst_name = CFX_StandardFont::GetCanonicalFontName(*std_font);
+  }
+  return subst_name;
+}
 
 CFX_FontMapper::CFX_FontMapper() = default;
 

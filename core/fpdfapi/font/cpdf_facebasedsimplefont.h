@@ -30,9 +30,11 @@ class CPDF_FaceBasedSimpleFont : public CPDF_SimpleFont {
   int GlyphFromCharCode(uint32_t charcode, bool* pVertGlyph) override;
   bool HasFontWidths() const override;
 
-  // Inkbar(fonts): the code page an unembedded simple font with |font_dict|
-  // is substituted with. inkbar/fonts.cc calls it too.
-  static FX_CodePage SubstCodePage(const CPDF_Dictionary* font_dict);
+  // Inkbar(fonts): the code page an unembedded simple font with |font_dict|,
+  // named |base_font|, is substituted with. inkbar/fonts.cc calls it too.
+  static FX_CodePage SubstCodePage(const CPDF_Dictionary* font_dict,
+                                   const ByteString& base_font,
+                                   bool is_truetype);
 
  protected:
   CPDF_FaceBasedSimpleFont(CPDF_Document* document,

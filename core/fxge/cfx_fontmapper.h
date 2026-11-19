@@ -56,6 +56,8 @@ class CFX_FontMapper {
   // built-in face. Upstream's embedder tests turn it on: they expect the
   // test fonts.
   static void SetStandardFontsFromSystemForTesting(bool from_system);
+  // Inkbar(fonts): the name FindSubstFace() substitutes for |name|.
+  static ByteString GetSubstName(const ByteString& name, bool is_truetype);
   static constexpr uint32_t MakeTag(char c1, char c2, char c3, char c4) {
     return static_cast<uint8_t>(c1) << 24 | static_cast<uint8_t>(c2) << 16 |
            static_cast<uint8_t>(c3) << 8 | static_cast<uint8_t>(c4);
