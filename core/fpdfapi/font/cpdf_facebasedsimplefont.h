@@ -11,6 +11,7 @@
 
 #include "core/fpdfapi/font/cpdf_fontencoding.h"
 #include "core/fpdfapi/font/cpdf_simplefont.h"
+#include "core/fxcrt/fx_codepage.h"
 #include "core/fxcrt/fx_coordinates.h"
 #include "core/fxcrt/retain_ptr.h"
 
@@ -28,6 +29,10 @@ class CPDF_FaceBasedSimpleFont : public CPDF_SimpleFont {
   FX_RECT GetCharBBox(uint32_t charcode) override;
   int GlyphFromCharCode(uint32_t charcode, bool* pVertGlyph) override;
   bool HasFontWidths() const override;
+
+  // Inkbar(fonts): the code page an unembedded simple font with |font_dict|
+  // is substituted with. inkbar/fonts.cc calls it too.
+  static FX_CodePage SubstCodePage(const CPDF_Dictionary* font_dict);
 
  protected:
   CPDF_FaceBasedSimpleFont(CPDF_Document* document,

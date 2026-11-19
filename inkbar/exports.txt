@@ -87,3 +87,6 @@ INK_Render_Start
 INK_Render_Continue
 INK_Render_Close
 INK_Page_UserUnit
+INK_Fonts_Register
+INK_Fonts_PageNeeds
+INK_Fonts_TakeMisses

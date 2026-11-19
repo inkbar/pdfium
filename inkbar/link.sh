@@ -38,7 +38,7 @@ done
 ROOT="$PWD"
 # eval: Ninja runs the command through a shell, which strips the quoting in the defines.
 OBJECTS=()
-for source in appearance redact sanitize inspect render; do
+for source in appearance redact sanitize inspect render fonts; do
   (cd "$BUILD" && eval "em++ $FLAGS -Wno-unknown-warning-option -c '$ROOT/inkbar/$source.cc' -o '$ROOT/inkbar/out/$source.o'")
   OBJECTS+=("inkbar/out/$source.o")
 done

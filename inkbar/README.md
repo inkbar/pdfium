@@ -24,6 +24,7 @@ Everything Inkbar adds lives under `inkbar/`. Changes to files outside that dire
 | `sanitize.h`, `sanitize.cc` | `INK_Sanitize`. It removes metadata, attached files, scripts, thumbnails and private application data from every object of a document. |
 | `inspect.h`, `inspect.cc` | `INK_Inspect_*`, for the redaction check. `INK_Inspect_Page` counts what lies under regions of a page, or finds candidate regions. `INK_Inspect_File` reports what a file carries besides its pages. Reports are JSON with numbers and booleans only, never text from the file. |
 | `render.h`, `render.cc` | `INK_Render_*` and `INK_Page_UserUnit`. `INK_Render_Start`, `INK_Render_Continue` and `INK_Render_Close` draw a page as `FPDF_RenderPageBitmap_Start` does, a slice of at most a given number of milliseconds at a time, and leave out the annotations whose object numbers the caller lists. Start sets the Hidden flag on those annotations while PDFium lists the ones it draws, then puts each `/F` back as it was before it returns, so a save during or after the render writes the same bytes. `INK_Page_UserUnit` reads a page's `/UserUnit`, 1 when absent or not positive. |
+| `fonts.h`, `fonts.cc` | `INK_Fonts_*`, fallback fonts for text a file does not embed. `INK_Init` gives PDFium's font mapper a font source that serves the font registered for the charset the mapper asks for: key 1 for Shift-JIS, 2 for GB2312, 4 for Big5, 8 for Hangul, 16 for any charset but those and ANSI, Symbol and default. It logs each key it was asked for and did not have, which `INK_Fonts_TakeMisses` returns. `INK_Fonts_PageNeeds` reads a page's resources, the forms, tiling patterns, soft mask groups and Type 3 fonts they use, and its annotations' normal appearances, and returns the keys its unembedded fonts need. It classifies each font with PDFium's own CMap and charset tables, as the font loader and mapper would, without loading it. A Type 0 font needs the key of its CID set's charset; one with an ordering PDFium does not know needs none, since PDFium maps it as ANSI and no font draws it meaningfully. A TrueType font with one of five Chinese names, which PDFium loads as a GB1 font, needs key 2. A simple font needs key 16 when its `/Differences` name a Cyrillic or Greek letter (see below), and none otherwise. A font whose embedded file does not load is substituted though `INK_Fonts_PageNeeds` counts it as embedded. |
 | `exports.txt` | The export allowlist. |
 | `build.sh`, `link.sh` | The build. |
 | `smoke.mjs` | The smoke check. |
@@ -40,6 +41,8 @@ inkbar/build.sh
 node inkbar/smoke.mjs testing/resources/hello_world.pdf
 node inkbar/sample.mjs
 ```
+
+Set `SMOKE_CJK_FONT` to the path of a Japanese OpenType file, such as Noto Sans JP, and `SMOKE_DEFAULT_FONT` to one with Cyrillic and Greek, such as Noto Sans, and the smoke check also checks that registered fallback fonts draw glyphs. Without them those checks are skipped.
 
 To check the redacted file the smoke check writes, set `SMOKE_REDACT_OUT` to a path inside the checkout and run `podman run --rm --security-opt label=disable -v "$PWD:/w" localhost/inkbar-qpdf:11 qpdf --check /w/<path>` on it.
 
@@ -59,7 +62,7 @@ The checkout is mounted into the container. `scripts/embedpdf-runtime/build-targ
 
 The binary is single-threaded.
 
-Current size of `inkbar-pdfium.wasm`: 6,935,044 bytes raw, 2,931,841 bytes gzipped at level 9. The budget is 3,256,192 bytes gzipped.
+Current size of `inkbar-pdfium.wasm`: 6,950,952 bytes raw, 2,936,638 bytes gzipped at level 9. It exports 92 functions. The budget is 3,256,192 bytes gzipped.
 
 ## The redaction check
 
@@ -152,6 +155,7 @@ Every change this fork's Inkbar commits make outside `inkbar/`. Update this list
 - `core/fpdfapi/edit/cpdf_image_redactor.{h,cpp}`: `RedactionHoleSamples()`, a public wrapper over the file's own `HoleSamples()` and `ColorSpaceOf()`, so the redaction check compares an image with the value the redaction fills it with. The smoke check guards it.
 - `core/fpdfapi/parser/cpdf_document.{h,cpp}`: `CPDF_Document::DropInfo()`, which `INK_Sanitize` calls so the next save writes no `/Info`. It caches a direct, empty `/Info` dictionary and removes `/Info` from the parser's trailer, so the save trailer names none and copies none, whether the file named an object or held a direct dictionary. A layer document shares its base's parser, so on a layer it changes only the cached `/Info` and leaves the base's trailer alone. The smoke check guards both cases.
 - `core/fpdfapi/edit/cpdf_pagecontentgenerator.cpp`, in `RealizeResource`: a direct resource, such as a shading or pattern dictionary held inside `/Resources`, is copied into an object of its own before the rewritten content names it. Upstream writes a reference to object 0, which the save drops, so a shading beside a redaction disappeared from the page. The smoke check guards it.
+- `core/fpdfapi/font/cpdf_facebasedsimplefont.{h,cpp}`: `CPDF_FaceBasedSimpleFont::SubstCodePage()`, which `LoadSubstFont` passes to the font mapper in place of `kDefANSI`. It gives the Cyrillic code page when an unembedded simple font's `/Differences` name a letter in U+0400 to U+04FF, the Greek code page when they name one in U+0370 to U+03FF and the font is not Symbol, and `kDefANSI` otherwise, as upstream. Upstream maps every simple font as ANSI, so the mapper never asked for a face with those letters and the text drew nothing; now the default fallback font draws it. `INK_Fonts_PageNeeds` calls the same function. The smoke check guards it.
 - `core/fpdfapi/edit/cpdf_path_redactor.cpp`, in `CPDF_PathRedactor::Redact`: the first look that skips a path away from every region uses a box built from the path's outline and stroke (`PaintBox`, in the same file) instead of `GetRect()`. `GetRect()` takes a negative line width with its sign, which pulls the box inward, and leaves out the miter where a closed subpath starts, so a path whose fill or stroke lay under a mark was skipped and survived the apply. The new box is not a superset of `GetRect()`: it is tighter for round and bevel joins and for miters past the limit, and never tighter than the stroke's real outline. For mitred joins it widens the first look to half the line width times the miter limit, five line widths at the default. The stretch is computed in double, so a very small or very large matrix does not lose it. The smoke check guards both cases.
 
 ## Taking upstream

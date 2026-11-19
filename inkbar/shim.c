@@ -12,6 +12,9 @@
 #include "fpdf_save.h"
 #include "fpdfview.h"
 
+// fonts.cc
+void INK_Fonts_Install(void);
+
 typedef struct {
   FPDF_FILEWRITE base;
   unsigned char* data;
@@ -47,6 +50,7 @@ void INK_Init(void) {
   memset(&config, 0, sizeof(config));
   config.version = 2;
   FPDF_InitLibraryWithConfig(&config);
+  INK_Fonts_Install();
 }
 
 void INK_Destroy(void) {

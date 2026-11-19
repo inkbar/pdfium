@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 89)
+assert.equal(names.length, 92)
 
 const m = await createModule()
 for (const name of names) {
@@ -27,6 +27,7 @@ const exported = Object.keys(m)
 assert.deepEqual(exported, [...names].sort())
 
 const FPDF_ANNOT = 0x01
+const EPDF_RENDER_WIDGETS = 0x8000
 const FPDF_ANNOT_SQUARE = 5
 const NO_INCREMENTAL = 2
 
@@ -3086,6 +3087,217 @@ for (const [entry, expected] of [
     assert.equal(m._INK_Page_UserUnit(page), expected, `INK_Page_UserUnit for "${entry}"`)
     m._FPDF_ClosePage(page)
   })
+}
+
+// Fallback fonts. INK_Fonts_PageNeeds says which keys a page's unembedded
+// fonts need, INK_Fonts_TakeMisses which keys the font mapper asked for and
+// found unregistered, and INK_Fonts_Register serves a font for a key.
+const FONT_KEYS = { japanese: 1, simplifiedChinese: 2, traditionalChinese: 4, korean: 8, default: 16 }
+
+// An unembedded Type 0 font with the given CIDSystemInfo ordering, as objects
+// |first| (the font), |first| + 1 (its descendant) and |first| + 2 (the descriptor).
+function type0Font(ordering, first) {
+  return [
+    `<< /Type /Font /Subtype /Type0 /BaseFont /Ink${ordering} /Encoding /Identity-H /DescendantFonts [${first + 1} 0 R] >>`,
+    `<< /Type /Font /Subtype /CIDFontType0 /BaseFont /Ink${ordering} /CIDSystemInfo << /Registry (Adobe) /Ordering (${ordering}) /Supplement 0 >> /FontDescriptor ${first + 2} 0 R /DW 1000 >>`,
+    `<< /Type /FontDescriptor /FontName /Ink${ordering} /Flags 4 /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 880 /Descent -120 /CapHeight 700 /StemV 80 >>`,
+  ]
+}
+
+// One 300 x 100 pt page showing |text| in font object 5 (|font| from object 5 on) at 40 pt, baseline 30.
+function fontPagePdf(text, font, { pageExtra = '', resources = '', extra = [] } = {}) {
+  return buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> ${resources} >> ${pageExtra} >>`,
+    streamObject('', `BT /F1 40 Tf 20 30 Td ${text} Tj ET`),
+    ...font,
+    ...extra,
+  ])
+}
+
+// Japan1 CIDs 843 to 846 are hiragana, which the built-in faces lack.
+const kana = '<034B034C034D034E>'
+const fontCases = [
+  { name: 'Japan1', pdf: fontPagePdf(kana, type0Font('Japan1', 5)), needs: FONT_KEYS.japanese },
+  { name: 'GB1', pdf: fontPagePdf(kana, type0Font('GB1', 5)), needs: FONT_KEYS.simplifiedChinese },
+  { name: 'CNS1', pdf: fontPagePdf(kana, type0Font('CNS1', 5)), needs: FONT_KEYS.traditionalChinese },
+  { name: 'Korea1', pdf: fontPagePdf(kana, type0Font('Korea1', 5)), needs: FONT_KEYS.korean },
+  {
+    name: 'Arial',
+    pdf: fontPagePdf('(Arial) ', ['<< /Type /Font /Subtype /TrueType /BaseFont /Arial /Encoding /WinAnsiEncoding >>']),
+    needs: 0,
+  },
+  {
+    name: 'a simple font with Cyrillic /Differences',
+    pdf: fontPagePdf('<C0C1C2C3>', [
+      '<< /Type /Font /Subtype /TrueType /BaseFont /PTSans /FirstChar 192 /LastChar 195 /Widths [600 600 600 600] /FontDescriptor 6 0 R /Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [192 /afii10017 /afii10018 /afii10019 /afii10020] >> >>',
+      '<< /Type /FontDescriptor /FontName /PTSans /Flags 32 /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 >>',
+    ]),
+    needs: FONT_KEYS.default,
+  },
+  {
+    name: 'a simple font with Greek /Differences',
+    pdf: fontPagePdf('(ABCD)', [
+      '<< /Type /Font /Subtype /Type1 /BaseFont /InkGreek /FirstChar 65 /LastChar 68 /Widths [600 600 600 600] /FontDescriptor 6 0 R /Encoding << /Type /Encoding /Differences [65 /Alpha /Beta /Gamma /Delta] >> >>',
+      '<< /Type /FontDescriptor /FontName /InkGreek /Flags 32 /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 >>',
+    ]),
+    needs: FONT_KEYS.default,
+  },
+  {
+    name: 'Calibri',
+    pdf: fontPagePdf('(Calibri) ', [
+      '<< /Type /Font /Subtype /TrueType /BaseFont /Calibri /Encoding /WinAnsiEncoding /FontDescriptor 6 0 R >>',
+      '<< /Type /FontDescriptor /FontName /Calibri /Flags 32 /FontBBox [0 -200 1000 900] /ItalicAngle 0 /Ascent 900 /Descent -200 /CapHeight 700 /StemV 80 >>',
+    ]),
+    needs: 0,
+  },
+  // PDFium maps an unrecognised ordering as ANSI: no key draws it.
+  { name: 'an unrecognised ordering', pdf: fontPagePdf(kana, type0Font('Klingon1', 5)), needs: 0 },
+  {
+    // The page's own font is Helvetica; the only unembedded CJK font is inside a form.
+    name: 'a form XObject',
+    pdf: buildPdf([
+      '<< /Type /Catalog /Pages 2 0 R >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] /Contents 4 0 R /Resources << /XObject << /Fm0 5 0 R >> >> >>',
+      streamObject('', '/Fm0 Do'),
+      streamObject('/Type /XObject /Subtype /Form /BBox [0 0 300 100] /Resources << /Font << /F1 6 0 R >> >>', `BT /F1 40 Tf 20 30 Td ${kana} Tj ET`),
+      ...type0Font('Korea1', 6),
+    ]),
+    needs: FONT_KEYS.korean,
+  },
+  {
+    name: 'an annotation appearance',
+    pdf: fontPagePdf('(page) ', ['<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'], {
+      pageExtra: '/Annots [6 0 R]',
+      extra: [
+        '<< /Type /Annot /Subtype /FreeText /Rect [0 0 300 100] /DA (/F2 20 Tf) /AP << /N 7 0 R >> >>',
+        streamObject('/Type /XObject /Subtype /Form /BBox [0 0 300 100] /Resources << /Font << /F2 8 0 R >> >>', `BT /F2 40 Tf 20 30 Td ${kana} Tj ET`),
+        ...type0Font('GB1', 8),
+      ],
+    }),
+    needs: FONT_KEYS.simplifiedChinese,
+  },
+]
+
+for (const { name, pdf, needs } of fontCases) {
+  withDoc(pdf, (doc) => assert.equal(m._INK_Fonts_PageNeeds(doc, 0), needs, `INK_Fonts_PageNeeds for ${name}`))
+}
+
+// The font the smoke check serves for Japanese: SMOKE_CJK_FONT names a
+// Japanese-capable OpenType file. Without it any bytes stand in, and the
+// check that glyphs draw is skipped.
+const cjkFontPath = process.env.SMOKE_CJK_FONT
+const cjkFont = cjkFontPath ? readFileSync(cjkFontPath) : Buffer.from('not a font')
+if (!cjkFontPath) console.log('SMOKE_CJK_FONT is not set: the check that a registered font draws glyphs is skipped')
+
+// Japan1 with nothing registered: one miss, then none. The text draws nothing.
+const japan1 = fontCases[0].pdf
+m._INK_Fonts_TakeMisses()
+withDoc(japan1, (doc) => {
+  assert.equal(inkInBand(renderPixels(doc), 15, 75), 0, 'the hiragana drew with no font registered')
+})
+assert.equal(m._INK_Fonts_TakeMisses(), FONT_KEYS.japanese, 'a Japan1 render missed no Japanese font')
+assert.equal(m._INK_Fonts_TakeMisses(), 0, 'INK_Fonts_TakeMisses did not clear its log')
+
+function registerFont(module, key, bytes) {
+  const ptr = module._malloc(bytes.length)
+  module.HEAPU8.set(bytes, ptr)
+  const result = module._INK_Fonts_Register(key, ptr, bytes.length)
+  // Register copies the bytes.
+  module._free(ptr)
+  return result
+}
+
+assert.equal(registerFont(m, 3, cjkFont), 0, 'a key of two bits was accepted')
+assert.equal(registerFont(m, 32, cjkFont), 0, 'an unknown key was accepted')
+assert.equal(m._INK_Fonts_Register(FONT_KEYS.japanese, 0, 0), 0, 'an empty font was accepted')
+assert.equal(registerFont(m, FONT_KEYS.japanese, cjkFont), 1)
+withDoc(japan1, (doc) => {
+  const ink = inkInBand(renderPixels(doc), 15, 75)
+  if (cjkFontPath) assert.ok(ink > 0, 'the registered Japanese font drew no glyphs')
+})
+assert.equal(m._INK_Fonts_TakeMisses(), 0, 'a registered key was logged as a miss')
+
+// Runs |fn(module, doc)| on page 0 of |pdf| loaded in a fresh module, after
+// registering |fonts|, a map from key to bytes.
+async function withFreshModule(pdf, fonts, fn) {
+  const fresh = await createModule()
+  fresh._INK_Init()
+  for (const [key, bytes] of fonts) assert.equal(registerFont(fresh, key, bytes), 1)
+  const buf = fresh._malloc(pdf.length)
+  fresh.HEAPU8.set(pdf, buf)
+  const doc = fresh._FPDF_LoadMemDocument64(buf, pdf.length, 0)
+  assert.notEqual(doc, 0)
+  try {
+    return fn(fresh, doc)
+  } finally {
+    fresh._FPDF_CloseDocument(doc)
+    fresh._free(buf)
+    fresh._INK_Destroy()
+  }
+}
+
+// Page 0 of |doc| in |module|, 300 x 100 pt with annotations and widgets.
+function freshRender(module, doc) {
+  const page = module._FPDF_LoadPage(doc, 0)
+  const bitmap = module._FPDFBitmap_CreateEx(300, 100, 4, 0, 0)
+  module._FPDFBitmap_FillRect(bitmap, 0, 0, 300, 100, 0xffffffff)
+  module._FPDF_RenderPageBitmap(bitmap, page, 0, 0, 300, 100, 0, FPDF_ANNOT | EPDF_RENDER_WIDGETS)
+  const data = module._FPDFBitmap_GetBuffer(bitmap)
+  const bytes = Buffer.from(module.HEAPU8.slice(data, data + 300 * 100 * 4))
+  module._FPDFBitmap_Destroy(bitmap)
+  module._FPDF_ClosePage(page)
+  return { bytes, width: 300, height: 100 }
+}
+
+// Needs and misses agree: on a fresh module, with every key a page needs
+// registered first, rendering the page (annotations included) misses nothing.
+for (const { name, pdf } of fontCases) {
+  const needs = withDoc(pdf, (doc) => m._INK_Fonts_PageNeeds(doc, 0))
+  const fonts = Object.values(FONT_KEYS)
+    .filter((key) => needs & key)
+    .map((key) => [key, cjkFont])
+  await withFreshModule(pdf, fonts, (fresh, doc) => {
+    assert.equal(fresh._INK_Fonts_PageNeeds(doc, 0), needs)
+    freshRender(fresh, doc)
+    assert.equal(fresh._INK_Fonts_TakeMisses(), 0, `rendering ${name} missed a key INK_Fonts_PageNeeds left out`)
+  })
+}
+
+// The default font: SMOKE_DEFAULT_FONT names an OpenType file with Cyrillic
+// and Greek, such as Noto Sans. Without it any bytes stand in, and the check
+// that glyphs draw is skipped.
+const defaultFontPath = process.env.SMOKE_DEFAULT_FONT
+const defaultFont = defaultFontPath ? readFileSync(defaultFontPath) : Buffer.from('not a font')
+if (!defaultFontPath) console.log('SMOKE_DEFAULT_FONT is not set: the check that the default font draws Cyrillic and Greek is skipped')
+
+// Simple fonts whose /Differences name Cyrillic or Greek letters ask for the
+// default key: missed with nothing registered, where they draw nothing, and
+// drawn from the registered default font.
+for (const name of ['a simple font with Cyrillic /Differences', 'a simple font with Greek /Differences']) {
+  const { pdf } = fontCases.find((c) => c.name === name)
+  await withFreshModule(pdf, [], (fresh, doc) => {
+    assert.equal(inkInBand(freshRender(fresh, doc), 15, 75), 0, `${name} drew with no font registered`)
+    assert.equal(fresh._INK_Fonts_TakeMisses(), FONT_KEYS.default, `${name} did not miss the default font`)
+  })
+  await withFreshModule(pdf, [[FONT_KEYS.default, defaultFont]], (fresh, doc) => {
+    const ink = inkInBand(freshRender(fresh, doc), 15, 75)
+    if (defaultFontPath) assert.ok(ink > 0, `the default font drew no glyphs for ${name}`)
+    assert.equal(fresh._INK_Fonts_TakeMisses(), 0, `${name} missed a registered default font`)
+  })
+}
+
+// A WinAnsi font with a name PDFium does not know draws the same bytes
+// whether every key has a font or none does: the mapper never asks for it.
+{
+  const { pdf } = fontCases.find((c) => c.name === 'Calibri')
+  const every = Object.values(FONT_KEYS).map((key) => [key, key === FONT_KEYS.default ? defaultFont : cjkFont])
+  const none = await withFreshModule(pdf, [], (fresh, doc) => freshRender(fresh, doc).bytes)
+  const all = await withFreshModule(pdf, every, (fresh, doc) => freshRender(fresh, doc).bytes)
+  assert.ok(inkInBand({ bytes: none, width: 300, height: 100 }, 15, 75) > 0, 'Calibri drew nothing')
+  assert.ok(none.equals(all), 'registered fonts changed how Calibri draws')
 }
 
 m._INK_Destroy()

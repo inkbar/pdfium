@@ -229,8 +229,33 @@ void CPDF_FaceBasedSimpleFont::LoadSubstFont() {
     weight = pdfium::kFontWeightNormal;
   }
   font_.LoadSubstFace(base_font_name_, IsTrueTypeFont(), flags_, weight,
-                      italic_angle_, FX_CodePage::kDefANSI,
+                      italic_angle_, SubstCodePage(font_dict_.Get()),
                       /*bVertical=*/false);
+}
+
+// Inkbar(fonts): Cyrillic or Greek when the /Differences name a letter of
+// that script (Greek not for the Symbol font), so the mapper asks for a face
+// that has it. Otherwise kDefANSI, as upstream.
+// static
+FX_CodePage CPDF_FaceBasedSimpleFont::SubstCodePage(
+    const CPDF_Dictionary* font_dict) {
+  RetainPtr<const CPDF_Dictionary> encoding = font_dict->GetDictFor("Encoding");
+  RetainPtr<const CPDF_Array> differences =
+      encoding ? encoding->GetArrayFor("Differences") : nullptr;
+  const bool symbol = font_dict->GetByteStringFor("BaseFont") == "Symbol";
+  bool greek = false;
+  for (size_t i = 0; differences && i < differences->size(); ++i) {
+    RetainPtr<const CPDF_Object> item = differences->GetDirectObjectAt(i);
+    if (!item || !item->IsName()) {
+      continue;
+    }
+    const wchar_t unicode = UnicodeFromAdobeName(item->GetString().c_str());
+    if (unicode >= 0x400 && unicode <= 0x4ff) {
+      return FX_CodePage::kMSWin_Cyrillic;
+    }
+    greek |= !symbol && unicode >= 0x370 && unicode <= 0x3ff;
+  }
+  return greek ? FX_CodePage::kMSWin_Greek : FX_CodePage::kDefANSI;
 }
 
 bool CPDF_FaceBasedSimpleFont::HasFontWidths() const {
