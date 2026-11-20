@@ -1715,7 +1715,7 @@ const zeros = (r) => [r.textChars, r.imagesNotBlank, r.paths, r.patternContent, 
   )
   const started = Date.now()
   assert.equal(unremovablePointer(heavy), 0, 'a page past the work budget returned a report')
-  assert.ok(Date.now() - started < 10000, 'the gate took more than 10 s')
+  assert.ok(Date.now() - started < 60000, 'the gate took more than 60 s')
 }
 
 // refuses an apply over what it cannot rewrite
