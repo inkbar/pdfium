@@ -7,8 +7,6 @@
 
 #include "inkbar/text.h"
 
-#include <stdio.h>
-
 #include <map>
 #include <memory>
 #include <optional>
@@ -23,6 +21,7 @@
 #include "core/fxge/cfx_standardfont.h"
 #include "core/fxge/fx_font.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
+#include "inkbar/json.h"
 #include "public/fpdf_text.h"
 
 struct InkText {
@@ -40,29 +39,6 @@ constexpr unsigned char kGenerated = 1;
 constexpr unsigned char kHyphen = 2;
 constexpr unsigned char kNoUnicode = 4;
 constexpr size_t kMaxFonts = 65535;
-
-// Appends |text| as a JSON string. A byte above 0x7F stands for the code point
-// of the same value, so any bytes give valid JSON.
-void AppendBytesString(std::string* out, const ByteString& text) {
-  out->push_back('"');
-  for (char c : text) {
-    const unsigned char byte = static_cast<unsigned char>(c);
-    if (byte == '"' || byte == '\\') {
-      out->push_back('\\');
-      out->push_back(static_cast<char>(byte));
-    } else if (byte < 0x20) {
-      char escape[8];
-      snprintf(escape, sizeof(escape), "\\u%04x", byte);
-      out->append(escape);
-    } else if (byte < 0x80) {
-      out->push_back(static_cast<char>(byte));
-    } else {
-      out->push_back(static_cast<char>(0xC0 | (byte >> 6)));
-      out->push_back(static_cast<char>(0x80 | (byte & 0x3F)));
-    }
-  }
-  out->push_back('"');
-}
 
 bool IsTimes(const ByteString& name) {
   std::optional<CFX_StandardFont::Index> index =
@@ -88,7 +64,7 @@ void AppendFont(std::string* out, const CPDF_Font* font) {
   const bool bold = (flags & pdfium::kFontStyleForceBold) || face->IsBold();
   auto boolean = [](bool value) { return value ? "true" : "false"; };
   out->append("{\"name\":");
-  AppendBytesString(out, name);
+  inkbar::json::AppendName(out, name);
   out->append(",\"fixedPitch\":");
   out->append(boolean(fixed_pitch));
   out->append(",\"serif\":");
@@ -100,6 +76,15 @@ void AppendFont(std::string* out, const CPDF_Font* font) {
   out->append(",\"vertical\":");
   out->append(boolean(font->IsVertWriting()));
   out->push_back('}');
+}
+
+// The font of character |i|'s text object, or null for a character PDFium
+// generated without one.
+RetainPtr<CPDF_Font> FontOf(FPDF_TEXTPAGE text_page, int i) {
+  const CPDF_PageObject* object =
+      CPDFPageObjectFromFPDFPageObject(FPDFText_GetTextObject(text_page, i));
+  const CPDF_TextObject* text_object = object ? object->AsText() : nullptr;
+  return text_object ? text_object->GetFont() : nullptr;
 }
 
 // Reads |text_page| into |t|. False when the page has more fonts than an
@@ -117,8 +102,17 @@ bool Fill(FPDF_TEXTPAGE text_page, InkText* t) {
 
   std::map<const CPDF_Font*, unsigned short> font_index;
   std::vector<RetainPtr<CPDF_Font>> fonts;
+  // A generated character takes the font and size of the character before
+  // it; one before any character with a font takes those of the first such
+  // character, which is font 0.
   unsigned short last_font = 0;
   float last_size = 0;
+  for (int i = 0; i < count; ++i) {
+    if (FontOf(text_page, i)) {
+      last_size = static_cast<float>(FPDFText_GetFontSize(text_page, i));
+      break;
+    }
+  }
   for (int i = 0; i < count; ++i) {
     unsigned char flags = 0;
     if (FPDFText_IsGenerated(text_page, i) == 1) {
@@ -147,11 +141,7 @@ bool Fill(FPDF_TEXTPAGE text_page, InkText* t) {
     FS_MATRIX matrix = {0, 0, 0, 0, 0, 0};
     FPDFText_GetMatrix(text_page, i, &matrix);
 
-    // A character PDFium generated between text objects has none of its own.
-    const CPDF_PageObject* object =
-        CPDFPageObjectFromFPDFPageObject(FPDFText_GetTextObject(text_page, i));
-    const CPDF_TextObject* text_object = object ? object->AsText() : nullptr;
-    RetainPtr<CPDF_Font> font = text_object ? text_object->GetFont() : nullptr;
+    RetainPtr<CPDF_Font> font = FontOf(text_page, i);
     if (font) {
       auto it = font_index.find(font.Get());
       if (it == font_index.end()) {

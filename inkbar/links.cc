@@ -7,7 +7,6 @@
 
 #include "inkbar/links.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -34,6 +33,7 @@
 #include "core/fxcrt/span.h"
 #include "core/fxcrt/widestring.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
+#include "inkbar/json.h"
 
 namespace {
 
@@ -44,79 +44,10 @@ constexpr size_t kMaxOutlineItems = 100000;
 constexpr std::array<const char*, 9> kFitNames = {
     "Unknown", "XYZ", "Fit", "FitH", "FitV", "FitR", "FitB", "FitBH", "FitBV"};
 
-void AppendEscaped(std::string* out, uint32_t c) {
-  char escape[8];
-  snprintf(escape, sizeof(escape), "\\u%04x", static_cast<unsigned>(c));
-  out->append(escape);
-}
-
-// Appends |c| to a JSON string: quotes, backslashes and control characters
-// escaped, anything else as UTF-8. A surrogate or a value past U+10FFFF is
-// not a character and becomes U+FFFD.
-void AppendCodePoint(std::string* out, uint32_t c) {
-  if (c == '"' || c == '\\') {
-    out->push_back('\\');
-    out->push_back(static_cast<char>(c));
-  } else if (c < 0x20 || c == 0x7F) {
-    AppendEscaped(out, c);
-  } else if (c < 0x80) {
-    out->push_back(static_cast<char>(c));
-  } else if (c < 0x800) {
-    out->push_back(static_cast<char>(0xC0 | (c >> 6)));
-    out->push_back(static_cast<char>(0x80 | (c & 0x3F)));
-  } else if ((c >= 0xD800 && c <= 0xDFFF) || c > 0x10FFFF) {
-    AppendCodePoint(out, 0xFFFD);
-  } else if (c < 0x10000) {
-    out->push_back(static_cast<char>(0xE0 | (c >> 12)));
-    out->push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
-    out->push_back(static_cast<char>(0x80 | (c & 0x3F)));
-  } else {
-    out->push_back(static_cast<char>(0xF0 | (c >> 18)));
-    out->push_back(static_cast<char>(0x80 | ((c >> 12) & 0x3F)));
-    out->push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
-    out->push_back(static_cast<char>(0x80 | (c & 0x3F)));
-  }
-}
-
-// A JSON string of text PDFium decoded.
-void AppendText(std::string* out, const WideString& text) {
-  out->push_back('"');
-  for (wchar_t c : text) {
-    AppendCodePoint(out, static_cast<uint32_t>(c));
-  }
-  out->push_back('"');
-}
-
-// A JSON string of a name's bytes, each byte the code point of its value.
-void AppendName(std::string* out, const ByteString& name) {
-  out->push_back('"');
-  for (char c : name) {
-    AppendCodePoint(out, static_cast<unsigned char>(c));
-  }
-  out->push_back('"');
-}
-
-// A JSON string of bytes in lowercase hex.
-void AppendHex(std::string* out, const ByteString& bytes) {
-  static constexpr char kDigits[] = "0123456789abcdef";
-  out->push_back('"');
-  for (char c : bytes) {
-    const unsigned char byte = static_cast<unsigned char>(c);
-    out->push_back(kDigits[byte >> 4]);
-    out->push_back(kDigits[byte & 0xF]);
-  }
-  out->push_back('"');
-}
-
-void AppendNumber(std::string* out, float value) {
-  if (!std::isfinite(value)) {
-    out->append("null");
-    return;
-  }
-  char buffer[32];
-  snprintf(buffer, sizeof(buffer), "%.7g", value);
-  out->append(buffer);
-}
+using inkbar::json::AppendHex;
+using inkbar::json::AppendName;
+using inkbar::json::AppendNumber;
+using inkbar::json::AppendText;
 
 void AppendKey(std::string* out, const char* key) {
   out->push_back('"');
@@ -150,7 +81,15 @@ bool AllFiniteNumbers(const CPDF_Array* array) {
   return true;
 }
 
-void AppendDest(std::string* out, CPDF_Document* doc, const CPDF_Object* dest) {
+// A local destination names a page of this file. A remote go-to's or a
+// launch's /D names a page of another file, and its number is kept as it is.
+enum class Where { kLocal, kRemote };
+
+// For a local destination, a page number that is not a page of |doc| is -1.
+void AppendDest(std::string* out,
+                CPDF_Document* doc,
+                const CPDF_Object* dest,
+                Where where) {
   if (dest && (dest->IsString() || dest->IsName())) {
     out->push_back('{');
     AppendKey(out, "nameHex");
@@ -166,7 +105,11 @@ void AppendDest(std::string* out, CPDF_Document* doc, const CPDF_Object* dest) {
   CPDF_Dest explicit_dest(pdfium::WrapRetain(array));
   out->push_back('{');
   AppendKey(out, "page");
-  out->append(std::to_string(explicit_dest.GetDestPageIndex(doc)));
+  int page = explicit_dest.GetDestPageIndex(doc);
+  if (where == Where::kLocal && (page < 0 || page >= doc->GetPageCount())) {
+    page = -1;
+  }
+  out->append(std::to_string(page));
   out->push_back(',');
   AppendKey(out, "fit");
   const int mode = explicit_dest.GetZoomMode();
@@ -230,14 +173,14 @@ void AppendAction(std::string* out,
   } else if (s == "GoTo") {
     out->push_back(',');
     AppendKey(out, "dest");
-    AppendDest(out, doc, EntryFor(action, "D").Get());
+    AppendDest(out, doc, EntryFor(action, "D").Get(), Where::kLocal);
   } else if (s == "GoToR" || s == "Launch") {
     out->push_back(',');
     AppendKey(out, "fileHex");
     AppendFile(out, action);
     out->push_back(',');
     AppendKey(out, "dest");
-    AppendDest(out, doc, EntryFor(action, "D").Get());
+    AppendDest(out, doc, EntryFor(action, "D").Get(), Where::kRemote);
     out->push_back(',');
     AppendKey(out, "newWindow");
     const CPDF_Boolean* new_window =
@@ -324,7 +267,7 @@ void AppendLink(std::string* out,
   }
   out->push_back(',');
   AppendKey(out, "dest");
-  AppendDest(out, doc, EntryFor(annot, "Dest").Get());
+  AppendDest(out, doc, EntryFor(annot, "Dest").Get(), Where::kLocal);
   out->push_back(',');
   AppendKey(out, "action");
   RetainPtr<const CPDF_Object> a = EntryFor(annot, "A");
@@ -371,7 +314,7 @@ void AppendOutlineItem(OutlineWalk* walk,
   out->append(std::to_string(item->GetIntegerFor("Count")));
   out->push_back(',');
   AppendKey(out, "dest");
-  AppendDest(out, walk->doc, EntryFor(item, "Dest").Get());
+  AppendDest(out, walk->doc, EntryFor(item, "Dest").Get(), Where::kLocal);
   out->push_back(',');
   AppendKey(out, "action");
   RetainPtr<const CPDF_Object> a = EntryFor(item, "A");
@@ -426,7 +369,11 @@ char* INK_Links_Page(FPDF_DOCUMENT doc, int page_index) {
   bool first_link = true;
   RetainPtr<const CPDF_Array> annots = page->GetArrayFor("Annots");
   for (size_t i = 0; annots && i < annots->size(); ++i) {
-    RetainPtr<const CPDF_Dictionary> annot = annots->GetDictAt(i);
+    // Only a dictionary is an annotation. GetDictAt() would also give a
+    // stream's dictionary.
+    RetainPtr<const CPDF_Object> entry = annots->GetDirectObjectAt(i);
+    RetainPtr<const CPDF_Dictionary> annot =
+        entry ? pdfium::WrapRetain(entry->AsDictionary()) : nullptr;
     if (!annot) {
       continue;
     }
@@ -486,20 +433,17 @@ char* INK_Outline(FPDF_DOCUMENT doc) {
 char* INK_Dest_Named(FPDF_DOCUMENT doc, const unsigned char* name, int len) {
   ScopedFPDFDocumentView view(doc);
   CPDF_Document* pdf = view.Get();
-  if (!pdf || len < 0 || (!name && len > 0)) {
+  if (!pdf) {
     return nullptr;
   }
-  if (!pdf->GetRoot()) {
+  if (!pdf->GetRoot() || !name || len <= 0) {
     return Copy("null");
   }
-  ByteString key;
-  if (len > 0) {
-    key = ByteString(ByteStringView(UNSAFE_BUFFERS(
-        pdfium::span<const uint8_t>(name, static_cast<size_t>(len)))));
-  }
+  const ByteString key(ByteStringView(UNSAFE_BUFFERS(
+      pdfium::span<const uint8_t>(name, static_cast<size_t>(len)))));
   RetainPtr<const CPDF_Array> dest = CPDF_NameTree::LookupNamedDest(pdf, key);
   std::string out;
-  AppendDest(&out, pdf, dest.Get());
+  AppendDest(&out, pdf, dest.Get(), Where::kLocal);
   return Copy(out);
 }
 

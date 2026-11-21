@@ -38,7 +38,9 @@ const unsigned char* INK_Text_Flags(const InkText* t);
 
 // Count indexes into the font table. A character PDFium generated without a
 // text object of its own (a space or line break between objects) takes the
-// font and font size of the character before it.
+// font index and font size of the character before it that has one or, when
+// none comes before it, of the first later character that has one. Index 0
+// and size 0 only when no character on the page has a text object.
 const unsigned short* INK_Text_Fonts(const InkText* t);
 
 // UTF-8 JSON, owned by |t|:

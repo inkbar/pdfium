@@ -3800,6 +3800,70 @@ m._INK_Json_Free(0)
   })
 }
 
+{
+  // Page numbers in local destinations that are not pages of this file are
+  // -1; a remote go-to's page number is the other file's and stays. A stream
+  // in /Annots is not an annotation, and the entry after it keeps its index.
+  const link = (rest) => `<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] ${rest} >>`
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [6 0 R 7 0 R 8 0 R 9 0 R 10 0 R 11 0 R 12 0 R] >>`,
+    '<< >>',
+    '<< >>',
+    link('/Dest [999 /Fit]'),
+    link('/Dest [-5 /Fit]'),
+    link('/Dest [0 /Fit]'),
+    link('/A << /S /GoTo /D [999 /Fit] >>'),
+    link('/A << /S /GoToR /F (other.pdf) /D [7 /Fit] >>'),
+    streamObject('/Type /Annot /Subtype /Link /Rect [0 0 10 10]', ''),
+    link('/Dest [0 /XYZ 0.1 null 1.5]'),
+  ])
+  withPdf(pdf, (doc) => {
+    const { annots, links } = takeJson(m._INK_Links_Page(doc, 0))
+    assert.deepEqual(
+      annots.map((a) => a.index),
+      [0, 1, 2, 3, 4, 6],
+      'the stream entry is listed, or the entry after it lost its index',
+    )
+    assert.deepEqual(
+      links.map((l) => l.dest?.page ?? l.action.dest.page),
+      [-1, -1, 0, -1, 7, 0],
+    )
+    // Floats are written so that they read back as the same float.
+    assert.deepEqual(links[5].dest.args.map((v) => (v === null ? null : Math.fround(v))), [Math.fround(0.1), null, 1.5, null])
+    assert.equal(links[5].dest.args[0], Number(Math.fround(0.1).toPrecision(9)))
+  })
+}
+
+{
+  // INK_Dest_Named with no name.
+  const pdf = onePagePdf('', { mediaBox: letterBox, catalog: '/Dests << /old [3 0 R /Fit] >>' })
+  withPdf(pdf, (doc) => {
+    const ptr = heapBytes(Buffer.from('old', 'latin1'))
+    assert.equal(takeJson(m._INK_Dest_Named(doc, ptr, 0)), null, 'len 0')
+    assert.equal(takeJson(m._INK_Dest_Named(doc, ptr, -1)), null, 'a negative len')
+    assert.equal(takeJson(m._INK_Dest_Named(doc, 0, 3)), null, 'a NULL name')
+    assert.equal(cString(m._INK_Dest_Named(doc, 0, 0)), 'null', 'the JSON text null')
+    assert.deepEqual(takeJson(m._INK_Dest_Named(doc, ptr, 3)), { page: 0, fit: 'Fit', args: [null, null, null, null] })
+    m._free(ptr)
+  })
+  assert.equal(m._INK_Dest_Named(0, 0, 0), 0, 'a NULL document')
+}
+
+{
+  // An outline of 100,001 items stops at 100,000.
+  const total = 100001
+  const items = Array.from({ length: total }, (_, i) => `<< /Title (I${i}) ${i + 1 < total ? `/Next ${i + 8} 0 R` : ''} >>`)
+  const pdf = onePagePdf('', { mediaBox: letterBox, catalog: '/Outlines 6 0 R' }, ['<< /Type /Outlines /First 7 0 R >>', ...items])
+  withPdf(pdf, (doc) => {
+    const outline = takeJson(m._INK_Outline(doc))
+    assert.equal(outline.items.length, 100000)
+    assert.equal(outline.items.at(-1).title, 'I99999')
+    assert.equal(outline.truncated, true, 'the item cap does not truncate')
+  })
+}
+
 m._INK_Destroy()
 // SMOKE_OUT, SMOKE_FORM_OUT and SMOKE_IMAGE_OUT name files to receive the saved
 // documents, for qpdf --check: the appearance document, the text box, border

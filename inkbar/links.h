@@ -21,7 +21,10 @@ extern "C" {
 //
 // Dest   = { "page": 3, "fit": "XYZ", "args": [72, 700, null, null] }
 //        | { "nameHex": "636861707465722d32" }
-// "page" is -1 when the first entry is not a page of this file; a number is
+// "page" is the index of the page the first entry names, or -1 when it names
+// no page of this file: a page dictionary not in the page tree, a number that
+// is negative or not less than the page count, anything else. A remote go-to's
+// or a launch's "dest" names a page of another file, so there a number is
 // given as the file has it. "fit" is one of XYZ, Fit, FitH, FitV, FitR, FitB,
 // FitBH, FitBV, else "Unknown". "args" are the four entries after the fit
 // name, each a number or null (absent, null or not a number). A string or name
@@ -46,12 +49,13 @@ extern "C" {
 //                 "dest": Dest | null, "action": Action | null,
 //                 "aa": Action | null } ] }
 // "annots" has an entry for every dictionary in /Annots, "index" its place
-// there. "obj" is 0 for a direct object. "rectOk": /Rect is 4 finite numbers.
-// "quadsOk": /QuadPoints is absent, or a non-empty array of finite numbers
-// whose length is a multiple of 8. "links" has the Link annotations: "rect"
-// normalised, [0,0,0,0] when /Rect is not well formed; "quads" null when
-// /QuadPoints is absent or not well formed. "action" is null when /A is
-// absent or not a dictionary. "aa" is /AA's /D, else its /U.
+// there; any other entry, a stream included, is skipped. "obj" is 0 for a
+// direct object. "rectOk": /Rect is 4 finite numbers. "quadsOk": /QuadPoints is
+// absent, or a non-empty array of finite numbers whose length is a multiple
+// of 8. "links" has the Link annotations: "rect" normalised, [0,0,0,0] when
+// /Rect is not well formed; "quads" null when /QuadPoints is absent or not well
+// formed. "action" is null when /A is absent or not a dictionary. "aa" is /AA's
+// /D, else its /U.
 char* INK_Links_Page(FPDF_DOCUMENT doc, int page_index);
 
 // { "items": [ { "depth": 0, "title": "Cover", "flags": 2, "count": -2,
@@ -64,7 +68,7 @@ char* INK_Outline(FPDF_DOCUMENT doc);
 
 // |name|: |len| bytes as the file has them. Looks in /Names /Dests, then the
 // catalog's /Dests, and returns an explicit Dest, or "null" when the name is
-// unknown. NULL for a negative |len| or a NULL |name| with a positive |len|.
+// unknown, and for a NULL |name| or a |len| of 0 or less.
 char* INK_Dest_Named(FPDF_DOCUMENT doc, const unsigned char* name, int len);
 
 // Frees JSON from the calls above. NULL is a no-op.
