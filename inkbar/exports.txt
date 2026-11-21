@@ -99,3 +99,7 @@ INK_Text_Flags
 INK_Text_Fonts
 INK_Text_FontTable
 INK_Text_Free
+INK_Links_Page
+INK_Outline
+INK_Dest_Named
+INK_Json_Free
