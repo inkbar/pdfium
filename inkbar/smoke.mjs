@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 93)
+assert.equal(names.length, 101)
 
 const m = await createModule()
 for (const name of names) {
@@ -3453,6 +3453,148 @@ function checkFacts(module, doc, index, label) {
   fresh._FPDF_CloseDocument(doc)
   fresh._free(buf)
   fresh._INK_Destroy()
+}
+
+// INK_Text_*: a page's characters as PDFium's text page reports them.
+const LETTER = [0, 0, 612, 792]
+const letterBox = `[${LETTER.join(' ')}]`
+
+// The text of page |index| of |doc| in |mod|, or null when INK_Text_Page
+// returns NULL. geometry holds 15 floats per character (see text.h).
+function pageText(doc, index, mod = m) {
+  const t = mod._INK_Text_Page(doc, index)
+  if (!t) return null
+  const n = mod._INK_Text_Count(t)
+  const bytes = (ptr, size) => Buffer.from(mod.HEAPU8.slice(ptr, ptr + n * size))
+  const codesBytes = bytes(mod._INK_Text_Codes(t), 4)
+  const geometryBytes = bytes(mod._INK_Text_Geometry(t), 60)
+  const fontsBytes = bytes(mod._INK_Text_Fonts(t), 2)
+  const result = {
+    count: n,
+    codes: Array.from({ length: n }, (_, i) => codesBytes.readUInt32LE(i * 4)),
+    geometry: Array.from({ length: n }, (_, i) => Array.from({ length: 15 }, (_, k) => geometryBytes.readFloatLE((i * 15 + k) * 4))),
+    flags: [...bytes(mod._INK_Text_Flags(t), 1)],
+    fonts: Array.from({ length: n }, (_, i) => fontsBytes.readUInt16LE(i * 2)),
+    fontTable: JSON.parse(cString(mod._INK_Text_FontTable(t), mod)),
+  }
+  mod._INK_Text_Free(t)
+  return result
+}
+
+// The NUL-terminated UTF-8 string at |ptr| in |mod|.
+function cString(ptr, mod = m) {
+  assert.notEqual(ptr, 0, 'no string')
+  let end = ptr
+  while (mod.HEAPU8[end]) end++
+  return Buffer.from(mod.HEAPU8.slice(ptr, end)).toString('utf8')
+}
+
+// The text of page 0 of |pdf|, read in |mod|.
+function textOf(pdf, mod = m) {
+  const buf = mod._malloc(pdf.length)
+  mod.HEAPU8.set(pdf, buf)
+  const doc = mod._FPDF_LoadMemDocument64(buf, pdf.length, 0)
+  assert.notEqual(doc, 0, 'load failed')
+  const text = pageText(doc, 0, mod)
+  mod._FPDF_CloseDocument(doc)
+  mod._free(buf)
+  return text
+}
+
+const near = (actual, expected, what, tolerance = 0.01) =>
+  assert.ok(Math.abs(actual - expected) <= tolerance, `${what}: ${actual}, expected ${expected}`)
+const spell = (codes) => String.fromCodePoint(...codes)
+
+{
+  const hello = textOf(onePagePdf('BT /F1 12 Tf 72 700 Td (Hello) Tj ET', { mediaBox: letterBox }))
+  assert.equal(hello.count, 5)
+  assert.equal(spell(hello.codes), 'Hello')
+  hello.geometry.forEach((g, i) => {
+    near(g[9], 700, `origin y of character ${i}`)
+    near(g[10], 12, `font size of character ${i}`)
+    assert.ok(g[0] < g[2] && g[1] < g[3], `character ${i} has an empty box: ${g.slice(0, 4)}`)
+    assert.ok(g[4] <= g[0] && g[5] <= g[1] && g[6] >= g[2] && g[7] >= g[3], `character ${i}'s loose box does not hold its box`)
+    if (i > 0) assert.ok(g[8] > hello.geometry[i - 1][8], `origin x of character ${i} does not rise`)
+  })
+  near(hello.geometry[0][8], 72, 'origin x of H')
+  assert.deepEqual(hello.flags, [0, 0, 0, 0, 0])
+  assert.deepEqual(hello.fonts, [0, 0, 0, 0, 0])
+  assert.deepEqual(hello.fontTable, [{ name: 'Helvetica', fixedPitch: false, serif: false, italic: false, bold: false, vertical: false }])
+}
+
+{
+  // Separate Tj with a gap: PDFium puts a space it generated between the words.
+  const words = textOf(onePagePdf('BT /F1 12 Tf 72 700 Td (Hello) Tj 80 0 Td (World) Tj ET', { mediaBox: letterBox }))
+  assert.equal(spell(words.codes), 'Hello World')
+  assert.equal(words.codes[5], 32)
+  assert.equal(words.flags[5] & 1, 1, 'the space between the words is not marked generated')
+  assert.ok(words.flags.every((f, i) => i === 5 || f === 0), `flags ${words.flags}`)
+}
+
+{
+  const empty = textOf(onePagePdf('', { mediaBox: letterBox }))
+  assert.equal(empty.count, 0, 'a page with no content has characters')
+  assert.deepEqual(empty.fontTable, [])
+  const opened = load(onePagePdf('', { mediaBox: letterBox }))
+  assert.equal(m._INK_Text_Page(opened.doc, 99), 0, 'page 99 of a one-page file')
+  assert.equal(m._INK_Text_Page(opened.doc, -1), 0, 'page -1')
+  m._FPDF_CloseDocument(opened.doc)
+  m._free(opened.buf)
+  assert.equal(m._INK_Text_Page(0, 0), 0, 'a NULL document')
+  m._INK_Text_Free(0)
+}
+
+{
+  // Text inside a form XObject.
+  const form = textOf(
+    onePagePdf('q 1 0 0 1 100 100 cm /Fm0 Do Q', { mediaBox: letterBox, resources: '/XObject << /Fm0 6 0 R >>' }, [
+      streamObject('/Type /XObject /Subtype /Form /BBox [0 0 200 50] /Resources << /Font << /F1 5 0 R >> >>', 'BT /F1 10 Tf 5 5 Td (Inside) Tj ET'),
+    ]),
+  )
+  assert.equal(spell(form.codes), 'Inside')
+  near(form.geometry[0][8], 105, 'origin x of text in a form')
+  near(form.geometry[0][9], 105, 'origin y of text in a form')
+}
+
+{
+  // Text turned a quarter turn by its text matrix.
+  const turned = textOf(onePagePdf('BT /F1 12 Tf 0 1 -1 0 300 300 Tm (Up) Tj ET', { mediaBox: letterBox }))
+  assert.equal(spell(turned.codes), 'Up')
+  for (const g of turned.geometry) {
+    near(g[11], 0, 'matrix a')
+    near(g[12], 1, 'matrix b')
+    near(g[13], -1, 'matrix c')
+    near(g[14], 0, 'matrix d')
+    near(g[8], 300, 'origin x of turned text')
+  }
+  assert.ok(turned.geometry[1][9] > turned.geometry[0][9], 'turned text does not rise')
+}
+
+{
+  // A Type 0 font written vertically. Japan1 CIDs 34 and 35 are A and B. A
+  // fresh module, since the fonts check above registered bytes that are not a
+  // font for Japanese, and PDFium's text page drops vertical text that has no
+  // face.
+  const fresh = await createModule()
+  fresh._INK_Init()
+  const [font, descendant, descriptor] = type0Font('Japan1', 5)
+  const vertical = textOf(
+    buildPdf([
+      '<< /Type /Catalog /Pages 2 0 R >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>`,
+      streamObject('', 'BT /F1 20 Tf 100 600 Td <00220023> Tj ET'),
+      font.replace('/Identity-H', '/Identity-V'),
+      descendant,
+      descriptor,
+    ]),
+    fresh,
+  )
+  fresh._INK_Destroy()
+  assert.equal(spell(vertical.codes), 'AB')
+  assert.equal(vertical.fontTable.length, 1)
+  assert.equal(vertical.fontTable[0].name, 'InkJapan1')
+  assert.equal(vertical.fontTable[0].vertical, true, 'an /Identity-V font is not vertical')
 }
 
 m._INK_Destroy()
