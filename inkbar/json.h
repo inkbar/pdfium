@@ -1,0 +1,95 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Edward Coleridge Smith
+//
+// JSON writing shared by text.cc and links.cc: strings escaped the same way in
+// both, and floats written so that they read back as the same float.
+
+#ifndef INKBAR_JSON_H_
+#define INKBAR_JSON_H_
+
+#include <stdint.h>
+#include <stdio.h>
+
+#include <cmath>
+#include <string>
+
+#include "core/fxcrt/bytestring.h"
+#include "core/fxcrt/widestring.h"
+
+namespace inkbar::json {
+
+// Appends |c| to a JSON string: quotes and backslashes escaped, control
+// characters and DEL as \u escapes, anything else as UTF-8. A surrogate or a
+// value past U+10FFFF is not a character and becomes U+FFFD.
+inline void AppendCodePoint(std::string* out, uint32_t c) {
+  if (c == '"' || c == '\\') {
+    out->push_back('\\');
+    out->push_back(static_cast<char>(c));
+  } else if (c < 0x20 || c == 0x7F) {
+    char escape[8];
+    snprintf(escape, sizeof(escape), "\\u%04x", static_cast<unsigned>(c));
+    out->append(escape);
+  } else if (c < 0x80) {
+    out->push_back(static_cast<char>(c));
+  } else if (c < 0x800) {
+    out->push_back(static_cast<char>(0xC0 | (c >> 6)));
+    out->push_back(static_cast<char>(0x80 | (c & 0x3F)));
+  } else if ((c >= 0xD800 && c <= 0xDFFF) || c > 0x10FFFF) {
+    AppendCodePoint(out, 0xFFFD);
+  } else if (c < 0x10000) {
+    out->push_back(static_cast<char>(0xE0 | (c >> 12)));
+    out->push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+    out->push_back(static_cast<char>(0x80 | (c & 0x3F)));
+  } else {
+    out->push_back(static_cast<char>(0xF0 | (c >> 18)));
+    out->push_back(static_cast<char>(0x80 | ((c >> 12) & 0x3F)));
+    out->push_back(static_cast<char>(0x80 | ((c >> 6) & 0x3F)));
+    out->push_back(static_cast<char>(0x80 | (c & 0x3F)));
+  }
+}
+
+// A JSON string of text PDFium decoded.
+inline void AppendText(std::string* out, const WideString& text) {
+  out->push_back('"');
+  for (wchar_t c : text) {
+    AppendCodePoint(out, static_cast<uint32_t>(c));
+  }
+  out->push_back('"');
+}
+
+// A JSON string of a name's bytes, each byte the code point of its value.
+inline void AppendName(std::string* out, const ByteString& name) {
+  out->push_back('"');
+  for (char c : name) {
+    AppendCodePoint(out, static_cast<unsigned char>(c));
+  }
+  out->push_back('"');
+}
+
+// A JSON string of bytes in lowercase hex.
+inline void AppendHex(std::string* out, const ByteString& bytes) {
+  static constexpr char kDigits[] = "0123456789abcdef";
+  out->push_back('"');
+  for (char c : bytes) {
+    const unsigned char byte = static_cast<unsigned char>(c);
+    out->push_back(kDigits[byte >> 4]);
+    out->push_back(kDigits[byte & 0xF]);
+  }
+  out->push_back('"');
+}
+
+// A float with 9 significant digits, which reads back as the same float.
+// null when it is not finite.
+inline void AppendNumber(std::string* out, float value) {
+  if (!std::isfinite(value)) {
+    out->append("null");
+    return;
+  }
+  char buffer[32];
+  snprintf(buffer, sizeof(buffer), "%.9g", value);
+  out->append(buffer);
+}
+
+}  // namespace inkbar::json
+
+#endif  // INKBAR_JSON_H_
