@@ -169,13 +169,22 @@ Take upstream once a month. Also take it out of cycle when a Chrome stable relea
 1. Fetch and merge: `git fetch upstream main && git merge upstream/main`. Resolve conflicts, keeping changes outside `inkbar/` small.
 2. Rebuild with `inkbar/build.sh` and run `node inkbar/smoke.mjs testing/resources/hello_world.pdf`.
 3. Run the `@inkbar/engine` tests against the new archive. Do this before the monorepo's lock file moves to the new release.
-4. Push `main`, then push a tag named `v<branch>.<n>`. `<branch>` is the highest Chromium branch number that is an ancestor of `HEAD`. `<n>` counts releases on that branch, starting at 1. The release workflow builds the module and publishes the archive.
+4. Open a pull request and merge it with a merge commit. A squash would drop upstream's history, and the release reads the Chromium branch from that history. `main` allows squash merges only, so allow merge commits in the repository settings for this one pull request.
+5. Run the release workflow by hand from `main`. A merge commit's title does not start a release.
 
 The `upstream` workflow runs every Monday. It writes the number of upstream commits not yet merged to its job summary. It also runs the freshness check, and it never fails for being behind.
 
 ## Releases
 
-A tag that starts with `v` triggers the release workflow. It builds the module and publishes `inkbar-pdfium-wasm32-<tag>.tar.gz` to a GitHub release. The release notes give the upstream commit, the Chromium branch, the gzipped size of the module and the SHA-256 of the archive.
+Changes reach `main` through a pull request, merged as one squashed commit whose title is the pull request's title.
+
+The release workflow runs when a commit lands on `main` and its title starts with `feat` or `fix`. Other commits do not change the module, so they release nothing. To release one anyway, run the workflow by hand from `main`.
+
+The workflow names the release itself. `inkbar/next-tag.sh` prints `v<branch>.<n>`. `<branch>` is the highest Chromium branch number that is an ancestor of `HEAD`. `<n>` is one more than the last release on that branch, or 1 when the branch has none.
+
+The workflow builds the module, runs the smoke test and publishes `inkbar-pdfium-wasm32-<tag>.tar.gz` to a GitHub release. Publishing creates the tag, so a failed build leaves no tag behind. The release notes list the commits since the previous release, then the upstream commit, the Chromium branch, the gzipped size of the module and the SHA-256 of the archive.
+
+The workflow refuses a commit that already has a release.
 
 The archive holds seven files: `inkbar-pdfium.wasm`, `inkbar-pdfium.mjs`, `exports.txt`, `manifest.json`, `LICENSE`, `NOTICE` and `THIRD_PARTY_LICENSES`. `manifest.json` records the tag, the fork and upstream commits, the Chromium branch, the Emscripten version, the GN arguments and the module's SHA-256 and gzipped size.
 
