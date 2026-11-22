@@ -1,19 +1,31 @@
 name: release
 
+# A feat or fix merged to main changes the module, so it is released. Anything else is released
+# only when someone runs this workflow by hand from main.
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
+    if: >-
+      github.ref == 'refs/heads/main' && (
+        github.event_name == 'workflow_dispatch' ||
+        startsWith(github.event.head_commit.message, 'feat') ||
+        startsWith(github.event.head_commit.message, 'fix')
+      )
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
-      TAG: ${{ github.ref_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
@@ -22,6 +34,17 @@ jobs:
 
       - name: Add the upstream remote
         run: git remote add upstream https://pdfium.googlesource.com/pdfium
+
+      - name: Choose the tag
+        run: |
+          released="$(git tag --points-at HEAD --list 'v*' | head -n 1)"
+          if [[ -n "$released" ]]; then
+            echo "::error::This commit is already released as $released."
+            exit 1
+          fi
+          TAG="$(inkbar/next-tag.sh)"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          echo "Releasing $TAG" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Free disk space
         run: |
@@ -41,7 +64,10 @@ jobs:
       - name: Package
         run: |
           SHA="$(inkbar/package.sh "$TAG")"
+          PREVIOUS="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
           {
+            git log --reverse --format='- %s' ${PREVIOUS:+"$PREVIOUS"..}HEAD
+            echo
             echo "Upstream commit: $(jq -r .upstreamCommit inkbar/out/manifest.json)"
             echo "Chromium branch: $(jq -r .chromiumBranch inkbar/out/manifest.json)"
             echo "Gzipped module size: $(jq -r .wasmGzipBytes inkbar/out/manifest.json) bytes"
@@ -53,4 +79,4 @@ jobs:
       - name: Publish the release
         run: |
           gh release create "$TAG" "inkbar/out/inkbar-pdfium-wasm32-$TAG.tar.gz" \
-            --title "$TAG" --notes-file inkbar/out/notes.txt
+            --target "$GITHUB_SHA" --title "$TAG" --notes-file inkbar/out/notes.txt
