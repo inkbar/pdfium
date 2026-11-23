@@ -20,7 +20,9 @@ extern "C" {
 // action of a chain is read.
 //
 // Dest   = { "page": 3, "pageRef": [12, 0] | null, "fit": "XYZ",
-//            "args": [72, 700, null, null] }
+//            "args": [72, 700, null, null], "argCount": 3,
+//            "argKinds": ["number", "number", "null"], "argIndirect": false,
+//            "fitKind": "name", "pageKind": "ref" }
 //        | { "nameHex": "636861707465722d32" }
 // "page" is the index of the page the first entry names, or -1 when it names no
 // page of this file: a page dictionary not in the page tree, a number that is
@@ -33,6 +35,17 @@ extern "C" {
 // FitB, FitBH, FitBV, else "Unknown". "args" are the four entries after the fit
 // name, each a number or null (absent, null or not a number). A string or name
 // is a named destination, not looked up. Anything else is null.
+// The last five keys give the array's shape as the file wrote it, so a caller
+// can check it as PDF.js does. "argCount" is the number of entries after the
+// fit, any number. "argKinds" has one entry for each of the first 8 of them,
+// each resolved: "number", "null" (a null object, or a reference to no
+// object) or "other". "argIndirect" says whether any of those 8 is written as
+// a reference, which PDF.js does not resolve. "fitKind" is "name", "string" or
+// "other" for the second entry as written, "missing" when there is none.
+// "pageKind" is "ref" for a reference to a dictionary, "integer" for a whole
+// number, else "other", and "missing" for an empty array; with "pageRef", a
+// reference to anything else can be told apart. Only the first 10 entries are
+// read.
 //
 // Action = { "s": "URI", "uriHex": "...", "uriKind": "string" | "name" | null }
 //        | { "s": "GoTo", "dest": Dest | null }

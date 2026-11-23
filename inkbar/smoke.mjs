@@ -3791,6 +3791,9 @@ function takeJson(ptr) {
 }
 
 const hex = (text) => Buffer.from(text, 'latin1').toString('hex')
+// The shape keys of an explicit destination whose fit is a name and whose
+// arguments, none a reference, are of |kinds|.
+const shape = (kinds = [], pageKind = 'ref') => ({ argCount: kinds.length, argKinds: kinds, argIndirect: false, fitKind: 'name', pageKind })
 
 function withPdf(pdf, fn) {
   const opened = load(pdf)
@@ -3831,7 +3834,7 @@ m._INK_Json_Free(0)
       { index: 2, subtype: 'Link', flags: 0, obj: 0, generation: 0, rectOk: true, hasQuads: false, quadsOk: true },
     ])
     assert.deepEqual(links, [
-      { index: 1, rect: [72, 700, 200, 720], quads: null, dest: { page: 0, pageRef: [3, 0], fit: 'XYZ', args: [72, 700, null, null] }, action: null, aa: null },
+      { index: 1, rect: [72, 700, 200, 720], quads: null, dest: { page: 0, pageRef: [3, 0], fit: 'XYZ', args: [72, 700, null, null], ...shape(['number', 'number', 'null']) }, action: null, aa: null },
       { index: 2, rect: [72, 600, 200, 620], quads: null, dest: null, action: { s: 'URI', uriHex: hex('https://example.com/a'), uriKind: 'string' }, aa: null },
     ])
     assert.equal(Buffer.from(links[1].action.uriHex, 'hex').toString('latin1'), 'https://example.com/a')
@@ -3883,7 +3886,7 @@ m._INK_Json_Free(0)
       annots.map((_, i) => i !== 11),
     )
     assert.equal(links.length, 13)
-    const fit = (page, pageRef) => ({ page, pageRef, fit: 'Fit', args: [null, null, null, null] })
+    const fit = (page, pageRef) => ({ page, pageRef, fit: 'Fit', args: [null, null, null, null], ...shape() })
     assert.deepEqual(links[0].action, { s: 'URI', uriHex: hex('https://example.com/b'), uriKind: 'string' }, '/A beside /Dest')
     assert.deepEqual(links[0].dest, fit(0, [3, 0]), '/Dest beside /A')
     assert.equal(links[1].action, null, '/A 5')
@@ -4032,7 +4035,7 @@ m._INK_Json_Free(0)
         [0, 'Second'],
       ],
     )
-    assert.deepEqual(outline.items[0], { depth: 0, title: 'Cover', flags: 2, count: -1, dest: { page: 0, pageRef: [3, 0], fit: 'XYZ', args: [0, 792, null, null] }, action: null })
+    assert.deepEqual(outline.items[0], { depth: 0, title: 'Cover', flags: 2, count: -1, dest: { page: 0, pageRef: [3, 0], fit: 'XYZ', args: [0, 792, null, null], ...shape(['number', 'number', 'null']) }, action: null })
     assert.equal(outline.truncated, true, 'a loop does not truncate')
   })
 }
@@ -4069,8 +4072,8 @@ m._INK_Json_Free(0)
       ],
       truncated: false,
     })
-    assert.deepEqual(namedDest(doc, 'chapter-2'), { page: 0, pageRef: [3, 0], fit: 'FitH', args: [500, null, null, null] })
-    assert.deepEqual(namedDest(doc, 'old'), { page: 0, pageRef: [3, 0], fit: 'Fit', args: [null, null, null, null] })
+    assert.deepEqual(namedDest(doc, 'chapter-2'), { page: 0, pageRef: [3, 0], fit: 'FitH', args: [500, null, null, null], ...shape(['number']) })
+    assert.deepEqual(namedDest(doc, 'old'), { page: 0, pageRef: [3, 0], fit: 'Fit', args: [null, null, null, null], ...shape() })
     assert.equal(namedDest(doc, 'missing'), null)
   })
 }
@@ -4155,10 +4158,68 @@ m._INK_Json_Free(0)
     assert.equal(links[5].destInvalid, undefined, 'a good /Dest')
     assert.equal(links[3].destInvalid, undefined, 'no /Dest')
     assert.deepEqual(links[0].aa, { s: 'URI', uriHex: hex('https://example.com/g'), uriKind: 'string' })
-    assert.deepEqual(links[2].action, { s: 'GoToR', fileHex: hex('spec.pdf'), fileKind: 'spec', dest: { page: 3, pageRef: null, fit: 'Fit', args: [null, null, null, null] }, newWindow: null })
+    assert.deepEqual(links[2].action, { s: 'GoToR', fileHex: hex('spec.pdf'), fileKind: 'spec', dest: { page: 3, pageRef: null, fit: 'Fit', args: [null, null, null, null], ...shape([], 'integer') }, newWindow: null })
     assert.deepEqual(links[3].action, { s: 'URI', uriHex: hex('https://example.com/h'), uriKind: 'name' })
     assert.deepEqual(links[4].action, { s: 'URI', uriHex: '', uriKind: null })
-    assert.deepEqual(links[5].dest, { page: 0, pageRef: [3, 0], fit: 'Fit', args: [null, null, null, null] })
+    assert.deepEqual(links[5].dest, { page: 0, pageRef: [3, 0], fit: 'Fit', args: [null, null, null, null], ...shape() })
+  })
+}
+
+{
+  // An explicit destination's shape as the file wrote it, on a link's /Dest,
+  // in a GoTo action, in the outline and through a named destination. Object
+  // 6 is the number 7; object 7 a destination of a million entries.
+  const dests = [
+    ['[3 0 R /XYZ]', { argCount: 0, argKinds: [] }],
+    ['[3 0 R /XYZ 1]', { argCount: 1, argKinds: ['number'] }],
+    ['[3 0 R /XYZ null null null]', { argCount: 3, argKinds: ['null', 'null', 'null'] }],
+    ['[3 0 R /Fit null]', { argCount: 1, argKinds: ['null'] }],
+    ['[3 0 R /FitR 1 2 3 4 5]', { argCount: 5, argKinds: ['number', 'number', 'number', 'number', 'number'] }],
+    ['[3 0 R /XYZ (left) 2]', { argCount: 2, argKinds: ['other', 'number'] }],
+    ['[3 0 R /XYZ 6 0 R 2]', { argCount: 2, argKinds: ['number', 'number'], argIndirect: true }],
+    ['[1.5 /Fit]', { pageKind: 'other' }],
+    ['[/P /Fit]', { pageKind: 'other' }],
+    ['[0 /Fit]', { pageKind: 'integer' }],
+    ['[2.0 /Fit]', { pageKind: 'integer' }],
+    ['[6 0 R /Fit]', { pageKind: 'other' }],
+    ['[3 0 R (Fit)]', { fitKind: 'string' }],
+    ['[3 0 R 5]', { fitKind: 'other' }],
+    ['[3 0 R]', { argCount: 0, argKinds: [], fitKind: 'missing' }],
+    ['[]', { argCount: 0, argKinds: [], fitKind: 'missing', pageKind: 'missing' }],
+    ['7 0 R', { argCount: 999998, argKinds: Array(8).fill('number') }],
+  ]
+  const expected = dests.map(([, facts]) => ({ argCount: 0, argKinds: [], argIndirect: false, fitKind: 'name', pageKind: 'ref', ...facts }))
+  const shapeOf = (dest) => {
+    const { argCount, argKinds, argIndirect, fitKind, pageKind } = dest
+    return { argCount, argKinds, argIndirect, fitKind, pageKind }
+  }
+  const link = (rest) => `<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] ${rest} >>`
+  const first = 8
+  const pdf = buildPdf([
+    `<< /Type /Catalog /Pages 2 0 R /Outlines ${first + 2 * dests.length} 0 R /Dests << ${dests.map(([d], i) => `/d${i} ${d}`).join(' ')} >> >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [${dests.flatMap((_, i) => [`${first + 2 * i} 0 R`, `${first + 2 * i + 1} 0 R`]).join(' ')}] >>`,
+    '<< >>',
+    '<< >>',
+    '7',
+    `[3 0 R /XYZ ${'1 '.repeat(999998)}]`,
+    ...dests.flatMap(([d]) => [link(`/Dest ${d}`), link(`/A << /S /GoTo /D ${d} >>`)]),
+    `<< /Type /Outlines /First ${first + 2 * dests.length + 1} 0 R >>`,
+    ...dests.map(([d], i) => `<< /Title (T${i}) /Dest ${d} ${i + 1 < dests.length ? `/Next ${first + 2 * dests.length + 2 + i} 0 R` : ''} >>`),
+  ])
+  withPdf(pdf, (doc) => {
+    const { links } = takeJson(m._INK_Links_Page(doc, 0))
+    const outline = takeJson(m._INK_Outline(doc))
+    dests.forEach(([d], i) => {
+      assert.deepEqual(shapeOf(links[2 * i].dest), expected[i], `/Dest ${d}`)
+      assert.deepEqual(shapeOf(links[2 * i + 1].action.dest), expected[i], `GoTo ${d}`)
+      assert.deepEqual(shapeOf(outline.items[i].dest), expected[i], `outline ${d}`)
+      assert.deepEqual(shapeOf(namedDest(doc, `d${i}`)), expected[i], `named ${d}`)
+    })
+    // The values that were there before keep theirs.
+    assert.deepEqual(links[0].dest.args, [null, null, null, null])
+    assert.equal(links[0].dest.fit, 'XYZ')
+    assert.deepEqual(links[2 * 4].dest.args, [1, 2, 3, 4])
   })
 }
 
@@ -4171,7 +4232,7 @@ m._INK_Json_Free(0)
     assert.equal(takeJson(m._INK_Dest_Named(doc, ptr, -1)), null, 'a negative len')
     assert.equal(takeJson(m._INK_Dest_Named(doc, 0, 3)), null, 'a NULL name')
     assert.equal(cString(m._INK_Dest_Named(doc, 0, 0)), 'null', 'the JSON text null')
-    assert.deepEqual(takeJson(m._INK_Dest_Named(doc, ptr, 3)), { page: 0, pageRef: [3, 0], fit: 'Fit', args: [null, null, null, null] })
+    assert.deepEqual(takeJson(m._INK_Dest_Named(doc, ptr, 3)), { page: 0, pageRef: [3, 0], fit: 'Fit', args: [null, null, null, null], ...shape() })
     m._free(ptr)
   })
   assert.equal(m._INK_Dest_Named(0, 0, 0), 0, 'a NULL document')

@@ -41,6 +41,8 @@ namespace {
 
 constexpr int kMaxOutlineDepth = 64;
 constexpr size_t kMaxOutlineItems = 100000;
+// The most entries after an explicit destination's fit whose kinds are given.
+constexpr size_t kMaxArgKinds = 8;
 // The most bytes a JavaScript action's source writes inside its JSON string,
 // escapes included, and the most all the sources of one page's links write.
 constexpr size_t kMaxScriptBytes = 4096;
@@ -106,6 +108,66 @@ void AppendPageRef(std::string* out, const CPDF_Array* dest) {
   out->push_back(']');
 }
 
+// What an explicit destination's array holds, entry by entry, as the file
+// wrote it, so a caller can check it as PDF.js does: "argCount", "argKinds"
+// for at most the first kMaxArgKinds arguments (each resolved), whether any of
+// those is written as a reference ("argIndirect"), "fitKind" and "pageKind".
+// Reads at most kMaxArgKinds + 2 entries, however long the array.
+void AppendShape(std::string* out, const CPDF_Array* array) {
+  const size_t size = array->size();
+  out->push_back(',');
+  AppendKey(out, "argCount");
+  out->append(std::to_string(size > 2 ? size - 2 : 0));
+  out->push_back(',');
+  AppendKey(out, "argKinds");
+  out->push_back('[');
+  bool indirect = false;
+  for (size_t i = 2; i < size && i < 2 + kMaxArgKinds; ++i) {
+    if (i > 2) {
+      out->push_back(',');
+    }
+    RetainPtr<const CPDF_Object> entry = array->GetObjectAt(i);
+    indirect = indirect || (entry && entry->IsReference());
+    // A reference to no object is the null object.
+    RetainPtr<const CPDF_Object> value = entry ? entry->GetDirect() : nullptr;
+    out->append(!value || value->IsNull() ? "\"null\""
+                : value->IsNumber()        ? "\"number\""
+                                           : "\"other\"");
+  }
+  out->append("],");
+  AppendKey(out, "argIndirect");
+  out->append(Boolean(indirect));
+  out->push_back(',');
+  AppendKey(out, "fitKind");
+  RetainPtr<const CPDF_Object> fit =
+      size >= 2 ? array->GetObjectAt(1) : nullptr;
+  out->append(size < 2          ? "\"missing\""
+              : !fit             ? "\"other\""
+              : fit->IsName()    ? "\"name\""
+              : fit->IsString()  ? "\"string\""
+                                 : "\"other\"");
+  out->push_back(',');
+  AppendKey(out, "pageKind");
+  const char* page_kind = "\"missing\"";
+  if (size > 0) {
+    RetainPtr<const CPDF_Object> page = array->GetObjectAt(0);
+    page_kind = "\"other\"";
+    if (page && page->IsReference()) {
+      RetainPtr<const CPDF_Object> target = page->GetDirect();
+      if (target && target->IsDictionary()) {
+        page_kind = "\"ref\"";
+      }
+    } else if (const CPDF_Number* number = ToNumber(page.Get())) {
+      const float value = number->GetNumber();
+      if (number->IsInteger() ||
+          (std::isfinite(value) && std::floor(value) == value)) {
+        page_kind = "\"integer\"";
+      }
+    }
+  }
+  out->append(page_kind);
+}
+
 // A local destination names a page of this file. A remote go-to's or a
 // launch's /D names a page of another file, and its number is kept as it is.
 enum class Where { kLocal, kRemote };
@@ -159,7 +221,9 @@ void AppendDest(std::string* out,
       out->append("null");
     }
   }
-  out->append("]}");
+  out->push_back(']');
+  AppendShape(out, array);
+  out->push_back('}');
 }
 
 // /F of a remote go-to or a launch: a string, or the first string of a file
