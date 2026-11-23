@@ -3690,6 +3690,39 @@ const spell = (codes) => String.fromCodePoint(...codes)
 }
 
 {
+  // A /ToUnicode section is read to its end keyword whatever count it
+  // announces, as PDF.js reads it. A malformed entry still drops its section.
+  const mapped = (content, cmap) =>
+    spell(
+      textOf(
+        buildPdf([
+          '<< /Type /Catalog /Pages 2 0 R >>',
+          '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+          `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>`,
+          streamObject('', `BT /F1 12 Tf 72 700 Td ${content} Tj ET`),
+          '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /ToUnicode 6 0 R >>',
+          streamObject('', `/CIDInit /ProcSet findresource begin 12 dict begin begincmap 1 begincodespacerange <00> <FF> endcodespacerange\n${cmap}`),
+        ]),
+      ).codes,
+    )
+  const end = '\nendcmap CMapName currentdict /CMap defineresource pop end end'
+  const ranges = (count, n) => `${count} beginbfrange ${['<41><41><0061>', '<42><42><0062>', '<43><43><0063>'].slice(0, n).join(' ')} endbfrange${end}`
+  assert.equal(mapped('(ABCDE)', ranges(2, 2)), 'abCDE', 'a well-formed section')
+  assert.equal(mapped('(ABCDE)', ranges(1, 3)), 'abcDE', 'one announced, three held')
+  assert.equal(mapped('(ABCDE)', ranges(5, 2)), 'abCDE', 'five announced, two held')
+  assert.equal(mapped('(ABCDE)', `1 beginbfchar <41> <0061> <42> <0062> endbfchar${end}`), 'abCDE', 'bfchar, one announced, two held')
+  assert.equal(mapped('(ABCDE)', `3 beginbfchar <41> <0061> endbfchar${end}`), 'aBCDE', 'bfchar, three announced, one held')
+  // A section that never ends is read to the end of the stream.
+  assert.equal(mapped('(ABCDE)', '1 beginbfrange <41><41><0061> <42><42><0062>'), 'abCDE', 'a section with no end')
+  assert.equal(mapped('(ABCDE)', '2 beginbfchar <41> <0061> <42>'), 'aBCDE', 'a bfchar section with no end')
+  assert.equal(mapped('(ABCDE)', `5 beginbfrange <41><41><0061> <4G><42><0062> endbfrange${end}`), 'ABCDE', 'a malformed entry')
+  // The case of PDF.js's bug 1388: ten ranges announced, one held, mapping the
+  // space to U+B0A9. An A follows, since Helvetica's space has no outline and
+  // the text page drops an object with no width.
+  assert.equal(mapped('( A)', `10 beginbfrange <20> <20> <b0a9> endbfrange${end}`), '\u{b0a9}A')
+}
+
+{
   // /Rotate does not change the text: the same lines, a matrix-turned word and
   // a form XObject read in the same order with the same boxes, origins and
   // matrices on a page turned 0, 90, 180 and 270 degrees.
