@@ -26,7 +26,10 @@ InkText* INK_Text_Page(FPDF_DOCUMENT doc, int page_index);
 int INK_Text_Count(const InkText* t);
 
 // Count Unicode code points. A character with no Unicode mapping is 0 and has
-// flag 4.
+// flag 4. In a Type 3 font such a character is instead the code point of its
+// glyph's name (an Adobe glyph name or uniXXXX) or, when the name means
+// nothing, its character code. A result below 32, a surrogate (U+D800 to
+// U+DFFF) or a value past U+10FFFF keeps 0 and flag 4.
 const unsigned int* INK_Text_Codes(const InkText* t);
 
 // Count x 15 floats, user space: box l,b,r,t; loose box l,b,r,t; origin x,y;

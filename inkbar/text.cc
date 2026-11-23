@@ -14,11 +14,13 @@
 #include <vector>
 
 #include "core/fpdfapi/font/cpdf_font.h"
+#include "core/fpdfapi/font/cpdf_type3font.h"
 #include "core/fpdfapi/page/cpdf_pageobject.h"
 #include "core/fpdfapi/page/cpdf_textobject.h"
 #include "core/fpdfapi/parser/cpdf_array.h"
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
 #include "core/fpdfapi/parser/cpdf_number.h"
+#include "core/fpdftext/cpdf_textpage.h"
 #include "core/fxcrt/bytestring.h"
 #include "core/fxge/cfx_font.h"
 #include "core/fxge/cfx_standardfont.h"
@@ -41,6 +43,8 @@ constexpr int kGeometryPerChar = 15;
 constexpr unsigned char kGenerated = 1;
 constexpr unsigned char kHyphen = 2;
 constexpr unsigned char kNoUnicode = 4;
+// A Type 3 character below this, a control code, stays without a mapping.
+constexpr unsigned int kFirstPrintable = 32;
 constexpr size_t kMaxFonts = 65535;
 
 bool IsTimes(const ByteString& name) {
@@ -149,6 +153,28 @@ RetainPtr<CPDF_Font> FontOf(FPDF_TEXTPAGE text_page, int i) {
   return text_object ? text_object->GetFont() : nullptr;
 }
 
+// For character |i|, which has no Unicode mapping: when its font is Type 3,
+// the code point of its glyph's name or, when the name means nothing, the
+// character code itself. 0 for any other font, and for a value that is no
+// Unicode scalar (a surrogate or past U+10FFFF).
+unsigned int Type3Unicode(FPDF_TEXTPAGE text_page, int i) {
+  RetainPtr<CPDF_Font> font = FontOf(text_page, i);
+  const CPDF_Type3Font* type3 = font ? font->AsType3Font() : nullptr;
+  if (!type3) {
+    return 0;
+  }
+  const uint32_t char_code =
+      CPDFTextPageFromFPDFTextPage(text_page)->GetCharInfo(i).char_code();
+  const char* name = type3->GetCharProcName(char_code);
+  const wchar_t from_name = name ? UnicodeFromAdobeName(name) : 0;
+  const uint32_t value =
+      from_name ? static_cast<uint32_t>(from_name) : char_code;
+  if ((value >= 0xD800 && value <= 0xDFFF) || value > 0x10FFFF) {
+    return 0;
+  }
+  return value;
+}
+
 // Reads |text_page| into |t|. False when the page has more fonts than an
 // index can number.
 bool Fill(FPDF_TEXTPAGE text_page, InkText* t) {
@@ -183,12 +209,16 @@ bool Fill(FPDF_TEXTPAGE text_page, InkText* t) {
     if (FPDFText_IsHyphen(text_page, i) == 1) {
       flags |= kHyphen;
     }
+    unsigned int code = FPDFText_GetUnicode(text_page, i);
     if (FPDFText_HasUnicodeMapError(text_page, i) == 1) {
-      flags |= kNoUnicode;
+      code = Type3Unicode(text_page, i);
+      if (code < kFirstPrintable) {
+        flags |= kNoUnicode;
+        code = 0;
+      }
     }
     t->flags.push_back(flags);
-    t->codes.push_back(
-        (flags & kNoUnicode) ? 0 : FPDFText_GetUnicode(text_page, i));
+    t->codes.push_back(code);
 
     double left = 0;
     double right = 0;

@@ -3686,6 +3686,52 @@ function type3Pdf(content, differences, names, { fontExtra = '', extra = [] } = 
   assert.equal(text.fontTable[0].standard, null)
 }
 
+{
+  // Type 3 text with no /ToUnicode reads its glyph names, and the character
+  // code where a name means nothing.
+  const adobe = textOf(
+    type3Pdf(
+      'BT /T3 12 Tf 72 700 Td (SECRET-ALPHA) Tj 100 0 Td (KEEP-BETA) Tj ET',
+      '83 /S 69 /E 67 /C 82 /R 84 /T 45 /hyphen 65 /A 76 /L 80 /P 72 /H 75 /K 66 /B',
+      ['S', 'E', 'C', 'R', 'T', 'hyphen', 'A', 'L', 'P', 'H', 'K', 'B'],
+    ),
+  )
+  assert.equal(spell(adobe.codes), 'SECRET-ALPHA KEEP-BETA')
+  assert.ok(
+    adobe.flags.every((f) => (f & 4) === 0),
+    `flags ${adobe.flags}`,
+  )
+  // Names that mean nothing: the codes, 65 (A) and 97 (a) on a WinAnsi base.
+  assert.equal(spell(textOf(type3Pdf('BT /T3 12 Tf 72 700 Td (AA) Tj ET', '65 /C1', ['C1'])).codes), 'AA')
+  assert.equal(
+    spell(textOf(type3Pdf('BT /T3 12 Tf 72 700 Td (aa) Tj ET', '97 /a0', ['a0'], { fontExtra: '/Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [97 /a0] >>' })).codes),
+    'aa',
+  )
+  // A uniXXXX name, an arbitrary code with a name that means nothing, a name
+  // on a control code, and a control code whose name means nothing.
+  const mixed = textOf(type3Pdf('BT /T3 12 Tf 72 700 Td <C8030201> Tj ET', '1 /g1 2 /A 3 /uni00E9 200 /g7', ['g1', 'A', 'uni00E9', 'g7']))
+  assert.deepEqual(mixed.codes, [0xc8, 0xe9, 0x41, 0])
+  assert.deepEqual(
+    mixed.flags.map((f) => f & 4),
+    [0, 0, 0, 4],
+  )
+  // A name whose value is no Unicode scalar, a surrogate or past U+10FFFF,
+  // keeps flag 4 and code 0.
+  const scalar = textOf(type3Pdf('BT /T3 12 Tf 72 700 Td (AB) Tj ET', '65 /uD800 66 /uFFFFFF', ['uD800', 'uFFFFFF']))
+  assert.deepEqual(scalar.codes, [0, 0])
+  assert.deepEqual(scalar.flags, [4, 4])
+  // A /ToUnicode wins: code 65 reads Z.
+  const cmap = [
+    '/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /Ink def',
+    '1 begincodespacerange <00> <FF> endcodespacerange',
+    '1 beginbfchar <41> <005A> endbfchar',
+    'endcmap CMapName currentdict /CMap defineresource pop end end',
+  ].join('\n')
+  const mapped = textOf(type3Pdf('BT /T3 12 Tf 72 700 Td (A) Tj ET', '65 /A', ['A'], { fontExtra: '/ToUnicode 7 0 R', extra: [streamObject('', cmap)] }))
+  assert.equal(spell(mapped.codes), 'Z')
+  assert.deepEqual(mapped.flags, [0])
+}
+
 // INK_Links_Page, INK_Outline and INK_Dest_Named: what the file says about a
 // page's annotations, its links, the outline and named destinations.
 
