@@ -14,14 +14,20 @@
 #include <vector>
 
 #include "core/fpdfapi/font/cpdf_font.h"
+#include "core/fpdfapi/font/cpdf_type3font.h"
 #include "core/fpdfapi/page/cpdf_pageobject.h"
 #include "core/fpdfapi/page/cpdf_textobject.h"
+#include "core/fpdfapi/parser/cpdf_array.h"
+#include "core/fpdfapi/parser/cpdf_dictionary.h"
+#include "core/fpdfapi/parser/cpdf_number.h"
+#include "core/fpdftext/cpdf_textpage.h"
 #include "core/fxcrt/bytestring.h"
 #include "core/fxge/cfx_font.h"
 #include "core/fxge/cfx_standardfont.h"
 #include "core/fxge/fx_font.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
 #include "inkbar/json.h"
+#include "public/epdf_view.h"
 #include "public/fpdf_text.h"
 
 struct InkText {
@@ -30,6 +36,7 @@ struct InkText {
   std::vector<unsigned char> flags;
   std::vector<unsigned short> fonts;
   std::string font_table;
+  bool truncated = false;
 };
 
 namespace {
@@ -38,7 +45,11 @@ constexpr int kGeometryPerChar = 15;
 constexpr unsigned char kGenerated = 1;
 constexpr unsigned char kHyphen = 2;
 constexpr unsigned char kNoUnicode = 4;
+// A Type 3 character below this, a control code, stays without a mapping.
+constexpr unsigned int kFirstPrintable = 32;
 constexpr size_t kMaxFonts = 65535;
+// The most characters read from one page.
+constexpr int kMaxChars = 1000000;
 
 bool IsTimes(const ByteString& name) {
   std::optional<CFX_StandardFont::Index> index =
@@ -48,6 +59,30 @@ bool IsTimes(const ByteString& name) {
           index.value() == CFX_StandardFont::kTimesBold ||
           index.value() == CFX_StandardFont::kTimesBoldOblique ||
           index.value() == CFX_StandardFont::kTimesOblique);
+}
+
+// The font descriptor's |key| divided by 1000, as the file gives it, or null
+// when there is no descriptor or the key is absent or not a number. A Type 0
+// font's descriptor is its descendant's.
+void AppendDescriptorMetric(std::string* out,
+                            const CPDF_Font* font,
+                            const char* key) {
+  RetainPtr<const CPDF_Dictionary> dict = font->GetFontDict();
+  if (dict && font->IsCIDFont()) {
+    RetainPtr<const CPDF_Array> descendants =
+        dict->GetArrayFor("DescendantFonts");
+    dict = descendants ? descendants->GetDictAt(0) : nullptr;
+  }
+  RetainPtr<const CPDF_Dictionary> descriptor =
+      dict ? dict->GetDictFor("FontDescriptor") : nullptr;
+  RetainPtr<const CPDF_Object> value =
+      descriptor ? descriptor->GetDirectObjectFor(key) : nullptr;
+  const CPDF_Number* number = ToNumber(value.Get());
+  if (number) {
+    inkbar::json::AppendNumber(out, number->GetNumber() / 1000.f);
+  } else {
+    out->append("null");
+  }
 }
 
 // One font table entry. Each property is the font descriptor's flag or, where
@@ -75,6 +110,41 @@ void AppendFont(std::string* out, const CPDF_Font* font) {
   out->append(boolean(bold));
   out->append(",\"vertical\":");
   out->append(boolean(font->IsVertWriting()));
+  // In em units, as FPDFFont_GetAscent and FPDFFont_GetDescent give them at
+  // size 1. A Type 3 font's glyph space is its own, and PDFium fills its
+  // figures only once a glyph is drawn, so it gives none.
+  const int ascent = font->GetTypeAscent();
+  const int descent = font->GetTypeDescent();
+  const bool metrics = !font->IsType3Font() && (ascent != 0 || descent != 0);
+  out->append(",\"ascent\":");
+  if (metrics) {
+    inkbar::json::AppendNumber(out, ascent / 1000.f);
+  } else {
+    out->append("null");
+  }
+  out->append(",\"descent\":");
+  if (metrics) {
+    inkbar::json::AppendNumber(out, descent / 1000.f);
+  } else {
+    out->append("null");
+  }
+  out->append(",\"descriptorAscent\":");
+  AppendDescriptorMetric(out, font, "Ascent");
+  out->append(",\"descriptorDescent\":");
+  AppendDescriptorMetric(out, font, "Descent");
+  // The standard font PDFium draws it with: a Type 1 font of the standard 14
+  // with no font file. PDFium stores its canonical name as the base name.
+  out->append(",\"standard\":");
+  std::optional<CFX_StandardFont::Index> index =
+      font->IsStandardFont()
+          ? CFX_StandardFont::GetStandardFontIndex(name)
+          : std::nullopt;
+  if (index.has_value()) {
+    inkbar::json::AppendName(
+        out, CFX_StandardFont::GetCanonicalFontName(index.value()));
+  } else {
+    out->append("null");
+  }
   out->push_back('}');
 }
 
@@ -87,10 +157,36 @@ RetainPtr<CPDF_Font> FontOf(FPDF_TEXTPAGE text_page, int i) {
   return text_object ? text_object->GetFont() : nullptr;
 }
 
+// For character |i|, which has no Unicode mapping: when its font is Type 3,
+// the code point of its glyph's name or, when the name means nothing, the
+// character code itself. 0 for any other font, and for a value that is no
+// Unicode scalar (a surrogate or past U+10FFFF).
+unsigned int Type3Unicode(FPDF_TEXTPAGE text_page, int i) {
+  RetainPtr<CPDF_Font> font = FontOf(text_page, i);
+  const CPDF_Type3Font* type3 = font ? font->AsType3Font() : nullptr;
+  if (!type3) {
+    return 0;
+  }
+  const uint32_t char_code =
+      CPDFTextPageFromFPDFTextPage(text_page)->GetCharInfo(i).char_code();
+  const char* name = type3->GetCharProcName(char_code);
+  const wchar_t from_name = name ? UnicodeFromAdobeName(name) : 0;
+  const uint32_t value =
+      from_name ? static_cast<uint32_t>(from_name) : char_code;
+  if ((value >= 0xD800 && value <= 0xDFFF) || value > 0x10FFFF) {
+    return 0;
+  }
+  return value;
+}
+
 // Reads |text_page| into |t|. False when the page has more fonts than an
 // index can number.
 bool Fill(FPDF_TEXTPAGE text_page, InkText* t) {
-  const int count = FPDFText_CountChars(text_page);
+  int count = FPDFText_CountChars(text_page);
+  if (count > kMaxChars) {
+    count = kMaxChars;
+    t->truncated = true;
+  }
   if (count <= 0) {
     t->font_table = "[]";
     return true;
@@ -121,12 +217,16 @@ bool Fill(FPDF_TEXTPAGE text_page, InkText* t) {
     if (FPDFText_IsHyphen(text_page, i) == 1) {
       flags |= kHyphen;
     }
+    unsigned int code = FPDFText_GetUnicode(text_page, i);
     if (FPDFText_HasUnicodeMapError(text_page, i) == 1) {
-      flags |= kNoUnicode;
+      code = Type3Unicode(text_page, i);
+      if (code < kFirstPrintable) {
+        flags |= kNoUnicode;
+        code = 0;
+      }
     }
     t->flags.push_back(flags);
-    t->codes.push_back(
-        (flags & kNoUnicode) ? 0 : FPDFText_GetUnicode(text_page, i));
+    t->codes.push_back(code);
 
     double left = 0;
     double right = 0;
@@ -196,7 +296,10 @@ InkText* INK_Text_Page(FPDF_DOCUMENT doc, int page_index) {
   if (!doc || page_index < 0 || page_index >= FPDF_GetPageCount(doc)) {
     return nullptr;
   }
-  FPDF_PAGE page = FPDF_LoadPage(doc, page_index);
+  // Loaded as if /Rotate were 0: PDFium orders a page's text in display
+  // space, so on a turned page it would read across the lines. Boxes and
+  // origins are in user space either way.
+  FPDF_PAGE page = EPDF_LoadPageNormalized(doc, page_index, nullptr);
   if (!page) {
     return nullptr;
   }
@@ -234,6 +337,10 @@ const unsigned short* INK_Text_Fonts(const InkText* t) {
 
 const char* INK_Text_FontTable(const InkText* t) {
   return t ? t->font_table.c_str() : nullptr;
+}
+
+int INK_Text_Truncated(const InkText* t) {
+  return t && t->truncated ? 1 : 0;
 }
 
 void INK_Text_Free(InkText* t) {

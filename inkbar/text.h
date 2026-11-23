@@ -16,6 +16,8 @@ extern "C" {
 typedef struct InkText InkText;
 
 // The page's characters as PDFium's text page reports them, in its order.
+// The page is loaded as if its /Rotate were 0, so text is in the order it
+// has on the unturned page.
 // Text inside form XObjects is included; text in annotation appearances is
 // not. NULL when the page does not exist or cannot be loaded, and for a page
 // with more than 65,535 fonts. A page with no text gives a valid InkText with
@@ -26,7 +28,10 @@ InkText* INK_Text_Page(FPDF_DOCUMENT doc, int page_index);
 int INK_Text_Count(const InkText* t);
 
 // Count Unicode code points. A character with no Unicode mapping is 0 and has
-// flag 4.
+// flag 4. In a Type 3 font such a character is instead the code point of its
+// glyph's name (an Adobe glyph name or uniXXXX) or, when the name means
+// nothing, its character code. A result below 32, a surrogate (U+D800 to
+// U+DFFF) or a value past U+10FFFF keeps 0 and flag 4.
 const unsigned int* INK_Text_Codes(const InkText* t);
 
 // Count x 15 floats, user space: box l,b,r,t; loose box l,b,r,t; origin x,y;
@@ -45,8 +50,24 @@ const unsigned short* INK_Text_Fonts(const InkText* t);
 
 // UTF-8 JSON, owned by |t|:
 // [ { "name": "Helvetica", "fixedPitch": false, "serif": false,
-//     "italic": false, "bold": false, "vertical": false } ]
+//     "italic": false, "bold": false, "vertical": false,
+//     "ascent": 0.945, "descent": -0.224, "descriptorAscent": null,
+//     "descriptorDescent": null, "standard": "Helvetica" } ]
+// "ascent" and "descent" are PDFium's figures in em units (FPDFFont_GetAscent
+// and FPDFFont_GetDescent at size 1). Both are null for a Type 3 font and for
+// a font whose figures are both 0. "descriptorAscent" and "descriptorDescent"
+// are the font descriptor's /Ascent and /Descent divided by 1000, sign as the
+// file gives it; null when there is no descriptor or the key is absent or not
+// a number. A Type 0 font's descriptor is its descendant's. "standard" is the
+// name of the standard 14 font PDFium draws the font with (a Type 1 font of
+// the standard 14 with no font file), else null. None of these is checked: a
+// file can give any values, a positive descent included.
 const char* INK_Text_FontTable(const InkText* t);
+
+// 1 when the page had more than 1,000,000 characters, of which |t| holds the
+// first 1,000,000. 0 otherwise and for NULL. The cut can fall inside a line
+// break PDFium generated, leaving a lone CR as the last character.
+int INK_Text_Truncated(const InkText* t);
 
 // Frees |t|. NULL is a no-op.
 void INK_Text_Free(InkText* t);

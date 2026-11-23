@@ -19,43 +19,77 @@ extern "C" {
 // or NULL when it could not read (no such page, no document). Only the first
 // action of a chain is read.
 //
-// Dest   = { "page": 3, "fit": "XYZ", "args": [72, 700, null, null] }
+// Dest   = { "page": 3, "pageRef": [12, 0] | null, "fit": "XYZ",
+//            "args": [72, 700, null, null], "argCount": 3,
+//            "argKinds": ["number", "number", "null"], "argIndirect": false,
+//            "fitKind": "name", "pageKind": "ref" }
 //        | { "nameHex": "636861707465722d32" }
-// "page" is the index of the page the first entry names, or -1 when it names
-// no page of this file: a page dictionary not in the page tree, a number that
-// is negative or not less than the page count, anything else. A remote go-to's
-// or a launch's "dest" names a page of another file, so there a number is
-// given as the file has it. "fit" is one of XYZ, Fit, FitH, FitV, FitR, FitB,
-// FitBH, FitBV, else "Unknown". "args" are the four entries after the fit
+// "page" is the index of the page the first entry names, or -1 when it names no
+// page of this file: a page dictionary not in the page tree, a number that is
+// negative or not less than the page count, anything else. A remote go-to's or
+// a launch's "dest" names a page of another file, so there a number is given as
+// the file has it. "pageRef" is the object number and generation the first
+// entry refers to, or null when it is not a reference; the generation is that
+// of the object the file holds under the number (PDFium keeps none in a
+// reference), 0 when there is none. "fit" is one of XYZ, Fit, FitH, FitV, FitR,
+// FitB, FitBH, FitBV, else "Unknown". "args" are the four entries after the fit
 // name, each a number or null (absent, null or not a number). A string or name
 // is a named destination, not looked up. Anything else is null.
+// The last five keys give the array's shape as the file wrote it, so a caller
+// can check it as PDF.js does. "argCount" is the number of entries after the
+// fit, any number. "argKinds" has one entry for each of the first 8 of them,
+// each resolved: "number", "null" (a null object, or a reference to no
+// object) or "other". "argIndirect" says whether any of those 8 is written as
+// a reference, which PDF.js does not resolve. "fitKind" is "name", "string" or
+// "other" for the second entry as written, "missing" when there is none.
+// "pageKind" is "ref" for a reference to a dictionary, "integer" for a whole
+// number, else "other", and "missing" for an empty array; with "pageRef", a
+// reference to anything else can be told apart. Only the first 10 entries are
+// read.
 //
-// Action = { "s": "URI", "uriHex": "..." }
+// Action = { "s": "URI", "uriHex": "...", "uriKind": "string" | "name" | null }
 //        | { "s": "GoTo", "dest": Dest | null }
 //        | { "s": "GoToR" | "Launch", "fileHex": "..." | null,
-//            "dest": Dest | null, "newWindow": true | false | null }
+//            "fileKind": "string" | "spec" | null, "dest": Dest | null,
+//            "newWindow": true | false | null }
 //        | { "s": "Named", "name": "NextPage" }
-//        | { "s": "JavaScript", "js": "app.launchURL('...')" }
+//        | { "s": "JavaScript", "js": "app.launchURL('...')",
+//            "scriptTruncated": true }
 //        | { "s": "<any other /S>" }
-// "fileHex" is /F when it is a string, else the first string of a file
-// specification's /UF, /F, /Unix, /Mac and /DOS. "js" is /JS decoded as PDFium
-// decodes it, from a string or a stream. A name's bytes above 0x7F are written
-// as the code points U+0080 to U+00FF.
+// "uriHex" is /URI's bytes, a string's or a name's; "uriKind" says which, and
+// is null, with "uriHex" empty, when /URI is neither. "fileHex" is /F when it
+// is a string, else the first string of a file specification's /UF, /F, /Unix,
+// /Mac and /DOS; "fileKind" says whether /F was a string or a file
+// specification, null when it was neither. "js" is /JS decoded as PDFium
+// decodes it, from a string or a stream, and cut after the last character
+// whose written form, as UTF-8 with JSON escapes (6 bytes for a control
+// character, 2 for a quote or a backslash), ends within 4,096 bytes. On one
+// page the scripts of all its links write at most 1,048,576 such bytes in
+// all; once that is spent, each later script is written empty.
+// "scriptTruncated" is present, and true, only when a script was cut. A
+// name's bytes above 0x7F are written as the code points U+0080 to U+00FF.
 
 // Reads /Annots from the page dictionary without parsing the page's content.
 // { "annots": [ { "index": 0, "subtype": "Link", "flags": 4, "obj": 12,
-//                 "rectOk": true, "quadsOk": true } ],
+//                 "generation": 0, "rectOk": true, "hasQuads": false,
+//                 "quadsOk": true } ],
 //   "links":  [ { "index": 0, "rect": [l,b,r,t], "quads": [x1,y1,...] | null,
-//                 "dest": Dest | null, "action": Action | null,
-//                 "aa": Action | null } ] }
+//                 "dest": Dest | null, "destInvalid": true,
+//                 "action": Action | null, "aa": Action | null } ] }
 // "annots" has an entry for every dictionary in /Annots, "index" its place
 // there; any other entry, a stream included, is skipped. "obj" is 0 for a
-// direct object. "rectOk": /Rect is 4 finite numbers. "quadsOk": /QuadPoints is
-// absent, or a non-empty array of finite numbers whose length is a multiple
-// of 8. "links" has the Link annotations: "rect" normalised, [0,0,0,0] when
-// /Rect is not well formed; "quads" null when /QuadPoints is absent or not well
-// formed. "action" is null when /A is absent or not a dictionary. "aa" is /AA's
-// /D, else its /U.
+// direct object, and so is "generation". "rectOk": /Rect is 4 finite numbers.
+// "hasQuads": /QuadPoints is present and not null, whatever it holds.
+// "quadsOk": /QuadPoints is absent, or a non-empty array of finite numbers
+// whose length is a multiple of 8. "links" has the Link annotations: "rect"
+// normalised, [0,0,0,0] when /Rect is not well formed; "quads" null when
+// /QuadPoints is absent or not well formed. "destInvalid" is present, and true,
+// only when /Dest is in the dictionary (null included) but is not a string, a
+// name or an array; "dest" is then null. It covers nothing else: an array that
+// is no valid explicit destination (a bad page entry, a wrong number of
+// arguments) is reported as "dest", and a caller applies the checks for an
+// explicit destination to "dest" itself. "action" is null when /A is absent
+// or not a dictionary. "aa" is /AA's /D, else its /U.
 char* INK_Links_Page(FPDF_DOCUMENT doc, int page_index);
 
 // { "items": [ { "depth": 0, "title": "Cover", "flags": 2, "count": -2,

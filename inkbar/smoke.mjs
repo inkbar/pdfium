@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 105)
+assert.equal(names.length, 106)
 
 const m = await createModule()
 for (const name of names) {
@@ -3476,6 +3476,7 @@ function pageText(doc, index, mod = m) {
     flags: [...bytes(mod._INK_Text_Flags(t), 1)],
     fonts: Array.from({ length: n }, (_, i) => fontsBytes.readUInt16LE(i * 2)),
     fontTable: JSON.parse(cString(mod._INK_Text_FontTable(t), mod)),
+    truncated: mod._INK_Text_Truncated(t),
   }
   mod._INK_Text_Free(t)
   return result
@@ -3519,7 +3520,23 @@ const spell = (codes) => String.fromCodePoint(...codes)
   near(hello.geometry[0][8], 72, 'origin x of H')
   assert.deepEqual(hello.flags, [0, 0, 0, 0, 0])
   assert.deepEqual(hello.fonts, [0, 0, 0, 0, 0])
-  assert.deepEqual(hello.fontTable, [{ name: 'Helvetica', fixedPitch: false, serif: false, italic: false, bold: false, vertical: false }])
+  // PDFium takes a standard font's ascent and descent from the face it loads
+  // for it, not from the font's metrics file (0.718 and -0.207 for Helvetica).
+  assert.deepEqual(hello.fontTable, [
+    {
+      name: 'Helvetica',
+      fixedPitch: false,
+      serif: false,
+      italic: false,
+      bold: false,
+      vertical: false,
+      ascent: 0.944999993,
+      descent: -0.224000007,
+      descriptorAscent: null,
+      descriptorDescent: null,
+      standard: 'Helvetica',
+    },
+  ])
 }
 
 {
@@ -3542,6 +3559,35 @@ const spell = (codes) => String.fromCodePoint(...codes)
   m._free(opened.buf)
   assert.equal(m._INK_Text_Page(0, 0), 0, 'a NULL document')
   m._INK_Text_Free(0)
+  assert.equal(m._INK_Text_Truncated(0), 0, 'NULL is truncated')
+  assert.equal(empty.truncated, 0, 'a page with no text is truncated')
+}
+
+{
+  // A page of 1,001,000 characters gives the first 1,000,000 and says so; one
+  // of exactly 1,000,000 gives them all. PDFium keeps at most 32,767
+  // characters of one string, so the page shows strings of 1,000.
+  const read = (strings) =>
+    withDoc(onePagePdf(`BT /F1 1 Tf 0 0 Td ${strings.map((text) => `(${text}) Tj`).join(' ')} ET`, { mediaBox: letterBox }), (doc) => {
+      const t = m._INK_Text_Page(doc, 0)
+      assert.notEqual(t, 0)
+      const count = m._INK_Text_Count(t)
+      const codes = new Uint32Array(m.HEAPU8.slice(m._INK_Text_Codes(t), m._INK_Text_Codes(t) + count * 4).buffer)
+      const truncated = m._INK_Text_Truncated(t)
+      m._INK_Text_Free(t)
+      return { count, codes, truncated }
+    })
+  const thousand = Array(1000).fill('a'.repeat(1000))
+  const over = read([...thousand, 'b'.repeat(1000)])
+  assert.equal(over.count, 1000000)
+  assert.equal(over.truncated, 1)
+  assert.ok(
+    over.codes.every((c) => c === 97),
+    'the characters kept are not the first ones',
+  )
+  const full = read(thousand)
+  assert.equal(full.count, 1000000)
+  assert.equal(full.truncated, 0)
 }
 
 {
@@ -3595,6 +3641,142 @@ const spell = (codes) => String.fromCodePoint(...codes)
   assert.equal(vertical.fontTable.length, 1)
   assert.equal(vertical.fontTable[0].name, 'InkJapan1')
   assert.equal(vertical.fontTable[0].vertical, true, 'an /Identity-V font is not vertical')
+  // The font descriptor's /Ascent 880 and /Descent -120.
+  assert.equal(vertical.fontTable[0].ascent, 0.879999995)
+  assert.equal(vertical.fontTable[0].descent, -0.119999997)
+  // A Type 0 font's descriptor is its descendant's.
+  assert.equal(vertical.fontTable[0].descriptorAscent, 0.879999995)
+  assert.equal(vertical.fontTable[0].descriptorDescent, -0.119999997)
+  assert.equal(vertical.fontTable[0].standard, null)
+}
+
+{
+  // An embedded TrueType font whose descriptor gives a positive /Descent:
+  // PDFium turns its own figure negative, the descriptor's is given as the
+  // file has it. A font with a file of its own is no standard font, whatever
+  // its name; an alias PDFium knows, such as TimesNewRoman, gives the
+  // standard name.
+  const ahem = readFileSync(fileURLToPath(new URL('../testing/resources/fonts/ahem/Ahem.ttf', import.meta.url)))
+  const page = (font, extra = []) =>
+    textOf(
+      buildPdf([
+        '<< /Type /Catalog /Pages 2 0 R >>',
+        '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>`,
+        streamObject('', 'BT /F1 12 Tf 72 700 Td (AB) Tj ET'),
+        font,
+        ...extra,
+      ]),
+    ).fontTable[0]
+  const embedded = page('<< /Type /Font /Subtype /TrueType /BaseFont /Helvetica /FirstChar 65 /LastChar 66 /Widths [1000 1000] /FontDescriptor 6 0 R >>', [
+    '<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontBBox [0 -200 1000 800] /ItalicAngle 0 /Ascent 800 /Descent 200 /CapHeight 800 /StemV 80 /FontFile2 7 0 R >>',
+    streamObject('', ahem),
+  ])
+  assert.equal(embedded.descriptorAscent, 0.800000012)
+  assert.equal(embedded.descriptorDescent, 0.200000003)
+  assert.equal(embedded.descent, -0.200000003)
+  assert.equal(embedded.standard, null)
+  const bold = page('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>')
+  assert.equal(bold.standard, 'Helvetica-Bold')
+  assert.equal(bold.descriptorAscent, null)
+  const times = page('<< /Type /Font /Subtype /Type1 /BaseFont /TimesNewRoman >>')
+  assert.equal(times.standard, 'Times-Roman', 'an alias of a standard font')
+  const notNumber = page('<< /Type /Font /Subtype /Type1 /BaseFont /Courier /FontDescriptor 6 0 R >>', [
+    '<< /Type /FontDescriptor /FontName /Courier /Flags 32 /Ascent /Tall >>',
+  ])
+  assert.equal(notNumber.descriptorAscent, null)
+  assert.equal(notNumber.descriptorDescent, null)
+  assert.equal(notNumber.standard, 'Courier')
+}
+
+{
+  // /Rotate does not change the text: the same lines, a matrix-turned word and
+  // a form XObject read in the same order with the same boxes, origins and
+  // matrices on a page turned 0, 90, 180 and 270 degrees.
+  const content = [
+    'BT /F1 12 Tf 72 700 Td (First line) Tj 0 -20 Td (Second line) Tj 0 -20 Td (Third line) Tj ET',
+    'BT /F1 12 Tf 0 1 -1 0 400 500 Tm (Up) Tj ET',
+    'q 1 0 0 1 100 100 cm /Fm0 Do Q',
+  ].join('\n')
+  const form = streamObject('/Type /XObject /Subtype /Form /BBox [0 0 200 50] /Resources << /Font << /F1 5 0 R >> >>', 'BT /F1 10 Tf 5 5 Td (Inside) Tj ET')
+  const [upright, ...turned] = [0, 90, 180, 270].map((rotate) =>
+    textOf(onePagePdf(content, { mediaBox: letterBox, page: `/Rotate ${rotate}`, resources: '/XObject << /Fm0 6 0 R >>' }, [form])),
+  )
+  assert.ok(spell(upright.codes).startsWith('First line\r\nSecond line\r\nThird line'), JSON.stringify(spell(upright.codes)))
+  turned.forEach((text, i) => assert.deepEqual(text, upright, `the text of a page turned ${(i + 1) * 90} degrees`))
+}
+
+// A letter page drawing |content| with a Type 3 font as /T3, object 5, whose
+// /Differences are |differences| and whose every glyph name in |names| draws
+// one procedure, object 6. |fontExtra| goes in the font dictionary, and
+// |extra| objects follow from 7.
+function type3Pdf(content, differences, names, { fontExtra = '', extra = [] } = {}) {
+  return buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Contents 4 0 R /Resources << /Font << /T3 5 0 R >> >> >>`,
+    streamObject('', content),
+    `<< /Type /Font /Subtype /Type3 /FontBBox [0 0 600 700] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << ${names.map((n) => `/${n} 6 0 R`).join(' ')} >> /Encoding << /Type /Encoding /Differences [${differences}] >> /FirstChar 0 /LastChar 255 /Widths [${Array(256).fill(600).join(' ')}] /Resources << >> ${fontExtra} >>`,
+    streamObject('', '600 0 0 0 600 700 d1 0 0 600 700 re f'),
+    ...extra,
+  ])
+}
+
+{
+  // A Type 3 font has no ascent or descent.
+  const text = textOf(type3Pdf('BT /T3 12 Tf 72 700 Td (A) Tj ET', '65 /A', ['A']))
+  assert.equal(text.fontTable.length, 1)
+  assert.equal(text.fontTable[0].ascent, null)
+  assert.equal(text.fontTable[0].descent, null)
+  assert.equal(text.fontTable[0].descriptorAscent, null)
+  assert.equal(text.fontTable[0].descriptorDescent, null)
+  assert.equal(text.fontTable[0].standard, null)
+}
+
+{
+  // Type 3 text with no /ToUnicode reads its glyph names, and the character
+  // code where a name means nothing.
+  const adobe = textOf(
+    type3Pdf(
+      'BT /T3 12 Tf 72 700 Td (SECRET-ALPHA) Tj 100 0 Td (KEEP-BETA) Tj ET',
+      '83 /S 69 /E 67 /C 82 /R 84 /T 45 /hyphen 65 /A 76 /L 80 /P 72 /H 75 /K 66 /B',
+      ['S', 'E', 'C', 'R', 'T', 'hyphen', 'A', 'L', 'P', 'H', 'K', 'B'],
+    ),
+  )
+  assert.equal(spell(adobe.codes), 'SECRET-ALPHA KEEP-BETA')
+  assert.ok(
+    adobe.flags.every((f) => (f & 4) === 0),
+    `flags ${adobe.flags}`,
+  )
+  // Names that mean nothing: the codes, 65 (A) and 97 (a) on a WinAnsi base.
+  assert.equal(spell(textOf(type3Pdf('BT /T3 12 Tf 72 700 Td (AA) Tj ET', '65 /C1', ['C1'])).codes), 'AA')
+  assert.equal(
+    spell(textOf(type3Pdf('BT /T3 12 Tf 72 700 Td (aa) Tj ET', '97 /a0', ['a0'], { fontExtra: '/Encoding << /Type /Encoding /BaseEncoding /WinAnsiEncoding /Differences [97 /a0] >>' })).codes),
+    'aa',
+  )
+  // A uniXXXX name, an arbitrary code with a name that means nothing, a name
+  // on a control code, and a control code whose name means nothing.
+  const mixed = textOf(type3Pdf('BT /T3 12 Tf 72 700 Td <C8030201> Tj ET', '1 /g1 2 /A 3 /uni00E9 200 /g7', ['g1', 'A', 'uni00E9', 'g7']))
+  assert.deepEqual(mixed.codes, [0xc8, 0xe9, 0x41, 0])
+  assert.deepEqual(
+    mixed.flags.map((f) => f & 4),
+    [0, 0, 0, 4],
+  )
+  // A name whose value is no Unicode scalar, a surrogate or past U+10FFFF,
+  // keeps flag 4 and code 0.
+  const scalar = textOf(type3Pdf('BT /T3 12 Tf 72 700 Td (AB) Tj ET', '65 /uD800 66 /uFFFFFF', ['uD800', 'uFFFFFF']))
+  assert.deepEqual(scalar.codes, [0, 0])
+  assert.deepEqual(scalar.flags, [4, 4])
+  // A /ToUnicode wins: code 65 reads Z.
+  const cmap = [
+    '/CIDInit /ProcSet findresource begin 12 dict begin begincmap /CMapName /Ink def',
+    '1 begincodespacerange <00> <FF> endcodespacerange',
+    '1 beginbfchar <41> <005A> endbfchar',
+    'endcmap CMapName currentdict /CMap defineresource pop end end',
+  ].join('\n')
+  const mapped = textOf(type3Pdf('BT /T3 12 Tf 72 700 Td (A) Tj ET', '65 /A', ['A'], { fontExtra: '/ToUnicode 7 0 R', extra: [streamObject('', cmap)] }))
+  assert.equal(spell(mapped.codes), 'Z')
+  assert.deepEqual(mapped.flags, [0])
 }
 
 // INK_Links_Page, INK_Outline and INK_Dest_Named: what the file says about a
@@ -3609,6 +3791,9 @@ function takeJson(ptr) {
 }
 
 const hex = (text) => Buffer.from(text, 'latin1').toString('hex')
+// The shape keys of an explicit destination whose fit is a name and whose
+// arguments, none a reference, are of |kinds|.
+const shape = (kinds = [], pageKind = 'ref') => ({ argCount: kinds.length, argKinds: kinds, argIndirect: false, fitKind: 'name', pageKind })
 
 function withPdf(pdf, fn) {
   const opened = load(pdf)
@@ -3644,13 +3829,13 @@ m._INK_Json_Free(0)
   withPdf(pdf, (doc) => {
     const { annots, links } = takeJson(m._INK_Links_Page(doc, 0))
     assert.deepEqual(annots, [
-      { index: 0, subtype: 'Square', flags: 2, obj: 6, rectOk: true, quadsOk: true },
-      { index: 1, subtype: 'Link', flags: 0, obj: 7, rectOk: true, quadsOk: true },
-      { index: 2, subtype: 'Link', flags: 0, obj: 0, rectOk: true, quadsOk: true },
+      { index: 0, subtype: 'Square', flags: 2, obj: 6, generation: 0, rectOk: true, hasQuads: false, quadsOk: true },
+      { index: 1, subtype: 'Link', flags: 0, obj: 7, generation: 0, rectOk: true, hasQuads: false, quadsOk: true },
+      { index: 2, subtype: 'Link', flags: 0, obj: 0, generation: 0, rectOk: true, hasQuads: false, quadsOk: true },
     ])
     assert.deepEqual(links, [
-      { index: 1, rect: [72, 700, 200, 720], quads: null, dest: { page: 0, fit: 'XYZ', args: [72, 700, null, null] }, action: null, aa: null },
-      { index: 2, rect: [72, 600, 200, 620], quads: null, dest: null, action: { s: 'URI', uriHex: hex('https://example.com/a') }, aa: null },
+      { index: 1, rect: [72, 700, 200, 720], quads: null, dest: { page: 0, pageRef: [3, 0], fit: 'XYZ', args: [72, 700, null, null], ...shape(['number', 'number', 'null']) }, action: null, aa: null },
+      { index: 2, rect: [72, 600, 200, 620], quads: null, dest: null, action: { s: 'URI', uriHex: hex('https://example.com/a'), uriKind: 'string' }, aa: null },
     ])
     assert.equal(Buffer.from(links[1].action.uriHex, 'hex').toString('latin1'), 'https://example.com/a')
     assert.equal(m._INK_Links_Page(doc, 1), 0, 'page 1 of a one-page file')
@@ -3701,24 +3886,117 @@ m._INK_Json_Free(0)
       annots.map((_, i) => i !== 11),
     )
     assert.equal(links.length, 13)
-    const fit = (page) => ({ page, fit: 'Fit', args: [null, null, null, null] })
-    assert.deepEqual(links[0].action, { s: 'URI', uriHex: hex('https://example.com/b') }, '/A beside /Dest')
-    assert.deepEqual(links[0].dest, fit(0), '/Dest beside /A')
+    const fit = (page, pageRef) => ({ page, pageRef, fit: 'Fit', args: [null, null, null, null], ...shape() })
+    assert.deepEqual(links[0].action, { s: 'URI', uriHex: hex('https://example.com/b'), uriKind: 'string' }, '/A beside /Dest')
+    assert.deepEqual(links[0].dest, fit(0, [3, 0]), '/Dest beside /A')
     assert.equal(links[1].action, null, '/A 5')
     assert.deepEqual(links[2].rect, [0, 0, 0, 0], 'no /Rect')
-    assert.deepEqual(links[3].action, { s: 'GoToR', fileHex: hex('other.pdf'), dest: { nameHex: hex('chapter') }, newWindow: true })
-    assert.deepEqual(links[4].action, { s: 'Launch', fileHex: hex('app.exe'), dest: null, newWindow: null })
+    assert.deepEqual(links[3].action, { s: 'GoToR', fileHex: hex('other.pdf'), fileKind: 'string', dest: { nameHex: hex('chapter') }, newWindow: true })
+    assert.deepEqual(links[4].action, { s: 'Launch', fileHex: hex('app.exe'), fileKind: 'spec', dest: null, newWindow: null })
     assert.deepEqual(links[5].action, { s: 'Named', name: 'NextPage' })
     assert.deepEqual(links[6].action, { s: 'JavaScript', js: "app.launchURL('https://example.com/c')" })
     assert.deepEqual(links[7].action, { s: 'JavaScript', js: 'window.open("https://example.com/d")\n' })
     assert.equal(links[8].action, null)
-    assert.deepEqual(links[8].aa, { s: 'URI', uriHex: hex('https://example.com/e') }, '/AA /U')
-    assert.deepEqual(links[9].dest, fit(-1), 'a destination on the catalog')
+    assert.deepEqual(links[8].aa, { s: 'URI', uriHex: hex('https://example.com/e'), uriKind: 'string' }, '/AA /U')
+    assert.deepEqual(links[9].dest, fit(-1, [1, 0]), 'a destination on the catalog')
     assert.deepEqual(links[10].quads, [0, 10, 10, 10, 0, 0, 10, 0])
     assert.deepEqual(links[10].action, { s: 'SubmitForm' })
     assert.equal(links[11].quads, null, 'malformed /QuadPoints')
     assert.deepEqual(links[12].action, { s: 'GoTo', dest: { nameHex: hex('chapter-2') } })
   })
+}
+
+{
+  // A script is cut where what it writes inside its JSON string, UTF-8 with
+  // escapes, would pass 4,096 bytes, at a character's end, and the scripts of
+  // one page's links write at most 1,048,576 such bytes in all.
+  const PAGE_SCRIPTS = 1048576
+  // The bytes a script writes inside its JSON string, as json.h escapes it.
+  const written = (text) =>
+    [...text].reduce((sum, ch) => {
+      const c = ch.codePointAt(0)
+      if (ch === '"' || ch === '\\') return sum + 2
+      if (c < 0x20 || c === 0x7f) return sum + 6
+      return sum + Buffer.byteLength(ch)
+    }, 0)
+  const scriptPage = (annots, objects) =>
+    buildPdf([
+      '<< /Type /Catalog /Pages 2 0 R >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [${annots.map((n) => `${n} 0 R`).join(' ')}] >>`,
+      ...objects,
+    ])
+  const readLinks = (pdf) =>
+    withPdf(pdf, (doc) => {
+      const ptr = m._INK_Links_Page(doc, 0)
+      const text = cString(ptr)
+      m._INK_Json_Free(ptr)
+      assert.ok(Buffer.byteLength(text) < 16 * 1024 * 1024, `${Buffer.byteLength(text)} bytes of JSON`)
+      return JSON.parse(text).links
+    })
+  const js = (script) => `<< /S /JavaScript /JS ${script} 0 R >>`
+  const link = (rest) => `<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] ${rest} >>`
+
+  // A 1 MB script on 2,000 links, after one of 'a' and 3,000 é (0xE9 in
+  // PDFDocEncoding, two bytes in UTF-8): that one is cut after 2,047 é, at
+  // 4,095 bytes; 255 more fill the page's budget but for one byte, one 'a';
+  // the rest are empty.
+  {
+    const links = readLinks(
+      scriptPage(
+        Array.from({ length: 2001 }, (_, i) => i + 6),
+        [
+          streamObject('', 'a'.repeat(1 << 20)),
+          streamObject('', Buffer.concat([Buffer.from('a'), Buffer.alloc(3000, 0xe9)])),
+          link(`/A ${js(5)}`),
+          ...Array.from({ length: 2000 }, () => link(`/A ${js(4)}`)),
+        ],
+      ),
+    )
+    assert.equal(links.length, 2001)
+    assert.deepEqual(links[0].action, { s: 'JavaScript', js: `a${'é'.repeat(2047)}`, scriptTruncated: true })
+    const expected = (i) => (i <= 255 ? 'a'.repeat(4096) : i === 256 ? 'a' : '')
+    links.slice(1).forEach((l, k) => assert.deepEqual(l.action, { s: 'JavaScript', js: expected(k + 1), scriptTruncated: true }, `link ${k + 1}`))
+    assert.equal(
+      links.reduce((sum, l) => sum + written(l.action.js), 0),
+      PAGE_SCRIPTS,
+    )
+  }
+
+  // 2,000 links whose /A and /AA scripts are 4,096 bytes of \x01, which JSON
+  // writes as \u0001: each is cut at 682 characters (4,092 bytes), and the
+  // page's budget runs out after 256 of them and 170 characters of the next.
+  {
+    const links = readLinks(
+      scriptPage(
+        Array.from({ length: 2000 }, (_, i) => i + 5),
+        [streamObject('', Buffer.alloc(4096, 1)), ...Array.from({ length: 2000 }, () => link(`/A ${js(4)} /AA << /U ${js(4)} >>`))],
+      ),
+    )
+    const scripts = links.flatMap((l) => [l.action, l.aa])
+    assert.equal(scripts.length, 4000)
+    assert.ok(
+      scripts.every((a) => a.scriptTruncated === true && /^\x01*$/.test(a.js)),
+      'a script was not cut or holds more than \\x01',
+    )
+    assert.deepEqual(
+      scripts.slice(0, 258).map((a) => a.js.length),
+      [...Array(256).fill(682), 170, 0],
+    )
+    assert.ok(scripts.slice(257).every((a) => a.js === ''))
+    const total = scripts.reduce((sum, a) => sum + written(a.js), 0)
+    assert.ok(total <= PAGE_SCRIPTS, `${total} bytes of scripts`)
+  }
+
+  // A script of 4,096 quotes is cut at 2,048, each written as \"; 4,096 bytes
+  // of plain text exactly are not cut.
+  {
+    const links = readLinks(
+      scriptPage([4, 5], [link(`/A ${js(6)}`), link(`/A ${js(7)}`), streamObject('', '"'.repeat(4096)), streamObject('', 'a'.repeat(4096))]),
+    )
+    assert.deepEqual(links[0].action, { s: 'JavaScript', js: '"'.repeat(2048), scriptTruncated: true })
+    assert.deepEqual(links[1].action, { s: 'JavaScript', js: 'a'.repeat(4096) })
+  }
 }
 
 {
@@ -3757,7 +4035,7 @@ m._INK_Json_Free(0)
         [0, 'Second'],
       ],
     )
-    assert.deepEqual(outline.items[0], { depth: 0, title: 'Cover', flags: 2, count: -1, dest: { page: 0, fit: 'XYZ', args: [0, 792, null, null] }, action: null })
+    assert.deepEqual(outline.items[0], { depth: 0, title: 'Cover', flags: 2, count: -1, dest: { page: 0, pageRef: [3, 0], fit: 'XYZ', args: [0, 792, null, null], ...shape(['number', 'number', 'null']) }, action: null })
     assert.equal(outline.truncated, true, 'a loop does not truncate')
   })
 }
@@ -3790,12 +4068,12 @@ m._INK_Json_Free(0)
     assert.deepEqual(takeJson(m._INK_Outline(doc)), {
       items: [
         { depth: 0, title: 'Say "hi"\n\\ back\t', flags: 3, count: -2, dest: { nameHex: '636861707465722d32' }, action: null },
-        { depth: 0, title: 'ét\u{1f600}', flags: 0, count: 0, dest: null, action: { s: 'URI', uriHex: hex('https://example.com/f') } },
+        { depth: 0, title: 'ét\u{1f600}', flags: 0, count: 0, dest: null, action: { s: 'URI', uriHex: hex('https://example.com/f'), uriKind: 'string' } },
       ],
       truncated: false,
     })
-    assert.deepEqual(namedDest(doc, 'chapter-2'), { page: 0, fit: 'FitH', args: [500, null, null, null] })
-    assert.deepEqual(namedDest(doc, 'old'), { page: 0, fit: 'Fit', args: [null, null, null, null] })
+    assert.deepEqual(namedDest(doc, 'chapter-2'), { page: 0, pageRef: [3, 0], fit: 'FitH', args: [500, null, null, null], ...shape(['number']) })
+    assert.deepEqual(namedDest(doc, 'old'), { page: 0, pageRef: [3, 0], fit: 'Fit', args: [null, null, null, null], ...shape() })
     assert.equal(namedDest(doc, 'missing'), null)
   })
 }
@@ -3837,6 +4115,115 @@ m._INK_Json_Free(0)
 }
 
 {
+  // Facts a reader needs to treat a link as PDF.js does: whether /QuadPoints is
+  // there, a generation other than 0, a /Dest that is no destination beside
+  // /AA, whether /F was a string or a file specification, a /URI written as a
+  // name, and the reference a destination's page entry is.
+  const link = (rest) => `<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] ${rest} >>`
+  const body = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [4 0 R 5 0 R 6 0 R 7 0 R 8 0 R 9 3 R 10 0 R 11 0 R] >>`,
+    '<< /Type /Annot /Subtype /Highlight /Rect [0 0 10 10] >>',
+    '<< /Type /Annot /Subtype /Highlight /Rect [0 0 10 10] /QuadPoints 5 >>',
+    link('/Dest 5 /AA << /U << /S /URI /URI (https://example.com/g) >> >>'),
+    link('/Dest null /AA << /U << /S /URI /URI (https://example.com/g) >> >>'),
+    link('/A << /S /GoToR /F << /Type /Filespec /UF (spec.pdf) >> /D [3 /Fit] >>'),
+    link('/A << /S /URI /URI /https:#2F#2Fexample.com#2Fh >>'),
+    link('/A << /S /URI /URI 7 >>'),
+    link('/Dest [3 0 R /Fit]'),
+  ])
+  // Object 9 written with generation 3, in its header and in the xref table.
+  const lines = body.toString('latin1').replace('\n9 0 obj\n', '\n9 3 obj\n').split('\n')
+  const entry = lines.indexOf('0000000000 65535 f ') + 9
+  lines[entry] = lines[entry].replace(' 00000 n ', ' 00003 n ')
+  const pdf = Buffer.from(lines.join('\n'), 'latin1')
+  withPdf(pdf, (doc) => {
+    const { annots, links } = takeJson(m._INK_Links_Page(doc, 0))
+    assert.deepEqual(
+      annots.map((a) => a.hasQuads),
+      [false, true, false, false, false, false, false, false],
+    )
+    assert.deepEqual(
+      annots.map((a) => a.quadsOk),
+      [true, false, true, true, true, true, true, true],
+    )
+    assert.deepEqual(
+      annots.map((a) => [a.obj, a.generation]),
+      [4, 5, 6, 7, 8, 9, 10, 11].map((n) => [n, n === 9 ? 3 : 0]),
+    )
+    assert.equal(links[0].dest, null)
+    assert.equal(links[0].destInvalid, true, '/Dest 5')
+    assert.equal(links[1].destInvalid, true, '/Dest null')
+    assert.equal(links[5].destInvalid, undefined, 'a good /Dest')
+    assert.equal(links[3].destInvalid, undefined, 'no /Dest')
+    assert.deepEqual(links[0].aa, { s: 'URI', uriHex: hex('https://example.com/g'), uriKind: 'string' })
+    assert.deepEqual(links[2].action, { s: 'GoToR', fileHex: hex('spec.pdf'), fileKind: 'spec', dest: { page: 3, pageRef: null, fit: 'Fit', args: [null, null, null, null], ...shape([], 'integer') }, newWindow: null })
+    assert.deepEqual(links[3].action, { s: 'URI', uriHex: hex('https://example.com/h'), uriKind: 'name' })
+    assert.deepEqual(links[4].action, { s: 'URI', uriHex: '', uriKind: null })
+    assert.deepEqual(links[5].dest, { page: 0, pageRef: [3, 0], fit: 'Fit', args: [null, null, null, null], ...shape() })
+  })
+}
+
+{
+  // An explicit destination's shape as the file wrote it, on a link's /Dest,
+  // in a GoTo action, in the outline and through a named destination. Object
+  // 6 is the number 7; object 7 a destination of a million entries.
+  const dests = [
+    ['[3 0 R /XYZ]', { argCount: 0, argKinds: [] }],
+    ['[3 0 R /XYZ 1]', { argCount: 1, argKinds: ['number'] }],
+    ['[3 0 R /XYZ null null null]', { argCount: 3, argKinds: ['null', 'null', 'null'] }],
+    ['[3 0 R /Fit null]', { argCount: 1, argKinds: ['null'] }],
+    ['[3 0 R /FitR 1 2 3 4 5]', { argCount: 5, argKinds: ['number', 'number', 'number', 'number', 'number'] }],
+    ['[3 0 R /XYZ (left) 2]', { argCount: 2, argKinds: ['other', 'number'] }],
+    ['[3 0 R /XYZ 6 0 R 2]', { argCount: 2, argKinds: ['number', 'number'], argIndirect: true }],
+    ['[1.5 /Fit]', { pageKind: 'other' }],
+    ['[/P /Fit]', { pageKind: 'other' }],
+    ['[0 /Fit]', { pageKind: 'integer' }],
+    ['[2.0 /Fit]', { pageKind: 'integer' }],
+    ['[6 0 R /Fit]', { pageKind: 'other' }],
+    ['[3 0 R (Fit)]', { fitKind: 'string' }],
+    ['[3 0 R 5]', { fitKind: 'other' }],
+    ['[3 0 R]', { argCount: 0, argKinds: [], fitKind: 'missing' }],
+    ['[]', { argCount: 0, argKinds: [], fitKind: 'missing', pageKind: 'missing' }],
+    ['7 0 R', { argCount: 999998, argKinds: Array(8).fill('number') }],
+  ]
+  const expected = dests.map(([, facts]) => ({ argCount: 0, argKinds: [], argIndirect: false, fitKind: 'name', pageKind: 'ref', ...facts }))
+  const shapeOf = (dest) => {
+    const { argCount, argKinds, argIndirect, fitKind, pageKind } = dest
+    return { argCount, argKinds, argIndirect, fitKind, pageKind }
+  }
+  const link = (rest) => `<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] ${rest} >>`
+  const first = 8
+  const pdf = buildPdf([
+    `<< /Type /Catalog /Pages 2 0 R /Outlines ${first + 2 * dests.length} 0 R /Dests << ${dests.map(([d], i) => `/d${i} ${d}`).join(' ')} >> >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [${dests.flatMap((_, i) => [`${first + 2 * i} 0 R`, `${first + 2 * i + 1} 0 R`]).join(' ')}] >>`,
+    '<< >>',
+    '<< >>',
+    '7',
+    `[3 0 R /XYZ ${'1 '.repeat(999998)}]`,
+    ...dests.flatMap(([d]) => [link(`/Dest ${d}`), link(`/A << /S /GoTo /D ${d} >>`)]),
+    `<< /Type /Outlines /First ${first + 2 * dests.length + 1} 0 R >>`,
+    ...dests.map(([d], i) => `<< /Title (T${i}) /Dest ${d} ${i + 1 < dests.length ? `/Next ${first + 2 * dests.length + 2 + i} 0 R` : ''} >>`),
+  ])
+  withPdf(pdf, (doc) => {
+    const { links } = takeJson(m._INK_Links_Page(doc, 0))
+    const outline = takeJson(m._INK_Outline(doc))
+    dests.forEach(([d], i) => {
+      assert.deepEqual(shapeOf(links[2 * i].dest), expected[i], `/Dest ${d}`)
+      assert.deepEqual(shapeOf(links[2 * i + 1].action.dest), expected[i], `GoTo ${d}`)
+      assert.deepEqual(shapeOf(outline.items[i].dest), expected[i], `outline ${d}`)
+      assert.deepEqual(shapeOf(namedDest(doc, `d${i}`)), expected[i], `named ${d}`)
+    })
+    // The values that were there before keep theirs.
+    assert.deepEqual(links[0].dest.args, [null, null, null, null])
+    assert.equal(links[0].dest.fit, 'XYZ')
+    assert.deepEqual(links[2 * 4].dest.args, [1, 2, 3, 4])
+  })
+}
+
+{
   // INK_Dest_Named with no name.
   const pdf = onePagePdf('', { mediaBox: letterBox, catalog: '/Dests << /old [3 0 R /Fit] >>' })
   withPdf(pdf, (doc) => {
@@ -3845,7 +4232,7 @@ m._INK_Json_Free(0)
     assert.equal(takeJson(m._INK_Dest_Named(doc, ptr, -1)), null, 'a negative len')
     assert.equal(takeJson(m._INK_Dest_Named(doc, 0, 3)), null, 'a NULL name')
     assert.equal(cString(m._INK_Dest_Named(doc, 0, 0)), 'null', 'the JSON text null')
-    assert.deepEqual(takeJson(m._INK_Dest_Named(doc, ptr, 3)), { page: 0, fit: 'Fit', args: [null, null, null, null] })
+    assert.deepEqual(takeJson(m._INK_Dest_Named(doc, ptr, 3)), { page: 0, pageRef: [3, 0], fit: 'Fit', args: [null, null, null, null], ...shape() })
     m._free(ptr)
   })
   assert.equal(m._INK_Dest_Named(0, 0, 0), 0, 'a NULL document')
