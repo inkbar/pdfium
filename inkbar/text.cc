@@ -16,6 +16,9 @@
 #include "core/fpdfapi/font/cpdf_font.h"
 #include "core/fpdfapi/page/cpdf_pageobject.h"
 #include "core/fpdfapi/page/cpdf_textobject.h"
+#include "core/fpdfapi/parser/cpdf_array.h"
+#include "core/fpdfapi/parser/cpdf_dictionary.h"
+#include "core/fpdfapi/parser/cpdf_number.h"
 #include "core/fxcrt/bytestring.h"
 #include "core/fxge/cfx_font.h"
 #include "core/fxge/cfx_standardfont.h"
@@ -50,6 +53,30 @@ bool IsTimes(const ByteString& name) {
           index.value() == CFX_StandardFont::kTimesOblique);
 }
 
+// The font descriptor's |key| divided by 1000, as the file gives it, or null
+// when there is no descriptor or the key is absent or not a number. A Type 0
+// font's descriptor is its descendant's.
+void AppendDescriptorMetric(std::string* out,
+                            const CPDF_Font* font,
+                            const char* key) {
+  RetainPtr<const CPDF_Dictionary> dict = font->GetFontDict();
+  if (dict && font->IsCIDFont()) {
+    RetainPtr<const CPDF_Array> descendants =
+        dict->GetArrayFor("DescendantFonts");
+    dict = descendants ? descendants->GetDictAt(0) : nullptr;
+  }
+  RetainPtr<const CPDF_Dictionary> descriptor =
+      dict ? dict->GetDictFor("FontDescriptor") : nullptr;
+  RetainPtr<const CPDF_Object> value =
+      descriptor ? descriptor->GetDirectObjectFor(key) : nullptr;
+  const CPDF_Number* number = ToNumber(value.Get());
+  if (number) {
+    inkbar::json::AppendNumber(out, number->GetNumber() / 1000.f);
+  } else {
+    out->append("null");
+  }
+}
+
 // One font table entry. Each property is the font descriptor's flag or, where
 // PDFium can tell, the face it loaded for the font (a standard font has no
 // descriptor).
@@ -75,6 +102,41 @@ void AppendFont(std::string* out, const CPDF_Font* font) {
   out->append(boolean(bold));
   out->append(",\"vertical\":");
   out->append(boolean(font->IsVertWriting()));
+  // In em units, as FPDFFont_GetAscent and FPDFFont_GetDescent give them at
+  // size 1. A Type 3 font's glyph space is its own, and PDFium fills its
+  // figures only once a glyph is drawn, so it gives none.
+  const int ascent = font->GetTypeAscent();
+  const int descent = font->GetTypeDescent();
+  const bool metrics = !font->IsType3Font() && (ascent != 0 || descent != 0);
+  out->append(",\"ascent\":");
+  if (metrics) {
+    inkbar::json::AppendNumber(out, ascent / 1000.f);
+  } else {
+    out->append("null");
+  }
+  out->append(",\"descent\":");
+  if (metrics) {
+    inkbar::json::AppendNumber(out, descent / 1000.f);
+  } else {
+    out->append("null");
+  }
+  out->append(",\"descriptorAscent\":");
+  AppendDescriptorMetric(out, font, "Ascent");
+  out->append(",\"descriptorDescent\":");
+  AppendDescriptorMetric(out, font, "Descent");
+  // The standard font PDFium draws it with: a Type 1 font of the standard 14
+  // with no font file. PDFium stores its canonical name as the base name.
+  out->append(",\"standard\":");
+  std::optional<CFX_StandardFont::Index> index =
+      font->IsStandardFont()
+          ? CFX_StandardFont::GetStandardFontIndex(name)
+          : std::nullopt;
+  if (index.has_value()) {
+    inkbar::json::AppendName(
+        out, CFX_StandardFont::GetCanonicalFontName(index.value()));
+  } else {
+    out->append("null");
+  }
   out->push_back('}');
 }
 

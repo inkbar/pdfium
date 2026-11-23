@@ -3519,7 +3519,23 @@ const spell = (codes) => String.fromCodePoint(...codes)
   near(hello.geometry[0][8], 72, 'origin x of H')
   assert.deepEqual(hello.flags, [0, 0, 0, 0, 0])
   assert.deepEqual(hello.fonts, [0, 0, 0, 0, 0])
-  assert.deepEqual(hello.fontTable, [{ name: 'Helvetica', fixedPitch: false, serif: false, italic: false, bold: false, vertical: false }])
+  // PDFium takes a standard font's ascent and descent from the face it loads
+  // for it, not from the font's metrics file (0.718 and -0.207 for Helvetica).
+  assert.deepEqual(hello.fontTable, [
+    {
+      name: 'Helvetica',
+      fixedPitch: false,
+      serif: false,
+      italic: false,
+      bold: false,
+      vertical: false,
+      ascent: 0.944999993,
+      descent: -0.224000007,
+      descriptorAscent: null,
+      descriptorDescent: null,
+      standard: 'Helvetica',
+    },
+  ])
 }
 
 {
@@ -3595,6 +3611,79 @@ const spell = (codes) => String.fromCodePoint(...codes)
   assert.equal(vertical.fontTable.length, 1)
   assert.equal(vertical.fontTable[0].name, 'InkJapan1')
   assert.equal(vertical.fontTable[0].vertical, true, 'an /Identity-V font is not vertical')
+  // The font descriptor's /Ascent 880 and /Descent -120.
+  assert.equal(vertical.fontTable[0].ascent, 0.879999995)
+  assert.equal(vertical.fontTable[0].descent, -0.119999997)
+  // A Type 0 font's descriptor is its descendant's.
+  assert.equal(vertical.fontTable[0].descriptorAscent, 0.879999995)
+  assert.equal(vertical.fontTable[0].descriptorDescent, -0.119999997)
+  assert.equal(vertical.fontTable[0].standard, null)
+}
+
+{
+  // An embedded TrueType font whose descriptor gives a positive /Descent:
+  // PDFium turns its own figure negative, the descriptor's is given as the
+  // file has it. A font with a file of its own is no standard font, whatever
+  // its name; an alias PDFium knows, such as TimesNewRoman, gives the
+  // standard name.
+  const ahem = readFileSync(fileURLToPath(new URL('../testing/resources/fonts/ahem/Ahem.ttf', import.meta.url)))
+  const page = (font, extra = []) =>
+    textOf(
+      buildPdf([
+        '<< /Type /Catalog /Pages 2 0 R >>',
+        '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>`,
+        streamObject('', 'BT /F1 12 Tf 72 700 Td (AB) Tj ET'),
+        font,
+        ...extra,
+      ]),
+    ).fontTable[0]
+  const embedded = page('<< /Type /Font /Subtype /TrueType /BaseFont /Helvetica /FirstChar 65 /LastChar 66 /Widths [1000 1000] /FontDescriptor 6 0 R >>', [
+    '<< /Type /FontDescriptor /FontName /Helvetica /Flags 32 /FontBBox [0 -200 1000 800] /ItalicAngle 0 /Ascent 800 /Descent 200 /CapHeight 800 /StemV 80 /FontFile2 7 0 R >>',
+    streamObject('', ahem),
+  ])
+  assert.equal(embedded.descriptorAscent, 0.800000012)
+  assert.equal(embedded.descriptorDescent, 0.200000003)
+  assert.equal(embedded.descent, -0.200000003)
+  assert.equal(embedded.standard, null)
+  const bold = page('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>')
+  assert.equal(bold.standard, 'Helvetica-Bold')
+  assert.equal(bold.descriptorAscent, null)
+  const times = page('<< /Type /Font /Subtype /Type1 /BaseFont /TimesNewRoman >>')
+  assert.equal(times.standard, 'Times-Roman', 'an alias of a standard font')
+  const notNumber = page('<< /Type /Font /Subtype /Type1 /BaseFont /Courier /FontDescriptor 6 0 R >>', [
+    '<< /Type /FontDescriptor /FontName /Courier /Flags 32 /Ascent /Tall >>',
+  ])
+  assert.equal(notNumber.descriptorAscent, null)
+  assert.equal(notNumber.descriptorDescent, null)
+  assert.equal(notNumber.standard, 'Courier')
+}
+
+// A letter page drawing |content| with a Type 3 font as /T3, object 5, whose
+// /Differences are |differences| and whose every glyph name in |names| draws
+// one procedure, object 6. |fontExtra| goes in the font dictionary, and
+// |extra| objects follow from 7.
+function type3Pdf(content, differences, names, { fontExtra = '', extra = [] } = {}) {
+  return buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Contents 4 0 R /Resources << /Font << /T3 5 0 R >> >> >>`,
+    streamObject('', content),
+    `<< /Type /Font /Subtype /Type3 /FontBBox [0 0 600 700] /FontMatrix [0.001 0 0 0.001 0 0] /CharProcs << ${names.map((n) => `/${n} 6 0 R`).join(' ')} >> /Encoding << /Type /Encoding /Differences [${differences}] >> /FirstChar 0 /LastChar 255 /Widths [${Array(256).fill(600).join(' ')}] /Resources << >> ${fontExtra} >>`,
+    streamObject('', '600 0 0 0 600 700 d1 0 0 600 700 re f'),
+    ...extra,
+  ])
+}
+
+{
+  // A Type 3 font has no ascent or descent.
+  const text = textOf(type3Pdf('BT /T3 12 Tf 72 700 Td (A) Tj ET', '65 /A', ['A']))
+  assert.equal(text.fontTable.length, 1)
+  assert.equal(text.fontTable[0].ascent, null)
+  assert.equal(text.fontTable[0].descent, null)
+  assert.equal(text.fontTable[0].descriptorAscent, null)
+  assert.equal(text.fontTable[0].descriptorDescent, null)
+  assert.equal(text.fontTable[0].standard, null)
 }
 
 // INK_Links_Page, INK_Outline and INK_Dest_Named: what the file says about a

@@ -45,7 +45,18 @@ const unsigned short* INK_Text_Fonts(const InkText* t);
 
 // UTF-8 JSON, owned by |t|:
 // [ { "name": "Helvetica", "fixedPitch": false, "serif": false,
-//     "italic": false, "bold": false, "vertical": false } ]
+//     "italic": false, "bold": false, "vertical": false,
+//     "ascent": 0.945, "descent": -0.224, "descriptorAscent": null,
+//     "descriptorDescent": null, "standard": "Helvetica" } ]
+// "ascent" and "descent" are PDFium's figures in em units (FPDFFont_GetAscent
+// and FPDFFont_GetDescent at size 1). Both are null for a Type 3 font and for
+// a font whose figures are both 0. "descriptorAscent" and "descriptorDescent"
+// are the font descriptor's /Ascent and /Descent divided by 1000, sign as the
+// file gives it; null when there is no descriptor or the key is absent or not
+// a number. A Type 0 font's descriptor is its descendant's. "standard" is the
+// name of the standard 14 font PDFium draws the font with (a Type 1 font of
+// the standard 14 with no font file), else null. None of these is checked: a
+// file can give any values, a positive descent included.
 const char* INK_Text_FontTable(const InkText* t);
 
 // Frees |t|. NULL is a no-op.
