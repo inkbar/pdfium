@@ -27,6 +27,7 @@
 #include "core/fxge/fx_font.h"
 #include "fpdfsdk/cpdfsdk_helpers.h"
 #include "inkbar/json.h"
+#include "public/epdf_view.h"
 #include "public/fpdf_text.h"
 
 struct InkText {
@@ -288,7 +289,10 @@ InkText* INK_Text_Page(FPDF_DOCUMENT doc, int page_index) {
   if (!doc || page_index < 0 || page_index >= FPDF_GetPageCount(doc)) {
     return nullptr;
   }
-  FPDF_PAGE page = FPDF_LoadPage(doc, page_index);
+  // Loaded as if /Rotate were 0: PDFium orders a page's text in display
+  // space, so on a turned page it would read across the lines. Boxes and
+  // origins are in user space either way.
+  FPDF_PAGE page = EPDF_LoadPageNormalized(doc, page_index, nullptr);
   if (!page) {
     return nullptr;
   }

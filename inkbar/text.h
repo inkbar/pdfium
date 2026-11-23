@@ -16,6 +16,8 @@ extern "C" {
 typedef struct InkText InkText;
 
 // The page's characters as PDFium's text page reports them, in its order.
+// The page is loaded as if its /Rotate were 0, so text is in the order it
+// has on the unturned page.
 // Text inside form XObjects is included; text in annotation appearances is
 // not. NULL when the page does not exist or cannot be loaded, and for a page
 // with more than 65,535 fonts. A page with no text gives a valid InkText with

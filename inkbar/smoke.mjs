@@ -3659,6 +3659,23 @@ const spell = (codes) => String.fromCodePoint(...codes)
   assert.equal(notNumber.standard, 'Courier')
 }
 
+{
+  // /Rotate does not change the text: the same lines, a matrix-turned word and
+  // a form XObject read in the same order with the same boxes, origins and
+  // matrices on a page turned 0, 90, 180 and 270 degrees.
+  const content = [
+    'BT /F1 12 Tf 72 700 Td (First line) Tj 0 -20 Td (Second line) Tj 0 -20 Td (Third line) Tj ET',
+    'BT /F1 12 Tf 0 1 -1 0 400 500 Tm (Up) Tj ET',
+    'q 1 0 0 1 100 100 cm /Fm0 Do Q',
+  ].join('\n')
+  const form = streamObject('/Type /XObject /Subtype /Form /BBox [0 0 200 50] /Resources << /Font << /F1 5 0 R >> >>', 'BT /F1 10 Tf 5 5 Td (Inside) Tj ET')
+  const [upright, ...turned] = [0, 90, 180, 270].map((rotate) =>
+    textOf(onePagePdf(content, { mediaBox: letterBox, page: `/Rotate ${rotate}`, resources: '/XObject << /Fm0 6 0 R >>' }, [form])),
+  )
+  assert.ok(spell(upright.codes).startsWith('First line\r\nSecond line\r\nThird line'), JSON.stringify(spell(upright.codes)))
+  turned.forEach((text, i) => assert.deepEqual(text, upright, `the text of a page turned ${(i + 1) * 90} degrees`))
+}
+
 // A letter page drawing |content| with a Type 3 font as /T3, object 5, whose
 // /Differences are |differences| and whose every glyph name in |names| draws
 // one procedure, object 6. |fontExtra| goes in the font dictionary, and
