@@ -65,7 +65,7 @@ The checkout is mounted into the container. `scripts/embedpdf-runtime/build-targ
 
 The binary is single-threaded.
 
-Current size of `inkbar-pdfium.wasm`: 6,981,863 bytes raw, 2,945,718 bytes gzipped at level 9. It exports 105 functions. The budget is 3,256,192 bytes gzipped.
+Current size of `inkbar-pdfium.wasm`: 6,988,240 bytes raw, 2,947,725 bytes gzipped at level 9. It exports 106 functions. The budget is 3,256,192 bytes gzipped.
 
 ## The redaction check
 
