@@ -24,6 +24,7 @@
 #include "core/fpdfapi/parser/cpdf_name.h"
 #include "core/fpdfapi/parser/cpdf_number.h"
 #include "core/fpdfapi/parser/cpdf_object.h"
+#include "core/fpdfapi/parser/cpdf_reference.h"
 #include "core/fpdfapi/parser/cpdf_string.h"
 #include "core/fpdfdoc/cpdf_action.h"
 #include "core/fpdfdoc/cpdf_dest.h"
@@ -86,6 +87,25 @@ bool AllFiniteNumbers(const CPDF_Array* array) {
   return true;
 }
 
+// [number, generation] of the object an explicit destination's first entry
+// refers to, or null when that entry is not a reference. PDFium keeps no
+// generation in a reference, so it is that of the object the file holds under
+// the number, 0 when there is none.
+void AppendPageRef(std::string* out, const CPDF_Array* dest) {
+  RetainPtr<const CPDF_Object> first = dest->GetObjectAt(0);
+  const CPDF_Reference* ref = first ? first->AsReference() : nullptr;
+  if (!ref) {
+    out->append("null");
+    return;
+  }
+  RetainPtr<const CPDF_Object> target = ref->GetDirect();
+  out->push_back('[');
+  out->append(std::to_string(ref->GetRefObjNum()));
+  out->push_back(',');
+  out->append(std::to_string(target ? target->GetGenNum() : 0));
+  out->push_back(']');
+}
+
 // A local destination names a page of this file. A remote go-to's or a
 // launch's /D names a page of another file, and its number is kept as it is.
 enum class Where { kLocal, kRemote };
@@ -115,6 +135,9 @@ void AppendDest(std::string* out,
     page = -1;
   }
   out->append(std::to_string(page));
+  out->push_back(',');
+  AppendKey(out, "pageRef");
+  AppendPageRef(out, array);
   out->push_back(',');
   AppendKey(out, "fit");
   const int mode = explicit_dest.GetZoomMode();
@@ -222,7 +245,13 @@ void AppendAction(std::string* out,
     out->push_back(',');
     AppendKey(out, "uriHex");
     RetainPtr<const CPDF_Object> uri = EntryFor(action, "URI");
-    AppendHex(out, uri && uri->IsString() ? uri->GetString() : ByteString());
+    const bool readable = uri && (uri->IsString() || uri->IsName());
+    AppendHex(out, readable ? uri->GetString() : ByteString());
+    out->push_back(',');
+    AppendKey(out, "uriKind");
+    out->append(!readable          ? "null"
+                : uri->IsString() ? "\"string\""
+                                  : "\"name\"");
   } else if (s == "GoTo") {
     out->push_back(',');
     AppendKey(out, "dest");
@@ -231,6 +260,13 @@ void AppendAction(std::string* out,
     out->push_back(',');
     AppendKey(out, "fileHex");
     AppendFile(out, action);
+    out->push_back(',');
+    AppendKey(out, "fileKind");
+    RetainPtr<const CPDF_Object> file = EntryFor(action, "F");
+    out->append(!file                 ? "null"
+                : file->IsString()     ? "\"string\""
+                : file->IsDictionary() ? "\"spec\""
+                                       : "null");
     out->push_back(',');
     AppendKey(out, "dest");
     AppendDest(out, doc, EntryFor(action, "D").Get(), Where::kRemote);
@@ -269,6 +305,7 @@ void AppendAnnotEntry(std::string* out,
                       size_t index,
                       const CPDF_Dictionary* annot,
                       bool rect_ok,
+                      bool has_quads,
                       bool quads_ok) {
   out->push_back('{');
   AppendKey(out, "index");
@@ -283,8 +320,14 @@ void AppendAnnotEntry(std::string* out,
   AppendKey(out, "obj");
   out->append(std::to_string(annot->GetObjNum()));
   out->push_back(',');
+  AppendKey(out, "generation");
+  out->append(std::to_string(annot->GetGenNum()));
+  out->push_back(',');
   AppendKey(out, "rectOk");
   out->append(Boolean(rect_ok));
+  out->push_back(',');
+  AppendKey(out, "hasQuads");
+  out->append(Boolean(has_quads));
   out->push_back(',');
   AppendKey(out, "quadsOk");
   out->append(Boolean(quads_ok));
@@ -333,7 +376,16 @@ void AppendLink(std::string* out,
   }
   out->push_back(',');
   AppendKey(out, "dest");
-  AppendDest(out, doc, EntryFor(annot, "Dest").Get(), Where::kLocal);
+  RetainPtr<const CPDF_Object> dest = EntryFor(annot, "Dest");
+  AppendDest(out, doc, dest.Get(), Where::kLocal);
+  // /Dest is there, null included, but is no destination: not a string, a
+  // name or an array.
+  if (annot->KeyExist("Dest") &&
+      !(dest && (dest->IsString() || dest->IsName() || dest->IsArray()))) {
+    out->push_back(',');
+    AppendKey(out, "destInvalid");
+    out->append("true");
+  }
   out->push_back(',');
   AppendKey(out, "action");
   RetainPtr<const CPDF_Object> a = EntryFor(annot, "A");
@@ -459,7 +511,8 @@ char* INK_Links_Page(FPDF_DOCUMENT doc, int page_index) {
       annots_json.push_back(',');
     }
     first_annot = false;
-    AppendAnnotEntry(&annots_json, i, annot.Get(), rect_ok, quads_ok);
+    AppendAnnotEntry(&annots_json, i, annot.Get(), rect_ok, !!quads_object,
+                     quads_ok);
 
     if (annot->GetNameFor("Subtype") != "Link") {
       continue;

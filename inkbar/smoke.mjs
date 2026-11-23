@@ -3826,13 +3826,13 @@ m._INK_Json_Free(0)
   withPdf(pdf, (doc) => {
     const { annots, links } = takeJson(m._INK_Links_Page(doc, 0))
     assert.deepEqual(annots, [
-      { index: 0, subtype: 'Square', flags: 2, obj: 6, rectOk: true, quadsOk: true },
-      { index: 1, subtype: 'Link', flags: 0, obj: 7, rectOk: true, quadsOk: true },
-      { index: 2, subtype: 'Link', flags: 0, obj: 0, rectOk: true, quadsOk: true },
+      { index: 0, subtype: 'Square', flags: 2, obj: 6, generation: 0, rectOk: true, hasQuads: false, quadsOk: true },
+      { index: 1, subtype: 'Link', flags: 0, obj: 7, generation: 0, rectOk: true, hasQuads: false, quadsOk: true },
+      { index: 2, subtype: 'Link', flags: 0, obj: 0, generation: 0, rectOk: true, hasQuads: false, quadsOk: true },
     ])
     assert.deepEqual(links, [
-      { index: 1, rect: [72, 700, 200, 720], quads: null, dest: { page: 0, fit: 'XYZ', args: [72, 700, null, null] }, action: null, aa: null },
-      { index: 2, rect: [72, 600, 200, 620], quads: null, dest: null, action: { s: 'URI', uriHex: hex('https://example.com/a') }, aa: null },
+      { index: 1, rect: [72, 700, 200, 720], quads: null, dest: { page: 0, pageRef: [3, 0], fit: 'XYZ', args: [72, 700, null, null] }, action: null, aa: null },
+      { index: 2, rect: [72, 600, 200, 620], quads: null, dest: null, action: { s: 'URI', uriHex: hex('https://example.com/a'), uriKind: 'string' }, aa: null },
     ])
     assert.equal(Buffer.from(links[1].action.uriHex, 'hex').toString('latin1'), 'https://example.com/a')
     assert.equal(m._INK_Links_Page(doc, 1), 0, 'page 1 of a one-page file')
@@ -3883,19 +3883,19 @@ m._INK_Json_Free(0)
       annots.map((_, i) => i !== 11),
     )
     assert.equal(links.length, 13)
-    const fit = (page) => ({ page, fit: 'Fit', args: [null, null, null, null] })
-    assert.deepEqual(links[0].action, { s: 'URI', uriHex: hex('https://example.com/b') }, '/A beside /Dest')
-    assert.deepEqual(links[0].dest, fit(0), '/Dest beside /A')
+    const fit = (page, pageRef) => ({ page, pageRef, fit: 'Fit', args: [null, null, null, null] })
+    assert.deepEqual(links[0].action, { s: 'URI', uriHex: hex('https://example.com/b'), uriKind: 'string' }, '/A beside /Dest')
+    assert.deepEqual(links[0].dest, fit(0, [3, 0]), '/Dest beside /A')
     assert.equal(links[1].action, null, '/A 5')
     assert.deepEqual(links[2].rect, [0, 0, 0, 0], 'no /Rect')
-    assert.deepEqual(links[3].action, { s: 'GoToR', fileHex: hex('other.pdf'), dest: { nameHex: hex('chapter') }, newWindow: true })
-    assert.deepEqual(links[4].action, { s: 'Launch', fileHex: hex('app.exe'), dest: null, newWindow: null })
+    assert.deepEqual(links[3].action, { s: 'GoToR', fileHex: hex('other.pdf'), fileKind: 'string', dest: { nameHex: hex('chapter') }, newWindow: true })
+    assert.deepEqual(links[4].action, { s: 'Launch', fileHex: hex('app.exe'), fileKind: 'spec', dest: null, newWindow: null })
     assert.deepEqual(links[5].action, { s: 'Named', name: 'NextPage' })
     assert.deepEqual(links[6].action, { s: 'JavaScript', js: "app.launchURL('https://example.com/c')" })
     assert.deepEqual(links[7].action, { s: 'JavaScript', js: 'window.open("https://example.com/d")\n' })
     assert.equal(links[8].action, null)
-    assert.deepEqual(links[8].aa, { s: 'URI', uriHex: hex('https://example.com/e') }, '/AA /U')
-    assert.deepEqual(links[9].dest, fit(-1), 'a destination on the catalog')
+    assert.deepEqual(links[8].aa, { s: 'URI', uriHex: hex('https://example.com/e'), uriKind: 'string' }, '/AA /U')
+    assert.deepEqual(links[9].dest, fit(-1, [1, 0]), 'a destination on the catalog')
     assert.deepEqual(links[10].quads, [0, 10, 10, 10, 0, 0, 10, 0])
     assert.deepEqual(links[10].action, { s: 'SubmitForm' })
     assert.equal(links[11].quads, null, 'malformed /QuadPoints')
@@ -4032,7 +4032,7 @@ m._INK_Json_Free(0)
         [0, 'Second'],
       ],
     )
-    assert.deepEqual(outline.items[0], { depth: 0, title: 'Cover', flags: 2, count: -1, dest: { page: 0, fit: 'XYZ', args: [0, 792, null, null] }, action: null })
+    assert.deepEqual(outline.items[0], { depth: 0, title: 'Cover', flags: 2, count: -1, dest: { page: 0, pageRef: [3, 0], fit: 'XYZ', args: [0, 792, null, null] }, action: null })
     assert.equal(outline.truncated, true, 'a loop does not truncate')
   })
 }
@@ -4065,12 +4065,12 @@ m._INK_Json_Free(0)
     assert.deepEqual(takeJson(m._INK_Outline(doc)), {
       items: [
         { depth: 0, title: 'Say "hi"\n\\ back\t', flags: 3, count: -2, dest: { nameHex: '636861707465722d32' }, action: null },
-        { depth: 0, title: 'ét\u{1f600}', flags: 0, count: 0, dest: null, action: { s: 'URI', uriHex: hex('https://example.com/f') } },
+        { depth: 0, title: 'ét\u{1f600}', flags: 0, count: 0, dest: null, action: { s: 'URI', uriHex: hex('https://example.com/f'), uriKind: 'string' } },
       ],
       truncated: false,
     })
-    assert.deepEqual(namedDest(doc, 'chapter-2'), { page: 0, fit: 'FitH', args: [500, null, null, null] })
-    assert.deepEqual(namedDest(doc, 'old'), { page: 0, fit: 'Fit', args: [null, null, null, null] })
+    assert.deepEqual(namedDest(doc, 'chapter-2'), { page: 0, pageRef: [3, 0], fit: 'FitH', args: [500, null, null, null] })
+    assert.deepEqual(namedDest(doc, 'old'), { page: 0, pageRef: [3, 0], fit: 'Fit', args: [null, null, null, null] })
     assert.equal(namedDest(doc, 'missing'), null)
   })
 }
@@ -4112,6 +4112,57 @@ m._INK_Json_Free(0)
 }
 
 {
+  // Facts a reader needs to treat a link as PDF.js does: whether /QuadPoints is
+  // there, a generation other than 0, a /Dest that is no destination beside
+  // /AA, whether /F was a string or a file specification, a /URI written as a
+  // name, and the reference a destination's page entry is.
+  const link = (rest) => `<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] ${rest} >>`
+  const body = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [4 0 R 5 0 R 6 0 R 7 0 R 8 0 R 9 3 R 10 0 R 11 0 R] >>`,
+    '<< /Type /Annot /Subtype /Highlight /Rect [0 0 10 10] >>',
+    '<< /Type /Annot /Subtype /Highlight /Rect [0 0 10 10] /QuadPoints 5 >>',
+    link('/Dest 5 /AA << /U << /S /URI /URI (https://example.com/g) >> >>'),
+    link('/Dest null /AA << /U << /S /URI /URI (https://example.com/g) >> >>'),
+    link('/A << /S /GoToR /F << /Type /Filespec /UF (spec.pdf) >> /D [3 /Fit] >>'),
+    link('/A << /S /URI /URI /https:#2F#2Fexample.com#2Fh >>'),
+    link('/A << /S /URI /URI 7 >>'),
+    link('/Dest [3 0 R /Fit]'),
+  ])
+  // Object 9 written with generation 3, in its header and in the xref table.
+  const lines = body.toString('latin1').replace('\n9 0 obj\n', '\n9 3 obj\n').split('\n')
+  const entry = lines.indexOf('0000000000 65535 f ') + 9
+  lines[entry] = lines[entry].replace(' 00000 n ', ' 00003 n ')
+  const pdf = Buffer.from(lines.join('\n'), 'latin1')
+  withPdf(pdf, (doc) => {
+    const { annots, links } = takeJson(m._INK_Links_Page(doc, 0))
+    assert.deepEqual(
+      annots.map((a) => a.hasQuads),
+      [false, true, false, false, false, false, false, false],
+    )
+    assert.deepEqual(
+      annots.map((a) => a.quadsOk),
+      [true, false, true, true, true, true, true, true],
+    )
+    assert.deepEqual(
+      annots.map((a) => [a.obj, a.generation]),
+      [4, 5, 6, 7, 8, 9, 10, 11].map((n) => [n, n === 9 ? 3 : 0]),
+    )
+    assert.equal(links[0].dest, null)
+    assert.equal(links[0].destInvalid, true, '/Dest 5')
+    assert.equal(links[1].destInvalid, true, '/Dest null')
+    assert.equal(links[5].destInvalid, undefined, 'a good /Dest')
+    assert.equal(links[3].destInvalid, undefined, 'no /Dest')
+    assert.deepEqual(links[0].aa, { s: 'URI', uriHex: hex('https://example.com/g'), uriKind: 'string' })
+    assert.deepEqual(links[2].action, { s: 'GoToR', fileHex: hex('spec.pdf'), fileKind: 'spec', dest: { page: 3, pageRef: null, fit: 'Fit', args: [null, null, null, null] }, newWindow: null })
+    assert.deepEqual(links[3].action, { s: 'URI', uriHex: hex('https://example.com/h'), uriKind: 'name' })
+    assert.deepEqual(links[4].action, { s: 'URI', uriHex: '', uriKind: null })
+    assert.deepEqual(links[5].dest, { page: 0, pageRef: [3, 0], fit: 'Fit', args: [null, null, null, null] })
+  })
+}
+
+{
   // INK_Dest_Named with no name.
   const pdf = onePagePdf('', { mediaBox: letterBox, catalog: '/Dests << /old [3 0 R /Fit] >>' })
   withPdf(pdf, (doc) => {
@@ -4120,7 +4171,7 @@ m._INK_Json_Free(0)
     assert.equal(takeJson(m._INK_Dest_Named(doc, ptr, -1)), null, 'a negative len')
     assert.equal(takeJson(m._INK_Dest_Named(doc, 0, 3)), null, 'a NULL name')
     assert.equal(cString(m._INK_Dest_Named(doc, 0, 0)), 'null', 'the JSON text null')
-    assert.deepEqual(takeJson(m._INK_Dest_Named(doc, ptr, 3)), { page: 0, fit: 'Fit', args: [null, null, null, null] })
+    assert.deepEqual(takeJson(m._INK_Dest_Named(doc, ptr, 3)), { page: 0, pageRef: [3, 0], fit: 'Fit', args: [null, null, null, null] })
     m._free(ptr)
   })
   assert.equal(m._INK_Dest_Named(0, 0, 0), 0, 'a NULL document')
