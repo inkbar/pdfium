@@ -183,9 +183,15 @@ ByteStringView CPDF_ToUnicodeMap::HandleBeginBFChar(
   };
   std::vector<CodeWord> code_words;
 
+  // Inkbar: the announced count only sizes the reservation. As PDF.js does,
+  // the section holds the entries up to its end keyword, so a wrong count does
+  // not discard it; kOutOfSpecBFLimit still bounds the entries kept.
   const int raw_count = StringToInt(previous_word);
-  bool is_valid = raw_count >= 0 && raw_count <= kOutOfSpecBFLimit;
-  const size_t expected_count = is_valid ? static_cast<size_t>(raw_count) : 0;
+  bool is_valid = true;
+  const size_t expected_count =
+      raw_count >= 0 && raw_count <= kOutOfSpecBFLimit
+          ? static_cast<size_t>(raw_count)
+          : 0;
   code_words.reserve(expected_count);
 
   ByteStringView word;
@@ -207,12 +213,14 @@ ByteStringView CPDF_ToUnicodeMap::HandleBeginBFChar(
     word = parser.GetWord();
     code_words.emplace_back(CodeWord{code.value(), word});
 
-    if (code_words.size() > expected_count) {
+    // Inkbar: bounded by the limit, not by the announced count.
+    if (code_words.size() > static_cast<size_t>(kOutOfSpecBFLimit)) {
       is_valid = false;
     }
   }
 
-  if (is_valid && code_words.size() == expected_count) {
+  // Inkbar: kept whatever the announced count.
+  if (is_valid) {
     for (const auto& entry : code_words) {
       SetCode(entry.code, StringToWideString(entry.word));
     }
@@ -240,9 +248,15 @@ ByteStringView CPDF_ToUnicodeMap::HandleBeginBFRange(
                              MultimapMultiDestRange>;
   std::vector<Range> ranges;
 
+  // Inkbar: the announced count only sizes the reservation. As PDF.js does,
+  // the section holds the entries up to its end keyword, so a wrong count does
+  // not discard it; kOutOfSpecBFLimit still bounds the entries kept.
   const int raw_count = StringToInt(previous_word);
-  bool is_valid = raw_count >= 0 && raw_count <= kOutOfSpecBFLimit;
-  const size_t expected_count = is_valid ? static_cast<size_t>(raw_count) : 0;
+  bool is_valid = true;
+  const size_t expected_count =
+      raw_count >= 0 && raw_count <= kOutOfSpecBFLimit
+          ? static_cast<size_t>(raw_count)
+          : 0;
   ranges.reserve(expected_count);
 
   ByteStringView word;
@@ -287,7 +301,8 @@ ByteStringView CPDF_ToUnicodeMap::HandleBeginBFRange(
       }
       ranges.push_back(std::move(range));
 
-      if (ranges.size() > expected_count) {
+      // Inkbar: bounded by the limit, not by the announced count.
+      if (ranges.size() > static_cast<size_t>(kOutOfSpecBFLimit)) {
         is_valid = false;
         continue;
       }
@@ -318,12 +333,14 @@ ByteStringView CPDF_ToUnicodeMap::HandleBeginBFRange(
       ranges.push_back(std::move(range));
     }
 
-    if (ranges.size() > expected_count) {
+    // Inkbar: bounded by the limit, not by the announced count.
+    if (ranges.size() > static_cast<size_t>(kOutOfSpecBFLimit)) {
       is_valid = false;
     }
   }
 
-  if (is_valid && ranges.size() == expected_count) {
+  // Inkbar: kept whatever the announced count.
+  if (is_valid) {
     for (const auto& entry : ranges) {
       if (std::holds_alternative<CodeWordRange>(entry)) {
         const auto& range = std::get<CodeWordRange>(entry);

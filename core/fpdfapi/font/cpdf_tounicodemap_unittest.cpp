@@ -79,26 +79,18 @@ TEST(CPDFToUnicodeMapTest, HandleBeginBFCharRejectsInvalidCidValues) {
   }
 }
 
+// Inkbar: a section whose announced count is wrong is read to its end
+// keyword, as PDF.js reads it, so both entries map.
 TEST(CPDFToUnicodeMapTest, HandleBeginBFCharBadCount) {
-  {
-    static constexpr uint8_t kInput1[] =
-        "1 beginbfchar<1><0041><2><0042>endbfchar";
-    auto stream = pdfium::MakeRetain<CPDF_Stream>(kInput1);
+  for (const char* input : {"1 beginbfchar<1><0041><2><0042>endbfchar",
+                            "3 beginbfchar<1><0041><2><0042>endbfchar"}) {
+    auto stream =
+        pdfium::MakeRetain<CPDF_Stream>(ByteStringView(input).unsigned_span());
     CPDF_ToUnicodeMap map(stream);
-    EXPECT_EQ(0u, map.ReverseLookup(0x0041));
-    EXPECT_EQ(0u, map.ReverseLookup(0x0042));
-    EXPECT_EQ(0u, map.GetUnicodeCountByCharcodeForTesting(1u));
-    EXPECT_EQ(0u, map.GetUnicodeCountByCharcodeForTesting(2u));
-  }
-  {
-    static constexpr uint8_t kInput2[] =
-        "3 beginbfchar<1><0041><2><0042>endbfchar";
-    auto stream = pdfium::MakeRetain<CPDF_Stream>(kInput2);
-    CPDF_ToUnicodeMap map(stream);
-    EXPECT_EQ(0u, map.ReverseLookup(0x0041));
-    EXPECT_EQ(0u, map.ReverseLookup(0x0042));
-    EXPECT_EQ(0u, map.GetUnicodeCountByCharcodeForTesting(1u));
-    EXPECT_EQ(0u, map.GetUnicodeCountByCharcodeForTesting(2u));
+    EXPECT_EQ(1u, map.ReverseLookup(0x0041));
+    EXPECT_EQ(2u, map.ReverseLookup(0x0042));
+    EXPECT_EQ(1u, map.GetUnicodeCountByCharcodeForTesting(1u));
+    EXPECT_EQ(1u, map.GetUnicodeCountByCharcodeForTesting(2u));
   }
 }
 
@@ -286,29 +278,24 @@ TEST(CPDFToUnicodeMapTest, HandleBeginBFRangeRejectsMismatchedBracket) {
   EXPECT_EQ(0u, map.GetUnicodeCountByCharcodeForTesting(3u));
 }
 
+// Inkbar: a section whose announced count is wrong is read to its end
+// keyword, as PDF.js reads it, so it maps as the good count below does.
 TEST(CPDFToUnicodeMapTest, HandleBeginBFRangeBadCount) {
-  {
-    static constexpr uint8_t kInput1[] =
-        "1 beginbfrange<1><2><0040><4><5><0050>endbfrange";
-    auto stream = pdfium::MakeRetain<CPDF_Stream>(kInput1);
+  for (const char* input :
+       {"1 beginbfrange<1><2><0040><4><5><0050>endbfrange",
+        "3 beginbfrange<1><2><0040><4><5><0050>endbfrange"}) {
+    auto stream =
+        pdfium::MakeRetain<CPDF_Stream>(ByteStringView(input).unsigned_span());
     CPDF_ToUnicodeMap map(stream);
-    for (wchar_t unicode = 0x0039; unicode < 0x0053; ++unicode) {
-      EXPECT_EQ(0u, map.ReverseLookup(unicode));
-    }
-    for (uint32_t charcode = 0; charcode < 7; ++charcode) {
+    EXPECT_EQ(1u, map.ReverseLookup(0x0040));
+    EXPECT_EQ(2u, map.ReverseLookup(0x0041));
+    EXPECT_EQ(4u, map.ReverseLookup(0x0050));
+    EXPECT_EQ(5u, map.ReverseLookup(0x0051));
+    for (uint32_t charcode : {0u, 3u, 6u}) {
       EXPECT_EQ(0u, map.GetUnicodeCountByCharcodeForTesting(charcode));
     }
-  }
-  {
-    static constexpr uint8_t kInput2[] =
-        "3 beginbfrange<1><2><0040><4><5><0050>endbfrange";
-    auto stream = pdfium::MakeRetain<CPDF_Stream>(kInput2);
-    CPDF_ToUnicodeMap map(stream);
-    for (wchar_t unicode = 0x0039; unicode < 0x0053; ++unicode) {
-      EXPECT_EQ(0u, map.ReverseLookup(unicode));
-    }
-    for (uint32_t charcode = 0; charcode < 7; ++charcode) {
-      EXPECT_EQ(0u, map.GetUnicodeCountByCharcodeForTesting(charcode));
+    for (uint32_t charcode : {1u, 2u, 4u, 5u}) {
+      EXPECT_EQ(1u, map.GetUnicodeCountByCharcodeForTesting(charcode));
     }
   }
 }
