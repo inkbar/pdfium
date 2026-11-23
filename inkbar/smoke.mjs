@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 105)
+assert.equal(names.length, 106)
 
 const m = await createModule()
 for (const name of names) {
@@ -3476,6 +3476,7 @@ function pageText(doc, index, mod = m) {
     flags: [...bytes(mod._INK_Text_Flags(t), 1)],
     fonts: Array.from({ length: n }, (_, i) => fontsBytes.readUInt16LE(i * 2)),
     fontTable: JSON.parse(cString(mod._INK_Text_FontTable(t), mod)),
+    truncated: mod._INK_Text_Truncated(t),
   }
   mod._INK_Text_Free(t)
   return result
@@ -3558,6 +3559,35 @@ const spell = (codes) => String.fromCodePoint(...codes)
   m._free(opened.buf)
   assert.equal(m._INK_Text_Page(0, 0), 0, 'a NULL document')
   m._INK_Text_Free(0)
+  assert.equal(m._INK_Text_Truncated(0), 0, 'NULL is truncated')
+  assert.equal(empty.truncated, 0, 'a page with no text is truncated')
+}
+
+{
+  // A page of 1,001,000 characters gives the first 1,000,000 and says so; one
+  // of exactly 1,000,000 gives them all. PDFium keeps at most 32,767
+  // characters of one string, so the page shows strings of 1,000.
+  const read = (strings) =>
+    withDoc(onePagePdf(`BT /F1 1 Tf 0 0 Td ${strings.map((text) => `(${text}) Tj`).join(' ')} ET`, { mediaBox: letterBox }), (doc) => {
+      const t = m._INK_Text_Page(doc, 0)
+      assert.notEqual(t, 0)
+      const count = m._INK_Text_Count(t)
+      const codes = new Uint32Array(m.HEAPU8.slice(m._INK_Text_Codes(t), m._INK_Text_Codes(t) + count * 4).buffer)
+      const truncated = m._INK_Text_Truncated(t)
+      m._INK_Text_Free(t)
+      return { count, codes, truncated }
+    })
+  const thousand = Array(1000).fill('a'.repeat(1000))
+  const over = read([...thousand, 'b'.repeat(1000)])
+  assert.equal(over.count, 1000000)
+  assert.equal(over.truncated, 1)
+  assert.ok(
+    over.codes.every((c) => c === 97),
+    'the characters kept are not the first ones',
+  )
+  const full = read(thousand)
+  assert.equal(full.count, 1000000)
+  assert.equal(full.truncated, 0)
 }
 
 {
@@ -3871,6 +3901,99 @@ m._INK_Json_Free(0)
     assert.equal(links[11].quads, null, 'malformed /QuadPoints')
     assert.deepEqual(links[12].action, { s: 'GoTo', dest: { nameHex: hex('chapter-2') } })
   })
+}
+
+{
+  // A script is cut where what it writes inside its JSON string, UTF-8 with
+  // escapes, would pass 4,096 bytes, at a character's end, and the scripts of
+  // one page's links write at most 1,048,576 such bytes in all.
+  const PAGE_SCRIPTS = 1048576
+  // The bytes a script writes inside its JSON string, as json.h escapes it.
+  const written = (text) =>
+    [...text].reduce((sum, ch) => {
+      const c = ch.codePointAt(0)
+      if (ch === '"' || ch === '\\') return sum + 2
+      if (c < 0x20 || c === 0x7f) return sum + 6
+      return sum + Buffer.byteLength(ch)
+    }, 0)
+  const scriptPage = (annots, objects) =>
+    buildPdf([
+      '<< /Type /Catalog /Pages 2 0 R >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [${annots.map((n) => `${n} 0 R`).join(' ')}] >>`,
+      ...objects,
+    ])
+  const readLinks = (pdf) =>
+    withPdf(pdf, (doc) => {
+      const ptr = m._INK_Links_Page(doc, 0)
+      const text = cString(ptr)
+      m._INK_Json_Free(ptr)
+      assert.ok(Buffer.byteLength(text) < 16 * 1024 * 1024, `${Buffer.byteLength(text)} bytes of JSON`)
+      return JSON.parse(text).links
+    })
+  const js = (script) => `<< /S /JavaScript /JS ${script} 0 R >>`
+  const link = (rest) => `<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] ${rest} >>`
+
+  // A 1 MB script on 2,000 links, after one of 'a' and 3,000 é (0xE9 in
+  // PDFDocEncoding, two bytes in UTF-8): that one is cut after 2,047 é, at
+  // 4,095 bytes; 255 more fill the page's budget but for one byte, one 'a';
+  // the rest are empty.
+  {
+    const links = readLinks(
+      scriptPage(
+        Array.from({ length: 2001 }, (_, i) => i + 6),
+        [
+          streamObject('', 'a'.repeat(1 << 20)),
+          streamObject('', Buffer.concat([Buffer.from('a'), Buffer.alloc(3000, 0xe9)])),
+          link(`/A ${js(5)}`),
+          ...Array.from({ length: 2000 }, () => link(`/A ${js(4)}`)),
+        ],
+      ),
+    )
+    assert.equal(links.length, 2001)
+    assert.deepEqual(links[0].action, { s: 'JavaScript', js: `a${'é'.repeat(2047)}`, scriptTruncated: true })
+    const expected = (i) => (i <= 255 ? 'a'.repeat(4096) : i === 256 ? 'a' : '')
+    links.slice(1).forEach((l, k) => assert.deepEqual(l.action, { s: 'JavaScript', js: expected(k + 1), scriptTruncated: true }, `link ${k + 1}`))
+    assert.equal(
+      links.reduce((sum, l) => sum + written(l.action.js), 0),
+      PAGE_SCRIPTS,
+    )
+  }
+
+  // 2,000 links whose /A and /AA scripts are 4,096 bytes of \x01, which JSON
+  // writes as \u0001: each is cut at 682 characters (4,092 bytes), and the
+  // page's budget runs out after 256 of them and 170 characters of the next.
+  {
+    const links = readLinks(
+      scriptPage(
+        Array.from({ length: 2000 }, (_, i) => i + 5),
+        [streamObject('', Buffer.alloc(4096, 1)), ...Array.from({ length: 2000 }, () => link(`/A ${js(4)} /AA << /U ${js(4)} >>`))],
+      ),
+    )
+    const scripts = links.flatMap((l) => [l.action, l.aa])
+    assert.equal(scripts.length, 4000)
+    assert.ok(
+      scripts.every((a) => a.scriptTruncated === true && /^\x01*$/.test(a.js)),
+      'a script was not cut or holds more than \\x01',
+    )
+    assert.deepEqual(
+      scripts.slice(0, 258).map((a) => a.js.length),
+      [...Array(256).fill(682), 170, 0],
+    )
+    assert.ok(scripts.slice(257).every((a) => a.js === ''))
+    const total = scripts.reduce((sum, a) => sum + written(a.js), 0)
+    assert.ok(total <= PAGE_SCRIPTS, `${total} bytes of scripts`)
+  }
+
+  // A script of 4,096 quotes is cut at 2,048, each written as \"; 4,096 bytes
+  // of plain text exactly are not cut.
+  {
+    const links = readLinks(
+      scriptPage([4, 5], [link(`/A ${js(6)}`), link(`/A ${js(7)}`), streamObject('', '"'.repeat(4096)), streamObject('', 'a'.repeat(4096))]),
+    )
+    assert.deepEqual(links[0].action, { s: 'JavaScript', js: '"'.repeat(2048), scriptTruncated: true })
+    assert.deepEqual(links[1].action, { s: 'JavaScript', js: 'a'.repeat(4096) })
+  }
 }
 
 {

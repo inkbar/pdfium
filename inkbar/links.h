@@ -35,12 +35,18 @@ extern "C" {
 //        | { "s": "GoToR" | "Launch", "fileHex": "..." | null,
 //            "dest": Dest | null, "newWindow": true | false | null }
 //        | { "s": "Named", "name": "NextPage" }
-//        | { "s": "JavaScript", "js": "app.launchURL('...')" }
+//        | { "s": "JavaScript", "js": "app.launchURL('...')",
+//            "scriptTruncated": true }
 //        | { "s": "<any other /S>" }
 // "fileHex" is /F when it is a string, else the first string of a file
 // specification's /UF, /F, /Unix, /Mac and /DOS. "js" is /JS decoded as PDFium
-// decodes it, from a string or a stream. A name's bytes above 0x7F are written
-// as the code points U+0080 to U+00FF.
+// decodes it, from a string or a stream, and cut after the last character
+// whose written form, as UTF-8 with JSON escapes (6 bytes for a control
+// character, 2 for a quote or a backslash), ends within 4,096 bytes. On one
+// page the scripts of all its links write at most 1,048,576 such bytes in
+// all; once that is spent, each later script is written empty.
+// "scriptTruncated" is present, and true, only when a script was cut. A
+// name's bytes above 0x7F are written as the code points U+0080 to U+00FF.
 
 // Reads /Annots from the page dictionary without parsing the page's content.
 // { "annots": [ { "index": 0, "subtype": "Link", "flags": 4, "obj": 12,

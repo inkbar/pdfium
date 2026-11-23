@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <optional>
@@ -39,6 +40,10 @@ namespace {
 
 constexpr int kMaxOutlineDepth = 64;
 constexpr size_t kMaxOutlineItems = 100000;
+// The most bytes a JavaScript action's source writes inside its JSON string,
+// escapes included, and the most all the sources of one page's links write.
+constexpr size_t kMaxScriptBytes = 4096;
+constexpr size_t kMaxPageScriptBytes = 1048576;
 
 // Indexed by the PDFDEST_VIEW_* values CPDF_Dest::GetZoomMode() returns.
 constexpr std::array<const char*, 9> kFitNames = {
@@ -154,9 +159,57 @@ void AppendFile(std::string* out, const CPDF_Dictionary* action) {
   out->append("null");
 }
 
+// The bytes inkbar::json writes for |c| inside a string: 2 for a quote or a
+// backslash, 6 for a control character or DEL (\u00XX), else its UTF-8. A
+// surrogate and a value past U+10FFFF become U+FFFD, which takes 3.
+size_t WrittenSize(uint32_t c) {
+  if (c == '"' || c == '\\') {
+    return 2;
+  }
+  if (c < 0x20 || c == 0x7F) {
+    return 6;
+  }
+  if (c < 0x80) {
+    return 1;
+  }
+  if (c < 0x800) {
+    return 2;
+  }
+  if (c < 0x10000 || c > 0x10FFFF) {
+    return 3;
+  }
+  return 4;
+}
+
+// |script| cut after the last character whose written form ends within
+// |limit| bytes. Adds the bytes it keeps to |*written| and sets |*cut| when it
+// was longer.
+WideString CutScript(const WideString& script,
+                     size_t limit,
+                     size_t* written,
+                     bool* cut) {
+  size_t bytes = 0;
+  size_t length = 0;
+  *cut = false;
+  for (wchar_t c : script) {
+    const size_t size = WrittenSize(static_cast<uint32_t>(c));
+    if (bytes + size > limit) {
+      *cut = true;
+      break;
+    }
+    bytes += size;
+    ++length;
+  }
+  *written += bytes;
+  return *cut ? script.First(length) : script;
+}
+
+// |page_scripts|: the bytes the scripts of this page's links have written so
+// far, or null outside a page.
 void AppendAction(std::string* out,
                   CPDF_Document* doc,
-                  const CPDF_Dictionary* action) {
+                  const CPDF_Dictionary* action,
+                  size_t* page_scripts) {
   if (!action) {
     out->append("null");
     return;
@@ -195,7 +248,19 @@ void AppendAction(std::string* out,
     out->push_back(',');
     AppendKey(out, "js");
     CPDF_Action js(pdfium::WrapRetain(action));
-    AppendText(out, js.GetJavaScript());
+    size_t outside_page = 0;
+    size_t* written = page_scripts ? page_scripts : &outside_page;
+    const size_t limit =
+        page_scripts
+            ? std::min(kMaxScriptBytes, kMaxPageScriptBytes - *page_scripts)
+            : kMaxScriptBytes;
+    bool cut = false;
+    AppendText(out, CutScript(js.GetJavaScript(), limit, written, &cut));
+    if (cut) {
+      out->push_back(',');
+      AppendKey(out, "scriptTruncated");
+      out->append("true");
+    }
   }
   out->push_back('}');
 }
@@ -231,7 +296,8 @@ void AppendLink(std::string* out,
                 size_t index,
                 const CPDF_Dictionary* annot,
                 const CPDF_Array* rect,
-                const CPDF_Array* quads) {
+                const CPDF_Array* quads,
+                size_t* page_scripts) {
   out->push_back('{');
   AppendKey(out, "index");
   out->append(std::to_string(index));
@@ -271,7 +337,7 @@ void AppendLink(std::string* out,
   out->push_back(',');
   AppendKey(out, "action");
   RetainPtr<const CPDF_Object> a = EntryFor(annot, "A");
-  AppendAction(out, doc, a ? a->AsDictionary() : nullptr);
+  AppendAction(out, doc, a ? a->AsDictionary() : nullptr, page_scripts);
   out->push_back(',');
   AppendKey(out, "aa");
   RetainPtr<const CPDF_Object> aa_object = EntryFor(annot, "AA");
@@ -280,7 +346,7 @@ void AppendLink(std::string* out,
   if (!trigger && aa) {
     trigger = aa->GetDictFor("U");
   }
-  AppendAction(out, doc, trigger.Get());
+  AppendAction(out, doc, trigger.Get(), page_scripts);
   out->push_back('}');
 }
 
@@ -318,7 +384,7 @@ void AppendOutlineItem(OutlineWalk* walk,
   out->push_back(',');
   AppendKey(out, "action");
   RetainPtr<const CPDF_Object> a = EntryFor(item, "A");
-  AppendAction(out, walk->doc, a ? a->AsDictionary() : nullptr);
+  AppendAction(out, walk->doc, a ? a->AsDictionary() : nullptr, nullptr);
   out->push_back('}');
   ++walk->items;
 }
@@ -367,6 +433,7 @@ char* INK_Links_Page(FPDF_DOCUMENT doc, int page_index) {
   std::string links_json = "\"links\":[";
   bool first_annot = true;
   bool first_link = true;
+  size_t page_scripts = 0;
   RetainPtr<const CPDF_Array> annots = page->GetArrayFor("Annots");
   for (size_t i = 0; annots && i < annots->size(); ++i) {
     // Only a dictionary is an annotation. GetDictAt() would also give a
@@ -402,7 +469,7 @@ char* INK_Links_Page(FPDF_DOCUMENT doc, int page_index) {
     }
     first_link = false;
     AppendLink(&links_json, pdf, i, annot.Get(), rect_ok ? rect : nullptr,
-               quads_well_formed ? quads : nullptr);
+               quads_well_formed ? quads : nullptr, &page_scripts);
   }
   annots_json.append("],");
   links_json.append("]}");

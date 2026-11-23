@@ -64,6 +64,11 @@ const unsigned short* INK_Text_Fonts(const InkText* t);
 // file can give any values, a positive descent included.
 const char* INK_Text_FontTable(const InkText* t);
 
+// 1 when the page had more than 1,000,000 characters, of which |t| holds the
+// first 1,000,000. 0 otherwise and for NULL. The cut can fall inside a line
+// break PDFium generated, leaving a lone CR as the last character.
+int INK_Text_Truncated(const InkText* t);
+
 // Frees |t|. NULL is a no-op.
 void INK_Text_Free(InkText* t);
 

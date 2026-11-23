@@ -36,6 +36,7 @@ struct InkText {
   std::vector<unsigned char> flags;
   std::vector<unsigned short> fonts;
   std::string font_table;
+  bool truncated = false;
 };
 
 namespace {
@@ -47,6 +48,8 @@ constexpr unsigned char kNoUnicode = 4;
 // A Type 3 character below this, a control code, stays without a mapping.
 constexpr unsigned int kFirstPrintable = 32;
 constexpr size_t kMaxFonts = 65535;
+// The most characters read from one page.
+constexpr int kMaxChars = 1000000;
 
 bool IsTimes(const ByteString& name) {
   std::optional<CFX_StandardFont::Index> index =
@@ -179,7 +182,11 @@ unsigned int Type3Unicode(FPDF_TEXTPAGE text_page, int i) {
 // Reads |text_page| into |t|. False when the page has more fonts than an
 // index can number.
 bool Fill(FPDF_TEXTPAGE text_page, InkText* t) {
-  const int count = FPDFText_CountChars(text_page);
+  int count = FPDFText_CountChars(text_page);
+  if (count > kMaxChars) {
+    count = kMaxChars;
+    t->truncated = true;
+  }
   if (count <= 0) {
     t->font_table = "[]";
     return true;
@@ -330,6 +337,10 @@ const unsigned short* INK_Text_Fonts(const InkText* t) {
 
 const char* INK_Text_FontTable(const InkText* t) {
   return t ? t->font_table.c_str() : nullptr;
+}
+
+int INK_Text_Truncated(const InkText* t) {
+  return t && t->truncated ? 1 : 0;
 }
 
 void INK_Text_Free(InkText* t) {
