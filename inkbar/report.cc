@@ -19,7 +19,6 @@
 #include "core/fpdfapi/parser/cpdf_object.h"
 #include "core/fpdfapi/parser/cpdf_reference.h"
 #include "core/fpdfapi/parser/fpdf_parser_decode.h"
-#include "core/fpdfdoc/cpdf_action.h"
 #include "core/fxcrt/span.h"
 #include "inkbar/json.h"
 
@@ -383,24 +382,83 @@ void AppendBorder(std::string* out, const CPDF_Dictionary* dict) {
   }
 }
 
-std::vector<WideString> CollectScripts(const CPDF_Object* action,
-                                       Budget* budget,
+ScriptReader::ScriptReader(Budget* budget) : budget_(budget) {}
+
+ScriptReader::~ScriptReader() = default;
+
+bool ScriptReader::Work(size_t units) {
+  if (units > work_left_) {
+    work_left_ = 0;
+    exhausted_ = true;
+    return false;
+  }
+  work_left_ -= units;
+  return true;
+}
+
+const WideString& ScriptReader::Decode(const CPDF_Dictionary* action,
                                        bool* cut) {
-  std::vector<WideString> sources;
+  static const WideString* const kEmpty = new WideString();
+  RetainPtr<const CPDF_Object> js = action->GetDirectObjectFor("JS");
+  if (!js || !(js->IsString() || js->IsStream())) {
+    return *kEmpty;
+  }
+  auto it = decoded_.find(js.Get());
+  if (it != decoded_.end()) {
+    return it->second;
+  }
+  // Decode nothing once the budget is spent.
+  if (budget_->left() == 0) {
+    budget_->Spend();
+    *cut = true;
+    return *kEmpty;
+  }
+  size_t written = 0;
+  bool source_cut = false;
+  WideString text = json::CutText(js->GetUnicodeText(), kMaxScriptBytes,
+                                  &written, &source_cut);
+  *cut = *cut || source_cut;
+  return decoded_.emplace(js.Get(), std::move(text)).first->second;
+}
+
+const std::vector<WideString>& ScriptReader::Sources(const CPDF_Object* action,
+                                                     bool* cut) {
+  if (!action || !Work(1)) {
+    if (action) {
+      *cut = true;
+    }
+    return none_;
+  }
+  RetainPtr<const CPDF_Object> first = action->GetDirect();
+  if (!first) {
+    return none_;
+  }
+  auto memo = chains_.find(first.Get());
+  if (memo != chains_.end()) {
+    *cut = *cut || memo->second.cut;
+    return memo->second.sources;
+  }
+  Chain chain;
   size_t read = 0;
   std::set<const CPDF_Object*> seen;
   // Depth first: an action, then its /Next in order. Pushed last first.
   std::vector<RetainPtr<const CPDF_Object>> stack;
-  if (action) {
-    stack.push_back(pdfium::WrapRetain(action));
-  }
+  stack.push_back(first);
   while (!stack.empty()) {
     RetainPtr<const CPDF_Object> object = stack.back()->GetDirect();
     stack.pop_back();
     if (!object || !seen.insert(object.Get()).second) {
       continue;
     }
+    if (++read > kMaxChain || !Work(1)) {
+      chain.cut = true;
+      break;
+    }
     if (const CPDF_Array* array = object->AsArray()) {
+      if (!Work(array->size())) {
+        chain.cut = true;
+        break;
+      }
       for (size_t i = array->size(); i > 0; --i) {
         RetainPtr<const CPDF_Object> entry = array->GetObjectAt(i - 1);
         if (entry) {
@@ -413,54 +471,80 @@ std::vector<WideString> CollectScripts(const CPDF_Object* action,
     if (!dict) {
       continue;
     }
-    if (++read > kMaxChain) {
-      *cut = true;
-      break;
-    }
     if (dict->GetNameFor("S") == "JavaScript") {
-      // Decode nothing once the budget is spent.
-      if (budget->left() == 0) {
-        budget->Spend();
-        *cut = true;
-        break;
-      }
-      const size_t room = std::min(kMaxScriptBytes, budget->left());
-      CPDF_Action js(pdfium::WrapRetain(dict));
-      size_t written = 0;
-      bool source_cut = false;
-      sources.push_back(
-          json::CutText(js.GetJavaScript(), room, &written, &source_cut));
-      budget->Take(written + 3);
-      if (source_cut) {
-        *cut = true;
-        if (room < kMaxScriptBytes) {
-          budget->Spend();
-          break;
-        }
-      }
+      chain.sources.push_back(Decode(dict, &chain.cut));
     }
     RetainPtr<const CPDF_Object> next = dict->GetObjectFor("Next");
     if (next) {
       stack.push_back(std::move(next));
     }
   }
-  return sources;
+  *cut = *cut || chain.cut;
+  return chains_.emplace(first.Get(), std::move(chain)).first->second.sources;
+}
+
+const ScriptReader::Keyed& ScriptReader::KeysWithScripts(
+    const CPDF_Dictionary* aa,
+    bool* cut) {
+  if (!aa || !Work(1)) {
+    if (aa) {
+      *cut = true;
+    }
+    return no_keys_;
+  }
+  auto memo = keyed_.find(aa);
+  if (memo != keyed_.end()) {
+    return memo->second;
+  }
+  Keyed keys;
+  CPDF_DictionaryLocker locker(aa);
+  for (const auto& item : locker) {
+    if (!Work(1)) {
+      *cut = true;
+      break;
+    }
+    if (!Sources(item.second.Get(), cut).empty()) {
+      keys.emplace_back(item.first, item.second);
+    }
+  }
+  return keyed_.emplace(aa, std::move(keys)).first->second;
+}
+
+size_t AppendSources(std::string* out,
+                     const std::vector<WideString>& sources,
+                     Budget* budget,
+                     bool* cut) {
+  // The brackets.
+  if (!budget->Take(2)) {
+    *cut = true;
+  }
+  out->push_back('[');
+  size_t count = 0;
+  for (const WideString& source : sources) {
+    // Quotes and a comma.
+    if (!budget->Take(3)) {
+      *cut = true;
+      break;
+    }
+    if (count > 0) {
+      out->push_back(',');
+    }
+    AppendWideText(out, source, kMaxScriptBytes, budget, cut);
+    ++count;
+    if (budget->spent()) {
+      break;
+    }
+  }
+  out->push_back(']');
+  return count;
 }
 
 size_t AppendScripts(std::string* out,
+                     ScriptReader* reader,
                      const CPDF_Object* action,
-                     Budget* budget,
                      bool* cut) {
-  const std::vector<WideString> sources = CollectScripts(action, budget, cut);
-  out->push_back('[');
-  for (size_t i = 0; i < sources.size(); ++i) {
-    if (i > 0) {
-      out->push_back(',');
-    }
-    json::AppendText(out, sources[i]);
-  }
-  out->push_back(']');
-  return sources.size();
+  return AppendSources(out, reader->Sources(action, cut), reader->budget(),
+                       cut);
 }
 
 char* Copy(const std::string& text) {

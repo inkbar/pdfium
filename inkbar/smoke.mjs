@@ -4676,6 +4676,77 @@ const inked = (bytes) => bytes.some((b) => b !== 0)
 }
 
 {
+  // A field 40 levels down, below PDFium's walk of 33 levels, whose widget is
+  // on the page; only the top and the bottom have /T. The page sweep climbs
+  // from the widget and walks down again, so the field is the bottom
+  // dictionary (object 45), not its widget (46): the fields and object numbers
+  // EPDFForm_LoadModel gives for this file in the released v8165.8 module.
+  const levels = 40
+  const nodes = Array.from(
+    { length: levels },
+    (_, i) => `<< ${i === 0 || i === levels - 1 ? `/T (n${i})` : ''} ${i > 0 ? `/Parent ${i + 5} 0 R` : ''} ${i + 1 < levels ? `/Kids [${i + 7} 0 R]` : '/FT /Tx /Kids [46 0 R]'} >>`,
+  )
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [46 0 R] >>',
+    '<< >>',
+    '<< >>',
+    ...nodes,
+    '<< /Type /Annot /Subtype /Widget /Parent 45 0 R /Rect [0 0 10 10] >>',
+  ])
+  withPdf(pdf, (doc) => {
+    const form = takeJson(m._INK_Form(doc))
+    assert.deepEqual(
+      form.fields.map((f) => [f.name, f.objectNumber, f.widgets.map((w) => w.objectNumber)]),
+      [['n0.n39', 45, [46]]],
+    )
+  })
+}
+
+{
+  // Script reading is bounded by work, not only by bytes. A widget under 1,000
+  // /Parent levels whose /AA are one dictionary of 1,000 keys, each the same
+  // chain of 999 Named actions and one empty script; and a catalog /AA of
+  // 200,000 keys, each that chain. Each shared object
+  // is read once a report.
+  // Objects |first| on: |count| - 1 Named actions, each naming the next, and
+  // an empty script.
+  const chain = (first, count) =>
+    Array.from({ length: count }, (_, i) => (i + 1 < count ? `<< /S /Named /N /NextPage /Next ${first + i + 1} 0 R >>` : '<< /S /JavaScript /JS () >>'))
+  const levels = 1000
+  const keys = 200000
+  // 6: the /AA of 1,000 keys; 7 to 1006: the chain; 1007 to 2006: the levels;
+  // 2007: the widget.
+  const pdf = buildPdf([
+    `<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [2007 0 R] >> /AA << ${Array.from({ length: keys }, (_, i) => `/k${i} 7 0 R`).join(' ')} >> >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [2007 0 R] >>',
+    '<< >>',
+    '<< >>',
+    `<< ${Array.from({ length: 1000 }, (_, i) => `/k${i} 7 0 R`).join(' ')} >>`,
+    ...chain(7, 1000),
+    ...Array.from({ length: levels }, (_, i) => `<< /AA 6 0 R ${i + 1 < levels ? `/Parent ${i + 1008} 0 R` : ''} >>`),
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (deep) /Rect [0 0 10 10] /Parent 1007 0 R /AA 6 0 R >>',
+  ])
+  withPdf(pdf, (doc) => {
+    let started = Date.now()
+    const form = takeJson(m._INK_Form(doc))
+    assert.ok(Date.now() - started < 2000, `the shared /AA took ${Date.now() - started} ms`)
+    assert.equal(Object.keys(form.fields[0].widgets[0].scripts).length, 1000)
+    started = Date.now()
+    const ptr = m._INK_Scripts(doc)
+    const text = cString(ptr)
+    m._INK_Json_Free(ptr)
+    assert.ok(Date.now() - started < 2000, `200,000 /AA keys took ${Date.now() - started} ms`)
+    assert.ok(Buffer.byteLength(text) <= 16 * 1024 * 1024, `${Buffer.byteLength(text)} bytes of JSON`)
+    const scripts = JSON.parse(text)
+    assert.equal(Object.keys(scripts.documentActions).length, keys)
+    assert.deepEqual(scripts.documentActions.k0, [''])
+  })
+}
+
+{
   // A field tree 1,005 levels deep: the walk stops at 1,000; PDFium loads 33
   // levels, so the text field at the bottom is not a field.
   const levels = 1005

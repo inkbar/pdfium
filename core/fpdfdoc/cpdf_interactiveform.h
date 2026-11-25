@@ -13,7 +13,6 @@
 #include <functional>
 #include <map>
 #include <memory>
-#include <set>  // Inkbar: |loaded_fields_|.
 #include <vector>
 
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
@@ -131,6 +130,8 @@ class CPDF_InteractiveForm {
 
   // EmbedPDF(reads-dont-write): loading the form walks const dictionaries.
   void LoadField(RetainPtr<const CPDF_Dictionary> field_dict, int nLevel);
+  // Inkbar: see |loaded_fields_|.
+  bool WalkFrom(RetainPtr<const CPDF_Object> object, int level);
   void AddTerminalField(RetainPtr<const CPDF_Dictionary> field_dict);
   CPDF_FormControl* AddControl(CPDF_FormField* field,
                                RetainPtr<CPDF_Dictionary> widget_dict);
@@ -151,10 +152,10 @@ class CPDF_InteractiveForm {
            std::less<>>
       control_lists_;
   UnownedPtr<NotifierIface> form_notify_;
-  // Inkbar: the field dictionaries and /Kids arrays LoadField has walked, so
-  // each is walked once in the form's life. Held, so an address is not
-  // reused by another object.
-  std::set<RetainPtr<const CPDF_Object>, std::less<>> loaded_fields_;
+  // Inkbar: the field dictionaries and /Kids arrays LoadField has walked,
+  // each with the shallowest level it was walked from. Held, so an address is
+  // not reused by another object.
+  std::map<RetainPtr<const CPDF_Object>, int, std::less<>> loaded_fields_;
 };
 
 #endif  // CORE_FPDFDOC_CPDF_INTERACTIVEFORM_H_

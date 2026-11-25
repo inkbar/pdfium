@@ -45,7 +45,7 @@ using inkbar::report::AppendKey;
 using inkbar::report::AppendNextKey;
 using inkbar::report::AppendNumbers;
 using inkbar::report::AppendRef;
-using inkbar::report::AppendScripts;
+using inkbar::report::ScriptReader;
 using inkbar::report::AppendWideText;
 using inkbar::report::Boolean;
 using inkbar::report::Budget;
@@ -254,18 +254,19 @@ void AppendValue(std::string* out,
   }
 }
 
-// Writes |sources| (a JSON array) under |key| in |scripts|.
+// Writes |sources| as a JSON array under |key| in |scripts|, charging the
+// key with its quotes, colon and comma.
 void AppendKeyedScripts(std::string* scripts,
                         bool* first,
                         const ByteString& key,
-                        const std::string& sources,
+                        const std::vector<WideString>& sources,
                         Budget* budget,
                         bool* cut) {
   // A key is a JSON object key, never null: one the budget cannot take is
   // left out with its sources.
   std::string name;
   inkbar::json::AppendName(&name, key);
-  if (!budget->Take(name.size())) {
+  if (!budget->Take(name.size() + 4)) {
     *cut = true;
     return;
   }
@@ -274,51 +275,55 @@ void AppendKeyedScripts(std::string* scripts,
   }
   scripts->append(name);
   scripts->push_back(':');
-  scripts->append(sources);
+  inkbar::report::AppendSources(scripts, sources, budget, cut);
   *first = false;
 }
 
 // /AA's JavaScript by key along /Parent from |widget|, and "A" for the
 // widget's own /A. For each key the nearest dictionary (the widget first)
 // whose action under it holds JavaScript gives the sources: the rule PDF.js
-// applies, which the viewer's reader follows today.
+// applies, which the viewer's reader follows today. Each level and each key
+// costs |reader| a unit of work.
 void AppendWidgetScripts(std::string* out,
                          const CPDF_Dictionary* widget,
-                         Budget* budget,
+                         ScriptReader* reader,
                          bool* cut) {
-  std::map<ByteString, std::string> scripts;
+  std::map<ByteString, RetainPtr<const CPDF_Object>> chains;
   std::set<const CPDF_Dictionary*> seen;
   RetainPtr<const CPDF_Dictionary> level = pdfium::WrapRetain(widget);
-  for (int depth = 0; level && depth <= kMaxDepth && !budget->spent();
-       ++depth) {
+  for (int depth = 0; level && depth <= kMaxDepth; ++depth) {
     if (!seen.insert(level.Get()).second) {
+      break;
+    }
+    if (!reader->Work(1)) {
+      *cut = true;
       break;
     }
     RetainPtr<const CPDF_Object> aa_object = EntryFor(level.Get(), "AA");
     if (const CPDF_Dictionary* aa =
             aa_object ? aa_object->AsDictionary() : nullptr) {
-      CPDF_DictionaryLocker locker(aa);
-      for (const auto& item : locker) {
-        if (item.first == "A" || scripts.count(item.first)) {
-          continue;
+      for (const auto& [key, chain] : reader->KeysWithScripts(aa, cut)) {
+        if (!reader->Work(1)) {
+          *cut = true;
+          break;
         }
-        std::string sources;
-        if (AppendScripts(&sources, item.second.Get(), budget, cut) > 0) {
-          scripts.emplace(item.first, std::move(sources));
+        if (key != "A") {
+          chains.try_emplace(key, chain);
         }
       }
     }
     level = level->GetDictFor("Parent");
   }
-  std::string own;
-  if (AppendScripts(&own, EntryFor(widget, "A").Get(), budget, cut) > 0) {
-    scripts.emplace("A", std::move(own));
+  RetainPtr<const CPDF_Object> own = EntryFor(widget, "A");
+  if (own && !reader->Sources(own.Get(), cut).empty()) {
+    chains.emplace("A", own);
   }
   AppendNextKey(out, "scripts");
   out->push_back('{');
   bool first = true;
-  for (const auto& [key, sources] : scripts) {
-    AppendKeyedScripts(out, &first, key, sources, budget, cut);
+  for (const auto& [key, chain] : chains) {
+    AppendKeyedScripts(out, &first, key, reader->Sources(chain.Get(), cut),
+                       reader->budget(), cut);
   }
   out->push_back('}');
 }
@@ -399,7 +404,8 @@ void AppendWidget(std::string* out,
                   const CPDF_FormControl* control,
                   bool toggle,
                   const Places& places,
-                  Budget* budget) {
+                  ScriptReader* reader) {
+  Budget* budget = reader->budget();
   const CPDF_Dictionary* widget = control->GetWidgetDict().Get();
   bool cut = false;
   out->push_back('{');
@@ -452,7 +458,7 @@ void AppendWidget(std::string* out,
     AppendNextKey(out, "pmd");
     out->append("true");
   }
-  AppendWidgetScripts(out, widget, budget, &cut);
+  AppendWidgetScripts(out, widget, reader, &cut);
   AppendAction(out, widget, budget, &cut);
   if (cut) {
     AppendNextKey(out, "truncated");
@@ -467,7 +473,8 @@ void AppendField(std::string* out,
                  CPDF_FormField* field,
                  bool recovered,
                  const Places& places,
-                 Budget* budget) {
+                 ScriptReader* reader) {
+  Budget* budget = reader->budget();
   const CPDF_Dictionary* dict = field->GetFieldDict().Get();
   bool cut = false;
   out->push_back('{');
@@ -545,7 +552,7 @@ void AppendField(std::string* out,
       out->push_back(',');
     }
     first = false;
-    AppendWidget(out, control, toggle, places, budget);
+    AppendWidget(out, control, toggle, places, reader);
   }
   out->push_back(']');
   if (cut || budget->spent()) {
@@ -559,19 +566,16 @@ void AppendField(std::string* out,
 // pairs; returns whether any did.
 bool AppendScriptsByKey(std::string* out,
                         const CPDF_Dictionary* dict,
-                        Budget* budget,
+                        ScriptReader* reader,
                         bool* cut) {
   bool first = true;
-  CPDF_DictionaryLocker locker(dict);
-  for (const auto& item : locker) {
-    if (budget->spent()) {
+  for (const auto& [key, chain] : reader->KeysWithScripts(dict, cut)) {
+    if (reader->budget()->spent() || !reader->Work(1)) {
       *cut = true;
       break;
     }
-    std::string sources;
-    if (AppendScripts(&sources, item.second.Get(), budget, cut) > 0) {
-      AppendKeyedScripts(out, &first, item.first, sources, budget, cut);
-    }
+    AppendKeyedScripts(out, &first, key, reader->Sources(chain.Get(), cut),
+                       reader->budget(), cut);
   }
   return !first;
 }
@@ -580,8 +584,9 @@ bool AppendScriptsByKey(std::string* out,
 // and /Kids array once, at most kMaxNames names and kMaxNames nodes.
 void AppendDocumentScripts(std::string* out,
                            const CPDF_Dictionary* tree,
-                           Budget* budget,
+                           ScriptReader* reader,
                            bool* truncated) {
+  Budget* budget = reader->budget();
   std::set<const CPDF_Object*> seen;
   std::vector<std::pair<RetainPtr<const CPDF_Dictionary>, int>> stack;
   if (tree) {
@@ -617,25 +622,33 @@ void AppendDocumentScripts(std::string* out,
       } else {
         entry_name = "null";
       }
-      const std::vector<WideString> sources = inkbar::report::CollectScripts(
-          pairs->GetObjectAt(i + 1).Get(), budget, &cut);
-      *truncated = *truncated || cut;
+      const std::vector<WideString>& sources =
+          reader->Sources(pairs->GetObjectAt(i + 1).Get(), &cut);
       for (const WideString& source : sources) {
         // The name is charged again for each source that repeats it.
         if (!budget->Take(kItemCost + entry_name.size())) {
           *truncated = true;
           return;
         }
+        const size_t mark = out->size();
         if (!first) {
           out->push_back(',');
         }
         out->append("{\"name\":");
         out->append(entry_name);
         out->append(",\"source\":");
-        AppendText(out, source);
+        AppendWideText(out, source, inkbar::report::kMaxScriptBytes, budget,
+                       &cut);
         out->push_back('}');
+        // A backstop: the budget charges at least what is written.
+        if (out->size() > kMaxReportBytes - kClosing) {
+          out->resize(mark);
+          *truncated = true;
+          return;
+        }
         first = false;
       }
+      *truncated = *truncated || cut;
     }
     RetainPtr<const CPDF_Array> kids = node->GetArrayFor("Kids");
     if (!kids || !seen.insert(kids.Get()).second) {
@@ -683,6 +696,7 @@ char* INK_Form(FPDF_DOCUMENT doc) {
   // Half the report for /AcroForm's own keys and the fields, the rest for
   // /CO and the closing keys, so /CO always fits.
   Budget budget(kMaxReportBytes / 2);
+  ScriptReader reader(&budget);
   AppendTextFor(&out, EntryFor(acro_form.Get(), "DA").Get(), "da", &budget,
                 &truncated);
   if (const CPDF_Number* q = ToNumber(EntryFor(acro_form.Get(), "Q").Get())) {
@@ -726,7 +740,7 @@ char* INK_Form(FPDF_DOCUMENT doc) {
         out.push_back(',');
       }
       const CPDF_Dictionary* dict = field->GetFieldDict().Get();
-      AppendField(&out, field, !declared.count(dict), places, &budget);
+      AppendField(&out, field, !declared.count(dict), places, &reader);
       // The budget charges at least what is written; this is a backstop.
       if (out.size() > kMaxReportBytes / 2) {
         out.resize(mark);
@@ -743,6 +757,7 @@ char* INK_Form(FPDF_DOCUMENT doc) {
     }
   }
   out.push_back(']');
+  truncated = truncated || reader.exhausted();
 
   // Each /CO entry names the field whose full name its dictionary has, as
   // CPDF_InteractiveForm::GetFieldInCalculationOrder finds it. An entry costs
@@ -795,31 +810,39 @@ char* INK_Scripts(FPDF_DOCUMENT doc) {
   const CPDF_Dictionary* root = pdf->GetRoot();
   bool truncated = false;
   Budget budget(kMaxReportBytes - kClosing);
+  ScriptReader reader(&budget);
   std::string out = "{\"document\":[";
   RetainPtr<const CPDF_Dictionary> names =
       root ? root->GetDictFor("Names") : nullptr;
   AppendDocumentScripts(
-      &out, names ? names->GetDictFor("JavaScript").Get() : nullptr, &budget,
+      &out, names ? names->GetDictFor("JavaScript").Get() : nullptr, &reader,
       &truncated);
   out.append("],\"documentActions\":{");
-  std::string sources;
+  std::string actions;
   bool first = true;
-  if (AppendScripts(&sources, EntryFor(root, "OpenAction").Get(), &budget,
-                    &truncated) > 0) {
-    out.append("\"OpenAction\":");
-    out.append(sources);
-    first = false;
+  RetainPtr<const CPDF_Object> open = EntryFor(root, "OpenAction");
+  const std::vector<WideString>& opening =
+      reader.Sources(open.Get(), &truncated);
+  if (!opening.empty()) {
+    AppendKeyedScripts(&actions, &first, "OpenAction", opening, &budget,
+                       &truncated);
   }
   RetainPtr<const CPDF_Object> aa_object = EntryFor(root, "AA");
   if (const CPDF_Dictionary* aa =
           aa_object ? aa_object->AsDictionary() : nullptr) {
     std::string by_key;
-    if (AppendScriptsByKey(&by_key, aa, &budget, &truncated)) {
+    if (AppendScriptsByKey(&by_key, aa, &reader, &truncated)) {
       if (!first) {
-        out.push_back(',');
+        actions.push_back(',');
       }
-      out.append(by_key);
+      actions.append(by_key);
     }
+  }
+  // A backstop: the budget charges at least what is written.
+  if (out.size() + actions.size() > kMaxReportBytes - kClosing) {
+    truncated = true;
+  } else {
+    out.append(actions);
   }
   out.append("},\"pageActions\":[");
   const int page_count = pdf->GetPageCount();
@@ -833,13 +856,14 @@ char* INK_Scripts(FPDF_DOCUMENT doc) {
       continue;
     }
     std::string by_key;
-    if (!AppendScriptsByKey(&by_key, aa, &budget, &truncated)) {
+    if (!AppendScriptsByKey(&by_key, aa, &reader, &truncated)) {
       continue;
     }
     if (!budget.Take(kItemCost)) {
       truncated = true;
       break;
     }
+    const size_t mark = out.size();
     if (!first) {
       out.push_back(',');
     }
@@ -848,9 +872,15 @@ char* INK_Scripts(FPDF_DOCUMENT doc) {
     out.append(",\"scripts\":{");
     out.append(by_key);
     out.append("}}");
+    // A backstop: the budget charges at least what is written.
+    if (out.size() > kMaxReportBytes - kClosing) {
+      out.resize(mark);
+      truncated = true;
+      break;
+    }
     first = false;
   }
-  truncated = truncated || budget.spent();
+  truncated = truncated || budget.spent() || reader.exhausted();
   out.append("],\"truncated\":");
   out.append(Boolean(truncated));
   out.push_back('}');

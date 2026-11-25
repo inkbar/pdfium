@@ -376,7 +376,8 @@ int INK_Annot_Draw(FPDF_BITMAP bitmap,
         annots && static_cast<size_t>(annot_index) < annots->size()
             ? ToDictionary(annots->GetDirectObjectAt(annot_index))
             : nullptr;
-    if (!dict || dict->GetNameFor("Subtype") == "Popup") {
+    // Read as CPDF_Annot reads it: a name or a string.
+    if (!dict || dict->GetByteStringFor("Subtype") == "Popup") {
       return 0;
     }
   }

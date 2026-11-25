@@ -11,7 +11,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "core/fxcrt/bytestring.h"
@@ -151,19 +153,69 @@ void AppendAppearance(std::string* out,
 // dictionary. "border": /Border's first three entries when it is an array.
 void AppendBorder(std::string* out, const CPDF_Dictionary* dict);
 
-// The sources of the JavaScript actions in the chain |action| starts, in the
-// order /Next gives them, depth first, each object once and at most
-// kMaxChain actions. Each source is cut as CutText cuts it at
-// kMaxScriptBytes, and the sources together take at most what |budget| has
-// left (no source is decoded once it is spent); sets |*cut| when one was cut
-// or the chain was longer.
-std::vector<WideString> CollectScripts(const CPDF_Object* action,
-                                       Budget* budget,
-                                       bool* cut);
-// The same as a JSON array, [] when there are none; returns how many.
-size_t AppendScripts(std::string* out,
-                     const CPDF_Object* action,
+// The most units of work one report spends reading JavaScript: an object of
+// an action chain, an entry of a /Next array, a key of an /AA dictionary, a
+// level of a /Parent chain or a memoised result looked up each cost one. A
+// few million reads take well under a second.
+constexpr size_t kMaxScriptWork = 4000000;
+
+// Reads the JavaScript of action chains and /AA dictionaries for one report.
+// Each chain is read once, memoised by its first action, each /JS string or
+// stream decoded once, and each /AA dictionary's keys read once, so an object
+// the file shares is read once a report however often it is reached. All of
+// it is charged to a work allowance (kMaxScriptWork); once that is spent
+// nothing more is read and every call sets its |*cut|.
+class ScriptReader {
+ public:
+  explicit ScriptReader(Budget* budget);
+  ~ScriptReader();
+
+  // The sources of the JavaScript actions in the chain |action| starts, in
+  // the order /Next gives them, depth first, each object once and at most
+  // kMaxChain objects (actions and /Next arrays). Each source is cut as
+  // CutText cuts it at kMaxScriptBytes; no source is decoded once the budget
+  // is spent. Sets |*cut| when one was cut or the chain was longer.
+  const std::vector<WideString>& Sources(const CPDF_Object* action, bool* cut);
+
+  // The keys of an /AA dictionary whose chains hold JavaScript, in key order,
+  // each with its chain.
+  using Keyed = std::vector<std::pair<ByteString, RetainPtr<const CPDF_Object>>>;
+  const Keyed& KeysWithScripts(const CPDF_Dictionary* aa, bool* cut);
+
+  // Spends |units| of the allowance; false once it is spent.
+  bool Work(size_t units);
+  // Whether the allowance ran out: something was left unread.
+  bool exhausted() const { return exhausted_; }
+  Budget* budget() const { return budget_; }
+
+ private:
+  struct Chain {
+    std::vector<WideString> sources;
+    bool cut = false;
+  };
+  const WideString& Decode(const CPDF_Dictionary* action, bool* cut);
+
+  Budget* const budget_;
+  size_t work_left_ = kMaxScriptWork;
+  bool exhausted_ = false;
+  std::map<const CPDF_Object*, Chain> chains_;
+  std::map<const CPDF_Object*, WideString> decoded_;
+  std::map<const CPDF_Dictionary*, Keyed> keyed_;
+  const std::vector<WideString> none_;
+  const Keyed no_keys_;
+};
+
+// |sources| as a JSON array, [] when there are none: each source cut to what
+// |budget| has left and charged with its punctuation. Returns how many it
+// wrote.
+size_t AppendSources(std::string* out,
+                     const std::vector<WideString>& sources,
                      Budget* budget,
+                     bool* cut);
+// AppendSources of |reader|'s sources for |action|.
+size_t AppendScripts(std::string* out,
+                     ScriptReader* reader,
+                     const CPDF_Object* action,
                      bool* cut);
 
 // A malloc'd copy of |text| with its NUL, freed with INK_Json_Free.

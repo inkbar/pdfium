@@ -36,7 +36,7 @@ extern "C" {
 
 // Reads /Annots from the page dictionary without parsing the page's content,
 // so it loads no font.
-// { "annots": [ {
+// { "tabs": "S", "annots": [ {
 //     "index": 0, "subtype": "Text", "objectNumber": 12, "generation": 0,
 //     "rect": [l, b, r, t] | null, "rectOk": true, "flags": 4,
 //     "hasAppearance": true, "appearance": "stream" | "states" | null,
@@ -49,7 +49,7 @@ extern "C" {
 //     "borderStyle": { "width": 1, "style": "S" }, "border": [0, 0, 1],
 //     "da": Text, "q": 1, "pmd": true, "parent": [9, 0],
 //     "truncated": true } ],
-//   "tabs": "S", "truncated": false }
+//   "truncated": false }
 // Each entry takes from the report's 16 MB as it is written (keys charged
 // 1 KB, a number 16 bytes, text and names what they write), so objects the
 // file shares between many annotations cannot grow one entry past the cap:

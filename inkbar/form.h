@@ -19,6 +19,10 @@ extern "C" {
 // 16 MB cap are as annots.h describes them.
 //
 // Scripts = { "K": ["source", ...], "A": [...], ... }
+// Reading them has a work allowance of 4,000,000 reads a report (an action, a
+// /Next array entry, an /AA key, a /Parent level), and each chain, /JS and /AA
+// dictionary is read once a report however many places share it; once the
+// allowance is spent nothing more is read and the report says "truncated".
 // The JavaScript sources of an action chain under each key, in the order the
 // chain gives them (the action, then its /Next, depth first, each object once,
 // at most 1,000 actions). A source is cut after the last character whose
@@ -50,6 +54,9 @@ extern "C" {
 //       "action": { "s": "URI", "uriHex": "..." } | { "s": "Named",
 //                 "name": "Print" } | { "s": "ResetForm", "fields": [Text],
 //                 "refs": [[n, g]], "flags": 0 } | { "s": "<other /S>" },
+//       (ResetForm: an entry of /Fields written as a reference is in "refs",
+//       whatever it refers to, a text string included; one written as a
+//       string is in "fields". PDF.js reads /Fields the same way.)
 //       "truncated": true } ],
 //     "truncated": true } ],
 //   "calculationOrder": [3, -1], "calculationOrderRefs": [[11, 0], null],

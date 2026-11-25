@@ -885,14 +885,32 @@ RetainPtr<const CPDF_Dictionary> CPDF_InteractiveForm::ResolveCurrentDict(
   return current ? current : dict;
 }
 
+// Inkbar: whether |object| has not been walked from |level| or a shallower
+// one yet; records |level| when so.
+bool CPDF_InteractiveForm::WalkFrom(RetainPtr<const CPDF_Object> object,
+                                    int level) {
+  auto [it, inserted] = loaded_fields_.try_emplace(std::move(object), level);
+  if (inserted) {
+    return true;
+  }
+  if (level >= it->second) {
+    return false;
+  }
+  it->second = level;
+  return true;
+}
+
 // EmbedPDF(reads-dont-write): loading the form walks const dictionaries.
 void CPDF_InteractiveForm::LoadField(
     RetainPtr<const CPDF_Dictionary> field_dict,
     int nLevel) {
-  // Inkbar: the form loads each field dictionary, and walks each /Kids array,
-  // once (|loaded_fields_|). A /Kids loop whose nodes list each other more
-  // than once doubled the work at every level down to kMaxRecursion, and
-  // fields sharing one /Kids array walked it once each.
+  // Inkbar: the form walks each field dictionary and each /Kids array once
+  // from each level (|loaded_fields_| keeps the shallowest level each was
+  // walked from), so at most kMaxRecursion + 1 times in all. A /Kids loop
+  // whose nodes list each other more than once doubled the work at every
+  // level down to kMaxRecursion, and fields sharing one /Kids array walked it
+  // once each. Walking again from a shallower level reaches what a walk
+  // cut off at kMaxRecursion missed, as upstream does.
   auto load = [this](auto& self,
                               RetainPtr<const CPDF_Dictionary> field_dict,
                               int nLevel) -> void {
@@ -906,7 +924,7 @@ void CPDF_InteractiveForm::LoadField(
     // promotions win over frozen base instances reached through base-held
     // references.
     field_dict = ResolveCurrentDict(std::move(field_dict));
-    if (!loaded_fields_.insert(field_dict).second) {
+    if (!WalkFrom(field_dict, nLevel)) {
       return;
     }
 
@@ -929,7 +947,7 @@ void CPDF_InteractiveForm::LoadField(
       AddTerminalField(std::move(field_dict));
       return;
     }
-    if (!loaded_fields_.insert(kids).second) {
+    if (!WalkFrom(kids, nLevel)) {
       return;
     }
     for (size_t i = 0; i < kids->size(); i++) {
