@@ -13,6 +13,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <set>  // Inkbar: |loaded_fields_|.
 #include <vector>
 
 #include "core/fpdfapi/parser/cpdf_dictionary.h"
@@ -150,6 +151,10 @@ class CPDF_InteractiveForm {
            std::less<>>
       control_lists_;
   UnownedPtr<NotifierIface> form_notify_;
+  // Inkbar: the field dictionaries and /Kids arrays LoadField has walked, so
+  // each is walked once in the form's life. Held, so an address is not
+  // reused by another object.
+  std::set<RetainPtr<const CPDF_Object>, std::less<>> loaded_fields_;
 };
 
 #endif  // CORE_FPDFDOC_CPDF_INTERACTIVEFORM_H_

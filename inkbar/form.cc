@@ -8,6 +8,7 @@
 
 #include "inkbar/form.h"
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <set>
@@ -36,23 +37,28 @@
 namespace {
 
 using inkbar::json::AppendHex;
-using inkbar::json::AppendName;
 using inkbar::json::AppendNumber;
 using inkbar::json::AppendText;
+using inkbar::report::AppendFileName;
 using inkbar::report::AppendFileText;
 using inkbar::report::AppendKey;
 using inkbar::report::AppendNextKey;
 using inkbar::report::AppendNumbers;
 using inkbar::report::AppendRef;
 using inkbar::report::AppendScripts;
+using inkbar::report::AppendWideText;
 using inkbar::report::Boolean;
+using inkbar::report::Budget;
 using inkbar::report::EntryFor;
+using inkbar::report::kEntryCost;
+using inkbar::report::kItemCost;
 using inkbar::report::kMaxDepth;
 using inkbar::report::kMaxNumbers;
 using inkbar::report::kMaxReportBytes;
 using inkbar::report::kMaxTextBytes;
 
 constexpr size_t kMaxFields = 50000;
+// The most names, and the most nodes, read from the /Names /JavaScript tree.
 constexpr size_t kMaxNames = 50000;
 // Room left for the keys that close a report.
 constexpr size_t kClosing = 256;
@@ -60,11 +66,74 @@ constexpr size_t kClosing = 256;
 // Where a dictionary sits: page index and place in that page's /Annots.
 using Places = std::map<const CPDF_Dictionary*, std::pair<int, int>>;
 
+// What a walk of /Fields and its /Kids found.
+struct FieldTree {
+  // Every dictionary reached, each once.
+  std::set<const CPDF_Dictionary*> seen;
+  // The deepest level reached; 1 for a top-level field.
+  int deepest = 0;
+  // A dictionary or a /Kids array was reached a second time.
+  bool revisits = false;
+  // More than kMaxFields dictionaries: the walk stopped there.
+  bool too_many = false;
+  // A /Kids array lay deeper than kMaxDepth: the walk did not go there.
+  bool too_deep = false;
+};
+
+// Walks /Fields and its /Kids, each dictionary and each array once, so a
+// /Kids array that many fields share is read once.
+FieldTree WalkFieldTree(const CPDF_Array* fields) {
+  FieldTree tree;
+  std::set<const CPDF_Array*> arrays;
+  std::vector<std::pair<RetainPtr<const CPDF_Array>, int>> stack;
+  if (fields) {
+    arrays.insert(fields);
+    stack.emplace_back(pdfium::WrapRetain(fields), 1);
+  }
+  while (!stack.empty()) {
+    RetainPtr<const CPDF_Array> array = std::move(stack.back().first);
+    const int depth = stack.back().second;
+    stack.pop_back();
+    for (size_t i = 0; i < array->size(); ++i) {
+      RetainPtr<const CPDF_Dictionary> field = array->GetDictAt(i);
+      if (!field) {
+        continue;
+      }
+      if (!tree.seen.insert(field.Get()).second) {
+        tree.revisits = true;
+        continue;
+      }
+      if (tree.seen.size() > kMaxFields) {
+        tree.too_many = true;
+        return tree;
+      }
+      tree.deepest = std::max(tree.deepest, depth);
+      RetainPtr<const CPDF_Array> kids = field->GetArrayFor("Kids");
+      if (!kids) {
+        continue;
+      }
+      if (!arrays.insert(kids.Get()).second) {
+        tree.revisits = true;
+        continue;
+      }
+      if (depth >= kMaxDepth) {
+        tree.too_deep = true;
+        continue;
+      }
+      stack.emplace_back(std::move(kids), depth + 1);
+    }
+  }
+  return tree;
+}
+
 // Every dictionary in every page's /Annots, resolved as
 // epdf::SweepPageWidgets resolves them, so a control's widget dictionary is
-// found by the dictionary itself; its first place wins. Counts the widgets in
-// |*widgets|, each place once.
-Places SweepPlaces(CPDF_Document* doc, size_t* widgets) {
+// found by the dictionary itself; its first place wins. Counts in
+// |*reconciled| the widgets the sweep would add to the form: those the field
+// tree does not hold that have /FT along /Parent, each once.
+Places SweepPlaces(CPDF_Document* doc,
+                   const std::set<const CPDF_Dictionary*>& tree,
+                   size_t* reconciled) {
   Places places;
   const int page_count = doc->GetPageCount();
   for (int i = 0; i < page_count; ++i) {
@@ -81,11 +150,14 @@ Places SweepPlaces(CPDF_Document* doc, size_t* widgets) {
       } else {
         annot = ToDictionary(std::move(element));
       }
-      if (annot) {
-        places.try_emplace(annot.Get(), i, static_cast<int>(j));
-        if (annot->GetNameFor("Subtype") == "Widget") {
-          ++*widgets;
-        }
+      if (!annot ||
+          !places.try_emplace(annot.Get(), i, static_cast<int>(j)).second) {
+        continue;
+      }
+      if (annot->GetNameFor("Subtype") == "Widget" &&
+          !tree.count(annot.Get()) &&
+          CPDF_FormField::GetFieldAttrForDict(annot.Get(), "FT")) {
+        ++*reconciled;
       }
     }
   }
@@ -128,20 +200,13 @@ void AppendObjectNumber(std::string* out, const CPDF_Object* object) {
 void AppendTextFor(std::string* out,
                    const CPDF_Object* value,
                    const char* name,
+                   Budget* budget,
                    bool* cut) {
   if (!value || !value->IsString()) {
     return;
   }
   AppendNextKey(out, name);
-  AppendFileText(out, value->GetString(), kMaxTextBytes, cut);
-}
-
-void AppendWide(std::string* out, const WideString& text, bool* cut) {
-  size_t written = 0;
-  bool text_cut = false;
-  AppendText(out, inkbar::json::CutText(text, kMaxTextBytes, &written,
-                                        &text_cut));
-  *cut = *cut || text_cut;
+  AppendFileText(out, value->GetString(), kMaxTextBytes, budget, cut);
 }
 
 // ,"<kind_key>":"..." and, for a string, a name or an array, ,"<key>":value.
@@ -149,6 +214,7 @@ void AppendValue(std::string* out,
                  const CPDF_Object* value,
                  const char* kind_key,
                  const char* key,
+                 Budget* budget,
                  bool* cut) {
   AppendNextKey(out, kind_key);
   if (!value || value->IsNull()) {
@@ -158,22 +224,26 @@ void AppendValue(std::string* out,
   if (value->IsString()) {
     out->append("\"string\"");
     AppendNextKey(out, key);
-    AppendFileText(out, value->GetString(), kMaxTextBytes, cut);
+    AppendFileText(out, value->GetString(), kMaxTextBytes, budget, cut);
   } else if (value->IsName()) {
     out->append("\"name\"");
     AppendNextKey(out, key);
-    AppendName(out, value->GetString());
+    AppendFileName(out, value->GetString(), budget, cut);
   } else if (const CPDF_Array* array = value->AsArray()) {
     out->append("\"array\"");
     AppendNextKey(out, key);
     out->push_back('[');
     for (size_t i = 0; i < array->size(); ++i) {
+      if (!budget->Take(kItemCost)) {
+        *cut = true;
+        break;
+      }
       if (i > 0) {
         out->push_back(',');
       }
       RetainPtr<const CPDF_Object> entry = array->GetDirectObjectAt(i);
       if (entry && entry->IsString()) {
-        AppendFileText(out, entry->GetString(), kMaxTextBytes, cut);
+        AppendFileText(out, entry->GetString(), kMaxTextBytes, budget, cut);
       } else {
         out->append("null");
       }
@@ -184,15 +254,43 @@ void AppendValue(std::string* out,
   }
 }
 
-// /AA's JavaScript by key along /Parent from |widget|, the nearest first, and
-// "A" for the widget's own /A.
+// Writes |sources| (a JSON array) under |key| in |scripts|.
+void AppendKeyedScripts(std::string* scripts,
+                        bool* first,
+                        const ByteString& key,
+                        const std::string& sources,
+                        Budget* budget,
+                        bool* cut) {
+  // A key is a JSON object key, never null: one the budget cannot take is
+  // left out with its sources.
+  std::string name;
+  inkbar::json::AppendName(&name, key);
+  if (!budget->Take(name.size())) {
+    *cut = true;
+    return;
+  }
+  if (!*first) {
+    scripts->push_back(',');
+  }
+  scripts->append(name);
+  scripts->push_back(':');
+  scripts->append(sources);
+  *first = false;
+}
+
+// /AA's JavaScript by key along /Parent from |widget|, and "A" for the
+// widget's own /A. For each key the nearest dictionary (the widget first)
+// whose action under it holds JavaScript gives the sources: the rule PDF.js
+// applies, which the viewer's reader follows today.
 void AppendWidgetScripts(std::string* out,
                          const CPDF_Dictionary* widget,
+                         Budget* budget,
                          bool* cut) {
   std::map<ByteString, std::string> scripts;
   std::set<const CPDF_Dictionary*> seen;
   RetainPtr<const CPDF_Dictionary> level = pdfium::WrapRetain(widget);
-  for (int depth = 0; level && depth <= kMaxDepth; ++depth) {
+  for (int depth = 0; level && depth <= kMaxDepth && !budget->spent();
+       ++depth) {
     if (!seen.insert(level.Get()).second) {
       break;
     }
@@ -205,7 +303,7 @@ void AppendWidgetScripts(std::string* out,
           continue;
         }
         std::string sources;
-        if (AppendScripts(&sources, item.second.Get(), cut) > 0) {
+        if (AppendScripts(&sources, item.second.Get(), budget, cut) > 0) {
           scripts.emplace(item.first, std::move(sources));
         }
       }
@@ -213,26 +311,23 @@ void AppendWidgetScripts(std::string* out,
     level = level->GetDictFor("Parent");
   }
   std::string own;
-  if (AppendScripts(&own, EntryFor(widget, "A").Get(), cut) > 0) {
+  if (AppendScripts(&own, EntryFor(widget, "A").Get(), budget, cut) > 0) {
     scripts.emplace("A", std::move(own));
   }
   AppendNextKey(out, "scripts");
   out->push_back('{');
   bool first = true;
   for (const auto& [key, sources] : scripts) {
-    if (!first) {
-      out->push_back(',');
-    }
-    first = false;
-    AppendName(out, key);
-    out->push_back(':');
-    out->append(sources);
+    AppendKeyedScripts(out, &first, key, sources, budget, cut);
   }
   out->push_back('}');
 }
 
 // The widget's own /A, its first action only.
-void AppendAction(std::string* out, const CPDF_Dictionary* widget, bool* cut) {
+void AppendAction(std::string* out,
+                  const CPDF_Dictionary* widget,
+                  Budget* budget,
+                  bool* cut) {
   RetainPtr<const CPDF_Object> a = EntryFor(widget, "A");
   const CPDF_Dictionary* action = a ? a->AsDictionary() : nullptr;
   if (!action) {
@@ -242,50 +337,58 @@ void AppendAction(std::string* out, const CPDF_Dictionary* widget, bool* cut) {
   AppendNextKey(out, "action");
   out->push_back('{');
   AppendKey(out, "s");
-  AppendName(out, s);
+  AppendFileName(out, s, budget, cut);
   if (s == "URI") {
     RetainPtr<const CPDF_Object> uri = EntryFor(action, "URI");
+    const ByteString bytes = uri && (uri->IsString() || uri->IsName())
+                                 ? uri->GetString()
+                                 : ByteString();
+    const size_t keep = std::min(
+        {bytes.GetLength(), kMaxTextBytes / 2, budget->left() / 2});
+    budget->Take(keep * 2);
+    if (keep < bytes.GetLength()) {
+      *cut = true;
+    }
     AppendNextKey(out, "uriHex");
-    AppendHex(out, uri && (uri->IsString() || uri->IsName())
-                       ? uri->GetString().First(std::min<size_t>(
-                             uri->GetString().GetLength(), kMaxTextBytes / 2))
-                       : ByteString());
+    AppendHex(out, bytes.First(keep));
   } else if (s == "Named") {
     RetainPtr<const CPDF_Object> name = EntryFor(action, "N");
     AppendNextKey(out, "name");
-    AppendName(out, name && name->IsName() ? name->GetString() : ByteString());
+    AppendFileName(out, name && name->IsName() ? name->GetString() : ByteString(),
+                   budget, cut);
   } else if (s == "ResetForm") {
     RetainPtr<const CPDF_Object> fields_object = EntryFor(action, "Fields");
     const CPDF_Array* fields =
         fields_object ? fields_object->AsArray() : nullptr;
-    AppendNextKey(out, "fields");
-    out->push_back('[');
-    bool first = true;
+    std::string names = "[";
+    std::string refs = "[";
     for (size_t i = 0; fields && i < fields->size(); ++i) {
-      RetainPtr<const CPDF_Object> entry = fields->GetDirectObjectAt(i);
-      if (entry && entry->IsString()) {
-        if (!first) {
-          out->push_back(',');
-        }
-        first = false;
-        AppendFileText(out, entry->GetString(), kMaxTextBytes, cut);
+      if (!budget->Take(kItemCost)) {
+        *cut = true;
+        break;
       }
-    }
-    out->append("]");
-    AppendNextKey(out, "refs");
-    out->push_back('[');
-    first = true;
-    for (size_t i = 0; fields && i < fields->size(); ++i) {
       RetainPtr<const CPDF_Object> entry = fields->GetObjectAt(i);
       if (entry && entry->IsReference()) {
-        if (!first) {
-          out->push_back(',');
+        if (refs.size() > 1) {
+          refs.push_back(',');
         }
-        first = false;
-        AppendRef(out, entry.Get());
+        AppendRef(&refs, entry.Get());
+        continue;
+      }
+      RetainPtr<const CPDF_Object> value = entry ? entry->GetDirect() : nullptr;
+      if (value && value->IsString()) {
+        if (names.size() > 1) {
+          names.push_back(',');
+        }
+        AppendFileText(&names, value->GetString(), kMaxTextBytes, budget, cut);
       }
     }
-    out->push_back(']');
+    names.push_back(']');
+    refs.push_back(']');
+    AppendNextKey(out, "fields");
+    out->append(names);
+    AppendNextKey(out, "refs");
+    out->append(refs);
     AppendNextKey(out, "flags");
     out->append(std::to_string(action->GetIntegerFor("Flags")));
   }
@@ -295,7 +398,8 @@ void AppendAction(std::string* out, const CPDF_Dictionary* widget, bool* cut) {
 void AppendWidget(std::string* out,
                   const CPDF_FormControl* control,
                   bool toggle,
-                  const Places& places) {
+                  const Places& places,
+                  Budget* budget) {
   const CPDF_Dictionary* widget = control->GetWidgetDict().Get();
   bool cut = false;
   out->push_back('{');
@@ -310,12 +414,13 @@ void AppendWidget(std::string* out,
   inkbar::report::AppendRect(out, widget);
   AppendNextKey(out, "flags");
   out->append(std::to_string(widget->GetIntegerFor("F")));
-  inkbar::report::AppendAppearance(out, widget);
+  inkbar::report::AppendAppearance(out, widget, budget, &cut);
   if (toggle) {
     AppendNextKey(out, "onState");
-    AppendName(out, control->GetOnStateName());
+    AppendFileName(out, control->GetOnStateName(), budget, &cut);
     AppendNextKey(out, "exportValue");
-    AppendWide(out, control->GetExportValue(), &cut);
+    AppendWideText(out, control->GetExportValue(), kMaxTextBytes, budget,
+                   &cut);
   }
   inkbar::report::AppendBorder(out, widget);
   RetainPtr<const CPDF_Object> mk_object = EntryFor(widget, "MK");
@@ -326,29 +431,29 @@ void AppendWidget(std::string* out,
       RetainPtr<const CPDF_Object> colour = EntryFor(mk, key);
       if (const CPDF_Array* array = colour ? colour->AsArray() : nullptr) {
         AppendNextKey(out, name);
-        AppendNumbers(out, array, kMaxNumbers, &cut);
+        AppendNumbers(out, array, kMaxNumbers, budget, &cut);
       }
     }
     if (const CPDF_Number* r = ToNumber(EntryFor(mk, "R").Get())) {
       AppendNextKey(out, "rotation");
       AppendNumber(out, r->GetNumber());
     }
-    AppendTextFor(out, EntryFor(mk, "CA").Get(), "caption", &cut);
+    AppendTextFor(out, EntryFor(mk, "CA").Get(), "caption", budget, &cut);
   }
   if (const CPDF_Number* q = ToNumber(
           CPDF_FormField::GetFieldAttrForDict(widget, "Q").Get())) {
     AppendNextKey(out, "q");
     AppendNumber(out, q->GetNumber());
   }
-  AppendTextFor(out, EntryFor(widget, "TU").Get(), "tooltip", &cut);
+  AppendTextFor(out, EntryFor(widget, "TU").Get(), "tooltip", budget, &cut);
   AppendTextFor(out, CPDF_FormField::GetFieldAttrForDict(widget, "DA").Get(),
-                "da", &cut);
+                "da", budget, &cut);
   if (EntryFor(widget, "PMD")) {
     AppendNextKey(out, "pmd");
     out->append("true");
   }
-  AppendWidgetScripts(out, widget, &cut);
-  AppendAction(out, widget, &cut);
+  AppendWidgetScripts(out, widget, budget, &cut);
+  AppendAction(out, widget, budget, &cut);
   if (cut) {
     AppendNextKey(out, "truncated");
     out->append("true");
@@ -356,15 +461,18 @@ void AppendWidget(std::string* out,
   out->push_back('}');
 }
 
+// Writes as much of the field as |budget| allows, and says "truncated" when
+// it cut anything.
 void AppendField(std::string* out,
                  CPDF_FormField* field,
                  bool recovered,
-                 const Places& places) {
+                 const Places& places,
+                 Budget* budget) {
   const CPDF_Dictionary* dict = field->GetFieldDict().Get();
   bool cut = false;
   out->push_back('{');
   AppendKey(out, "name");
-  AppendWide(out, field->GetFullName(), &cut);
+  AppendWideText(out, field->GetFullName(), kMaxTextBytes, budget, &cut);
   AppendObjectNumber(out, dict);
   AppendNextKey(out, "origin");
   out->append(recovered ? "\"recovered\"" : "\"acroform\"");
@@ -376,22 +484,28 @@ void AppendField(std::string* out,
   AppendNextKey(out, "flags");
   out->append(std::to_string(field->GetFieldFlags()));
   AppendValue(out, CPDF_FormField::GetFieldAttrForDict(dict, "V").Get(),
-              "valueKind", "value", &cut);
+              "valueKind", "value", budget, &cut);
   AppendValue(out, CPDF_FormField::GetFieldAttrForDict(dict, "DV").Get(),
-              "defaultValueKind", "defaultValue", &cut);
+              "defaultValueKind", "defaultValue", budget, &cut);
   if (type == CPDF_FormField::kComboBox || type == CPDF_FormField::kListBox) {
     AppendNextKey(out, "options");
     out->push_back('[');
     const int count = field->CountOptions();
     for (int i = 0; i < count; ++i) {
+      if (!budget->Take(kItemCost)) {
+        cut = true;
+        break;
+      }
       if (i > 0) {
         out->push_back(',');
       }
       out->push_back('{');
       AppendKey(out, "exportValue");
-      AppendWide(out, field->GetOptionValue(i), &cut);
+      AppendWideText(out, field->GetOptionValue(i), kMaxTextBytes, budget,
+                     &cut);
       AppendNextKey(out, "displayValue");
-      AppendWide(out, field->GetOptionLabel(i), &cut);
+      AppendWideText(out, field->GetOptionLabel(i), kMaxTextBytes, budget,
+                     &cut);
       out->push_back('}');
     }
     out->push_back(']');
@@ -411,7 +525,7 @@ void AppendField(std::string* out,
       out->append(std::to_string(ti->GetInteger()));
     }
   }
-  AppendTextFor(out, EntryFor(dict, "TU").Get(), "tooltip", &cut);
+  AppendTextFor(out, EntryFor(dict, "TU").Get(), "tooltip", budget, &cut);
   const bool toggle = type == CPDF_FormField::kCheckBox ||
                       type == CPDF_FormField::kRadioButton;
   AppendNextKey(out, "widgets");
@@ -423,123 +537,95 @@ void AppendField(std::string* out,
     if (!control) {
       continue;
     }
+    if (!budget->Take(kEntryCost)) {
+      cut = true;
+      break;
+    }
     if (!first) {
       out->push_back(',');
     }
     first = false;
-    AppendWidget(out, control, toggle, places);
+    AppendWidget(out, control, toggle, places, budget);
   }
   out->push_back(']');
-  if (cut) {
+  if (cut || budget->spent()) {
     AppendNextKey(out, "truncated");
     out->append("true");
   }
   out->push_back('}');
 }
 
-// The deepest level of /Fields and its /Kids, how many dictionaries they hold
-// and whether a /Kids entry names a dictionary already reached. Walks 1,000
-// levels deep; sets |*truncated| when there was more.
-void WalkFieldTree(const CPDF_Array* fields,
-                   int* deepest,
-                   size_t* nodes,
-                   bool* loops,
-                   bool* truncated) {
-  std::set<const CPDF_Dictionary*> seen;
-  std::vector<std::pair<RetainPtr<const CPDF_Dictionary>, int>> stack;
-  for (size_t i = 0; fields && i < fields->size(); ++i) {
-    RetainPtr<const CPDF_Dictionary> field = fields->GetDictAt(i);
-    if (field) {
-      stack.emplace_back(std::move(field), 1);
-    }
-  }
-  while (!stack.empty()) {
-    RetainPtr<const CPDF_Dictionary> field = std::move(stack.back().first);
-    const int depth = stack.back().second;
-    stack.pop_back();
-    if (!seen.insert(field.Get()).second) {
-      *loops = true;
-      continue;
-    }
-    *deepest = std::max(*deepest, depth);
-    ++*nodes;
-    RetainPtr<const CPDF_Array> kids = field->GetArrayFor("Kids");
-    for (size_t i = 0; kids && i < kids->size(); ++i) {
-      RetainPtr<const CPDF_Dictionary> kid = kids->GetDictAt(i);
-      if (!kid) {
-        continue;
-      }
-      if (depth >= kMaxDepth) {
-        *truncated = true;
-        break;
-      }
-      stack.emplace_back(std::move(kid), depth + 1);
-    }
-  }
-}
-
-// ,"<key>":{...} with the JavaScript under each key of |dict| that holds
-// some; returns whether any did.
+// The JavaScript under each key of |dict| that holds some, as "key":[...]
+// pairs; returns whether any did.
 bool AppendScriptsByKey(std::string* out,
                         const CPDF_Dictionary* dict,
+                        Budget* budget,
                         bool* cut) {
-  std::string scripts;
-  bool any = false;
+  bool first = true;
   CPDF_DictionaryLocker locker(dict);
   for (const auto& item : locker) {
+    if (budget->spent()) {
+      *cut = true;
+      break;
+    }
     std::string sources;
-    if (AppendScripts(&sources, item.second.Get(), cut) == 0) {
-      continue;
+    if (AppendScripts(&sources, item.second.Get(), budget, cut) > 0) {
+      AppendKeyedScripts(out, &first, item.first, sources, budget, cut);
     }
-    if (any) {
-      scripts.push_back(',');
-    }
-    any = true;
-    AppendName(&scripts, item.first);
-    scripts.push_back(':');
-    scripts.append(sources);
   }
-  out->append(scripts);
-  return any;
+  return !first;
 }
 
-// The /Names /JavaScript tree, each node once, in the tree's order.
+// The /Names /JavaScript tree in the tree's order, each node, /Names array
+// and /Kids array once, at most kMaxNames names and kMaxNames nodes.
 void AppendDocumentScripts(std::string* out,
                            const CPDF_Dictionary* tree,
+                           Budget* budget,
                            bool* truncated) {
-  std::set<const CPDF_Dictionary*> seen;
+  std::set<const CPDF_Object*> seen;
   std::vector<std::pair<RetainPtr<const CPDF_Dictionary>, int>> stack;
   if (tree) {
+    seen.insert(tree);
     stack.emplace_back(pdfium::WrapRetain(tree), 0);
   }
   size_t names = 0;
+  size_t nodes = 0;
   bool first = true;
   while (!stack.empty()) {
     RetainPtr<const CPDF_Dictionary> node = std::move(stack.back().first);
     const int depth = stack.back().second;
     stack.pop_back();
-    if (!seen.insert(node.Get()).second) {
-      continue;
+    if (++nodes > kMaxNames) {
+      *truncated = true;
+      return;
     }
     RetainPtr<const CPDF_Array> pairs = node->GetArrayFor("Names");
+    if (pairs && !seen.insert(pairs.Get()).second) {
+      pairs = nullptr;
+    }
     for (size_t i = 0; pairs && i + 1 < pairs->size(); i += 2) {
-      if (names++ == kMaxNames) {
+      if (names++ == kMaxNames || budget->spent()) {
         *truncated = true;
         return;
       }
       RetainPtr<const CPDF_Object> name = pairs->GetDirectObjectAt(i);
       bool cut = false;
-      const std::vector<WideString> sources =
-          inkbar::report::CollectScripts(pairs->GetObjectAt(i + 1).Get(), &cut);
       std::string entry_name;
       if (name && name->IsString()) {
-        AppendFileText(&entry_name, name->GetString(), kMaxTextBytes, &cut);
+        AppendFileText(&entry_name, name->GetString(), kMaxTextBytes, budget,
+                       &cut);
       } else {
         entry_name = "null";
       }
+      const std::vector<WideString> sources = inkbar::report::CollectScripts(
+          pairs->GetObjectAt(i + 1).Get(), budget, &cut);
       *truncated = *truncated || cut;
       for (const WideString& source : sources) {
-        const size_t mark = out->size();
+        // The name is charged again for each source that repeats it.
+        if (!budget->Take(kItemCost + entry_name.size())) {
+          *truncated = true;
+          return;
+        }
         if (!first) {
           out->push_back(',');
         }
@@ -548,25 +634,27 @@ void AppendDocumentScripts(std::string* out,
         out->append(",\"source\":");
         AppendText(out, source);
         out->push_back('}');
-        // The document's scripts take at most half the report.
-        if (out->size() > kMaxReportBytes / 2) {
-          out->resize(mark);
-          *truncated = true;
-          return;
-        }
         first = false;
       }
     }
     RetainPtr<const CPDF_Array> kids = node->GetArrayFor("Kids");
-    if (kids && depth + 1 > kMaxDepth) {
+    if (!kids || !seen.insert(kids.Get()).second) {
+      continue;
+    }
+    if (depth + 1 > kMaxDepth) {
       *truncated = true;
       continue;
     }
-    for (size_t i = kids ? kids->size() : 0; i > 0; --i) {
-      RetainPtr<const CPDF_Dictionary> kid = kids->GetDictAt(i - 1);
-      if (kid) {
-        stack.emplace_back(std::move(kid), depth + 1);
+    // Pushed last first, so the first kid is read next.
+    std::vector<RetainPtr<const CPDF_Dictionary>> fresh;
+    for (size_t i = 0; i < kids->size(); ++i) {
+      RetainPtr<const CPDF_Dictionary> kid = kids->GetDictAt(i);
+      if (kid && seen.insert(kid.Get()).second) {
+        fresh.push_back(std::move(kid));
       }
+    }
+    for (auto it = fresh.rbegin(); it != fresh.rend(); ++it) {
+      stack.emplace_back(std::move(*it), depth + 1);
     }
   }
 }
@@ -592,42 +680,44 @@ char* INK_Form(FPDF_DOCUMENT doc) {
   out.append(Boolean(acro_form &&
                      acro_form->GetBooleanFor("NeedAppearances", false)));
   bool truncated = false;
-  AppendTextFor(&out, EntryFor(acro_form.Get(), "DA").Get(), "da", &truncated);
+  // Half the report for /AcroForm's own keys and the fields, the rest for
+  // /CO and the closing keys, so /CO always fits.
+  Budget budget(kMaxReportBytes / 2);
+  AppendTextFor(&out, EntryFor(acro_form.Get(), "DA").Get(), "da", &budget,
+                &truncated);
   if (const CPDF_Number* q = ToNumber(EntryFor(acro_form.Get(), "Q").Get())) {
     AppendNextKey(&out, "q");
     AppendNumber(&out, q->GetNumber());
   }
 
-  int deepest = 0;
-  size_t nodes = 0;
-  bool loops = false;
-  WalkFieldTree(acro_form ? acro_form->GetArrayFor("Fields").Get() : nullptr,
-                &deepest, &nodes, &loops, &truncated);
-  size_t widgets = 0;
-  const Places places = SweepPlaces(pdf, &widgets);
+  const FieldTree tree = WalkFieldTree(
+      acro_form ? acro_form->GetArrayFor("Fields").Get() : nullptr);
+  truncated = truncated || tree.too_deep;
+  size_t reconciled = 0;
+  const Places places = SweepPlaces(pdf, tree.seen, &reconciled);
+  // PDFium's field tree takes time that grows with the square of what it
+  // loads, about 19 s for 50,000 fields, so above that it is not loaded.
+  const bool too_large =
+      tree.too_many || tree.seen.size() + reconciled > kMaxFields;
 
   AppendNextKey(&out, "fields");
   out.push_back('[');
   std::map<WideString, int> index_of;
-  // PDFium's field tree takes time that grows with the square of the fields
-  // it loads, about 19 s for 50,000. Past the cap no field is read.
-  std::unique_ptr<CPDF_InteractiveForm> form;
-  if (nodes > kMaxFields || widgets > kMaxFields) {
-    truncated = true;
-  } else {
+  if (!too_large) {
     // As EPDFForm_LoadModel: the declared tree, then the page sweep.
-    form = std::make_unique<CPDF_InteractiveForm>(pdf);
+    CPDF_InteractiveForm form(pdf);
     const std::set<const CPDF_Dictionary*> declared =
-        epdf::CollectFieldDicts(*form);
-    epdf::SweepPageWidgets(pdf, form.get());
-    const size_t count = epdf::CountFormFields(*form);
+        epdf::CollectFieldDicts(form);
+    epdf::SweepPageWidgets(pdf, &form);
+    const size_t count = epdf::CountFormFields(form);
     int written = 0;
     for (size_t i = 0; i < count; ++i) {
-      CPDF_FormField* field = form->GetField(i, WideString());
+      CPDF_FormField* field = form.GetField(i, WideString());
       if (!field) {
         continue;
       }
-      if (static_cast<size_t>(written) == kMaxFields) {
+      if (static_cast<size_t>(written) == kMaxFields ||
+          !budget.Take(kEntryCost)) {
         truncated = true;
         break;
       }
@@ -636,21 +726,27 @@ char* INK_Form(FPDF_DOCUMENT doc) {
         out.push_back(',');
       }
       const CPDF_Dictionary* dict = field->GetFieldDict().Get();
-      AppendField(&out, field, !declared.count(dict), places);
+      AppendField(&out, field, !declared.count(dict), places, &budget);
+      // The budget charges at least what is written; this is a backstop.
       if (out.size() > kMaxReportBytes / 2) {
-        // Half the report is the most fields take, so /CO always fits.
         out.resize(mark);
         truncated = true;
         break;
       }
       index_of.try_emplace(field->GetFullName(), written);
       ++written;
+      // A field the budget cut ends the list.
+      if (budget.spent()) {
+        truncated = true;
+        break;
+      }
     }
   }
   out.push_back(']');
 
   // Each /CO entry names the field whose full name its dictionary has, as
-  // CPDF_InteractiveForm::GetFieldInCalculationOrder finds it.
+  // CPDF_InteractiveForm::GetFieldInCalculationOrder finds it. An entry costs
+  // at most 2 * kItemCost: kMaxFields of them fit in what is left.
   AppendNextKey(&out, "calculationOrder");
   out.push_back('[');
   std::string refs = "[";
@@ -679,9 +775,11 @@ char* INK_Form(FPDF_DOCUMENT doc) {
   out.append(refs);
 
   AppendNextKey(&out, "fieldTreeDepth");
-  out.append(std::to_string(deepest));
-  AppendNextKey(&out, "fieldTreeLoops");
-  out.append(Boolean(loops));
+  out.append(std::to_string(tree.deepest));
+  AppendNextKey(&out, "fieldTreeRevisits");
+  out.append(Boolean(tree.revisits));
+  AppendNextKey(&out, "tooLarge");
+  out.append(Boolean(too_large));
   AppendNextKey(&out, "truncated");
   out.append(Boolean(truncated));
   out.push_back('}');
@@ -696,40 +794,37 @@ char* INK_Scripts(FPDF_DOCUMENT doc) {
   }
   const CPDF_Dictionary* root = pdf->GetRoot();
   bool truncated = false;
+  Budget budget(kMaxReportBytes - kClosing);
   std::string out = "{\"document\":[";
   RetainPtr<const CPDF_Dictionary> names =
       root ? root->GetDictFor("Names") : nullptr;
   AppendDocumentScripts(
-      &out, names ? names->GetDictFor("JavaScript").Get() : nullptr,
+      &out, names ? names->GetDictFor("JavaScript").Get() : nullptr, &budget,
       &truncated);
   out.append("],\"documentActions\":{");
-  std::string actions;
   std::string sources;
-  if (AppendScripts(&sources, EntryFor(root, "OpenAction").Get(),
+  bool first = true;
+  if (AppendScripts(&sources, EntryFor(root, "OpenAction").Get(), &budget,
                     &truncated) > 0) {
-    actions.append("\"OpenAction\":");
-    actions.append(sources);
+    out.append("\"OpenAction\":");
+    out.append(sources);
+    first = false;
   }
   RetainPtr<const CPDF_Object> aa_object = EntryFor(root, "AA");
   if (const CPDF_Dictionary* aa =
           aa_object ? aa_object->AsDictionary() : nullptr) {
     std::string by_key;
-    if (AppendScriptsByKey(&by_key, aa, &truncated)) {
-      if (!actions.empty()) {
-        actions.push_back(',');
+    if (AppendScriptsByKey(&by_key, aa, &budget, &truncated)) {
+      if (!first) {
+        out.push_back(',');
       }
-      actions.append(by_key);
+      out.append(by_key);
     }
-  }
-  if (out.size() + actions.size() > kMaxReportBytes * 3 / 4) {
-    truncated = true;
-  } else {
-    out.append(actions);
   }
   out.append("},\"pageActions\":[");
   const int page_count = pdf->GetPageCount();
-  bool first = true;
-  for (int i = 0; i < page_count; ++i) {
+  first = true;
+  for (int i = 0; i < page_count && !budget.spent(); ++i) {
     RetainPtr<const CPDF_Dictionary> page = pdf->GetPageDictionary(i);
     RetainPtr<const CPDF_Object> page_aa =
         page ? EntryFor(page.Get(), "AA") : nullptr;
@@ -738,10 +833,13 @@ char* INK_Scripts(FPDF_DOCUMENT doc) {
       continue;
     }
     std::string by_key;
-    if (!AppendScriptsByKey(&by_key, aa, &truncated)) {
+    if (!AppendScriptsByKey(&by_key, aa, &budget, &truncated)) {
       continue;
     }
-    const size_t mark = out.size();
+    if (!budget.Take(kItemCost)) {
+      truncated = true;
+      break;
+    }
     if (!first) {
       out.push_back(',');
     }
@@ -750,13 +848,9 @@ char* INK_Scripts(FPDF_DOCUMENT doc) {
     out.append(",\"scripts\":{");
     out.append(by_key);
     out.append("}}");
-    if (out.size() > kMaxReportBytes - kClosing) {
-      out.resize(mark);
-      truncated = true;
-      break;
-    }
     first = false;
   }
+  truncated = truncated || budget.spent();
   out.append("],\"truncated\":");
   out.append(Boolean(truncated));
   out.push_back('}');
@@ -779,8 +873,11 @@ char* INK_Doc_Facts(FPDF_DOCUMENT doc) {
   std::string out = "{";
   bool cut = false;
   std::string text;
-  AppendTextFor(&text, EntryFor(info.Get(), "Title").Get(), "title", &cut);
-  AppendTextFor(&text, EntryFor(info.Get(), "Author").Get(), "author", &cut);
+  Budget budget(kMaxReportBytes - kClosing);
+  AppendTextFor(&text, EntryFor(info.Get(), "Title").Get(), "title", &budget,
+                &cut);
+  AppendTextFor(&text, EntryFor(info.Get(), "Author").Get(), "author",
+                &budget, &cut);
   // Each key above wrote a leading comma.
   if (!text.empty()) {
     out.append(text, 1, std::string::npos);

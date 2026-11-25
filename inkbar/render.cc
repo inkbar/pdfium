@@ -105,7 +105,11 @@ std::vector<SavedFlags> HideListed(FPDF_PAGE page,
       pdf_page ? pdf_page->GetAnnotsArray() : nullptr;
   for (size_t i = 0; annots && i < annots->size(); ++i) {
     RetainPtr<const CPDF_Dictionary> dict = annots->GetDictAt(i);
-    if (!dict || (!listed.count(dict->GetObjNum()) && !places.count(i))) {
+    // A place names a dictionary only, as the reports count them: a stream
+    // there is not an annotation.
+    const bool at_place =
+        places.count(i) && ToDictionary(annots->GetDirectObjectAt(i));
+    if (!dict || (!listed.count(dict->GetObjNum()) && !at_place)) {
       continue;
     }
     // The render lists annotations through the same const_cast.

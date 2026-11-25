@@ -4300,8 +4300,8 @@ function heapMatrix(values) {
 }
 
 // Draws annotation |index| of page |pageIndex| alone onto a transparent bitmap
-// of the page's size, in |state| (null: the one /AS selects). Returns the
-// result and the bytes.
+// of the page's size, in |state| (null: the one /AS selects; a Buffer: the
+// name's bytes; a string: its UTF-8). Returns the result and the bytes.
 function drawAnnot(doc, pageIndex, index, state) {
   const page = m._FPDF_LoadPage(doc, pageIndex)
   assert.notEqual(page, 0)
@@ -4310,7 +4310,17 @@ function drawAnnot(doc, pageIndex, index, state) {
   const bitmap = m._FPDFBitmap_CreateEx(width, height, 4, 0, 0)
   m._FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0)
   const matrix = heapMatrix([width / m._FPDF_GetPageWidthF(page), 0, 0, height / m._FPDF_GetPageHeightF(page), 0, 0])
-  const drew = state === null ? m._INK_Annot_Draw(bitmap, page, index, 0, matrix) : withStrings([state], (name) => m._INK_Annot_Draw(bitmap, page, index, name, matrix))
+  let drew
+  if (state === null) {
+    drew = m._INK_Annot_Draw(bitmap, page, index, 0, matrix)
+  } else if (Buffer.isBuffer(state)) {
+    // A state as the name's own bytes.
+    const name = heapBytes(Buffer.concat([state, Buffer.from([0])]))
+    drew = m._INK_Annot_Draw(bitmap, page, index, name, matrix)
+    m._free(name)
+  } else {
+    drew = withStrings([state], (name) => m._INK_Annot_Draw(bitmap, page, index, name, matrix))
+  }
   const bytes = bitmapBytes(bitmap, height)
   m._free(matrix)
   m._FPDFBitmap_Destroy(bitmap)
@@ -4513,7 +4523,7 @@ const inked = (bytes) => bytes.some((b) => b !== 0)
     assert.equal(annots[5].truncated, true)
     assert.equal(annots[4].truncated, undefined)
     const form = takeJson(m._INK_Form(doc))
-    assert.deepEqual(form, { kind: 'none', needAppearances: false, fields: [], calculationOrder: [], calculationOrderRefs: [], fieldTreeDepth: 0, fieldTreeLoops: false, truncated: false })
+    assert.deepEqual(form, { kind: 'none', needAppearances: false, fields: [], calculationOrder: [], calculationOrderRefs: [], fieldTreeDepth: 0, fieldTreeRevisits: false, tooLarge: false, truncated: false })
     assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'a report changed what a save writes')
   })
 }
@@ -4542,7 +4552,8 @@ const inked = (bytes) => bytes.some((b) => b !== 0)
     const started = Date.now()
     const form = takeJson(m._INK_Form(doc))
     assert.ok(Date.now() - started < 5000, `the looping tree took ${Date.now() - started} ms`)
-    assert.equal(form.fieldTreeLoops, true)
+    assert.equal(form.fieldTreeRevisits, true)
+    assert.equal(form.tooLarge, false)
     assert.equal(form.truncated, false)
     const field = (name) => form.fields.find((f) => f.name === name)
     assert.deepEqual(
@@ -4577,7 +4588,7 @@ const inked = (bytes) => bytes.some((b) => b !== 0)
     const started = Date.now()
     const form = takeJson(m._INK_Form(doc))
     assert.ok(Date.now() - started < 5000, `50,001 fields took ${Date.now() - started} ms`)
-    assert.deepEqual([form.fields.length, form.truncated], [0, true])
+    assert.deepEqual([form.fields.length, form.tooLarge, form.truncated], [0, true, false], 'refused, not cut short')
     const ptr = m._INK_Annots_Page(doc, 0)
     const text = cString(ptr)
     m._INK_Json_Free(ptr)
@@ -4589,6 +4600,78 @@ const inked = (bytes) => bytes.some((b) => b !== 0)
       annots.slice(0, 2).map((a) => a.index),
       [0, 1],
     )
+  })
+}
+
+{
+  // 1,000 form fields and 50,001 widget annotations with no /FT, which the
+  // form does not load: they do not count towards the limit.
+  const fields = 1000
+  const pdf = buildPdf([
+    `<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [${Array.from({ length: fields }, (_, i) => `${i + 4} 0 R`).join(' ')}] >> >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [${'<< /Subtype /Widget /Rect [0 0 1 1] >> '.repeat(50001)}] >>`,
+    ...Array.from({ length: fields }, (_, i) => `<< /FT /Tx /T (f${i}) >>`),
+  ])
+  withPdf(pdf, (doc) => {
+    const form = takeJson(m._INK_Form(doc))
+    assert.deepEqual([form.fields.length, form.tooLarge, form.truncated], [fields, false, false])
+  })
+}
+
+{
+  // 20,000 dictionaries that all share one /Kids array, which lists them all,
+  // as the form's fields and as the /Names /JavaScript tree. Each array is
+  // walked once.
+  const n = 20000
+  const refs = Array.from({ length: n }, (_, i) => `${i + 5} 0 R`).join(' ')
+  const pdf = buildPdf([
+    `<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [${refs}] >> /Names << /JavaScript << /Kids 4 0 R >> >> >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} >>`,
+    `[${refs}]`,
+    ...Array.from({ length: n }, (_, i) => `<< /T (f${i}) /Kids 4 0 R /Names [(s${i}) << /S /JavaScript /JS (x) >>] >>`),
+  ])
+  withPdf(pdf, (doc) => {
+    let started = Date.now()
+    const form = takeJson(m._INK_Form(doc))
+    assert.ok(Date.now() - started < 2000, `the shared /Kids took ${Date.now() - started} ms`)
+    assert.equal(form.fieldTreeRevisits, true)
+    started = Date.now()
+    const scripts = takeJson(m._INK_Scripts(doc))
+    assert.ok(Date.now() - started < 2000, `the shared name tree took ${Date.now() - started} ms`)
+    assert.deepEqual([scripts.document.length, scripts.document[0], scripts.truncated], [n, { name: 's0', source: 'x' }, false])
+  })
+}
+
+{
+  // 1,000 JavaScript actions whose /JS is one 3 MB stream, as the open
+  // action's chain and as a widget's /A chain, and 2,000 widgets of one
+  // field sharing a /MK /BC of 1,000,000 numbers: each report stops within
+  // 16 MB and says so.
+  const chain = `<< /S /JavaScript /JS 6 0 R /Next [${'<< /S /JavaScript /JS 6 0 R >> '.repeat(999)}] >>`
+  const widgets = 2000
+  const pdf = buildPdf([
+    `<< /Type /Catalog /Pages 2 0 R /OpenAction ${chain} /AcroForm << /Fields [8 0 R 9 0 R] >> >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} >>`,
+    '<< >>',
+    '<< >>',
+    streamObject('', `/* ${'x'.repeat(3 * 1024 * 1024)} */`, true),
+    `[${'1 '.repeat(1000000)}]`,
+    `<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (script) /Rect [0 0 10 10] /A ${chain} >>`,
+    `<< /FT /Tx /T (wide) /Kids [${Array.from({ length: widgets }, (_, i) => `${i + 10} 0 R`).join(' ')}] >>`,
+    ...Array.from({ length: widgets }, () => '<< /Type /Annot /Subtype /Widget /Parent 9 0 R /Rect [0 0 1 1] /MK << /BC 7 0 R >> >>'),
+  ])
+  withPdf(pdf, (doc) => {
+    for (const call of ['_INK_Scripts', '_INK_Form']) {
+      const ptr = m[call](doc)
+      assert.notEqual(ptr, 0, call)
+      const text = cString(ptr)
+      m._INK_Json_Free(ptr)
+      assert.ok(Buffer.byteLength(text) <= 16 * 1024 * 1024, `${call}: ${Buffer.byteLength(text)} bytes`)
+      assert.equal(JSON.parse(text).truncated, true, `${call} was not cut`)
+    }
   })
 }
 
@@ -4633,6 +4716,55 @@ const inked = (bytes) => bytes.some((b) => b !== 0)
     assert.deepEqual(field('print').widgets[0].action, { s: 'Named', name: 'Print' })
     assert.equal(field('go').kind, 'button')
     assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'the form report changed what a save writes')
+  })
+}
+
+{
+  // Toggles whose appearances are odd: a checkbox with no Off appearance, an
+  // on-state with a space (/Yes#20No) and one with a byte past ASCII
+  // (/On#E9), a text widget with no appearance and an open popup with none,
+  // whose parent note has text for it.
+  // Drawing them writes nothing to the file.
+  const box = (x) => `/Rect [${x} 10 ${x + 20} 30]`
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 7 0 R 8 0 R 9 0 R] /DA (/Helv 12 Tf 0 g) >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] /Annots [6 0 R 7 0 R 8 0 R 9 0 R 10 0 R] >>`,
+    '<< >>',
+    '<< >>',
+    `<< /Type /Annot /Subtype /Widget /FT /Btn /T (noOff) ${box(10)} /AS /Yes /AP << /N << /Yes 11 0 R >> >> >>`,
+    `<< /Type /Annot /Subtype /Widget /FT /Btn /T (spaced) ${box(40)} /AS /Off /AP << /N << /Off 12 0 R /Yes#20No 11 0 R >> >> >>`,
+    `<< /Type /Annot /Subtype /Widget /FT /Btn /T (accent) ${box(70)} /AS /Off /AP << /N << /Off 12 0 R /On#E9 11 0 R >> >> >>`,
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (bare) /Rect [100 10 200 30] /V (hello) >>',
+    '<< /Type /Annot /Subtype /Popup /Rect [0 50 100 90] /Open true /Parent 13 0 R >>',
+    streamObject('/Type /XObject /Subtype /Form /BBox [0 0 20 20]', '0 0 1 rg 0 0 20 20 re f'),
+    streamObject('/Type /XObject /Subtype /Form /BBox [0 0 20 20]', '1 0 0 rg 0 0 20 20 re f'),
+    '<< /Type /Annot /Subtype /Text /Rect [0 90 20 100] /Contents (A note) /T (Sam) /Popup 10 0 R >>',
+  ])
+  withPdf(pdf, (doc) => {
+    const unread = saveWith(doc, NO_INCREMENTAL)
+    const form = takeJson(m._INK_Form(doc))
+    const widget = (name) => form.fields.find((f) => f.name === name).widgets[0]
+    assert.deepEqual([widget('noOff').states, widget('noOff').onState], [['Yes'], 'Yes'])
+    assert.equal(drawAnnot(doc, 0, 0, 'Off').drew, 0, 'Off where there is none')
+    assert.ok(inked(drawAnnot(doc, 0, 0, null).bytes), 'the checked box with no Off drew nothing')
+    // The on-state name round-trips into the draw as the report writes it.
+    assert.equal(widget('spaced').onState, 'Yes No')
+    const spacedOff = drawAnnot(doc, 0, 1, 'Off')
+    const spacedOn = drawAnnot(doc, 0, 1, widget('spaced').onState)
+    assert.deepEqual([spacedOff.drew, spacedOn.drew], [1, 1])
+    assert.ok(!spacedOff.bytes.equals(spacedOn.bytes), '/Yes#20No draws as Off')
+    // A name's bytes past ASCII are code points U+0080 to U+00FF: the draw
+    // takes them back as those bytes, not as their UTF-8.
+    assert.equal(widget('accent').onState, 'Oné')
+    const accentOn = drawAnnot(doc, 0, 2, Buffer.from(widget('accent').onState, 'latin1'))
+    assert.equal(accentOn.drew, 1)
+    assert.ok(inked(accentOn.bytes), 'the on-state with a byte past ASCII drew nothing')
+    assert.equal(drawAnnot(doc, 0, 2, widget('accent').onState).drew, 0, 'a state given as UTF-8')
+    assert.equal(widget('bare').hasAppearance, false)
+    drawAnnot(doc, 0, 3, null)
+    assert.equal(drawAnnot(doc, 0, 4, null).drew, 0, 'an open popup')
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'a draw changed what a save writes')
   })
 }
 

@@ -22,8 +22,10 @@ extern "C" {
 // The JavaScript sources of an action chain under each key, in the order the
 // chain gives them (the action, then its /Next, depth first, each object once,
 // at most 1,000 actions). A source is cut after the last character whose
-// written form ends within 4 MB. A key whose chain holds no JavaScript is
-// left out. A cut source or chain sets the entry's "truncated".
+// written form ends within 4 MB, and the chain's sources take at most what is
+// left of the report's 16 MB, charged as they are read: no source is decoded
+// once it is spent. A key whose chain holds no JavaScript is left out. A cut
+// source or chain sets the entry's "truncated".
 
 // { "kind": "none" | "acroform" | "xfa", "needAppearances": false,
 //   "da": Text, "q": 0,
@@ -51,7 +53,8 @@ extern "C" {
 //       "truncated": true } ],
 //     "truncated": true } ],
 //   "calculationOrder": [3, -1], "calculationOrderRefs": [[11, 0], null],
-//   "fieldTreeDepth": 2, "fieldTreeLoops": false, "truncated": false }
+//   "fieldTreeDepth": 2, "fieldTreeRevisits": false, "tooLarge": false,
+//   "truncated": false }
 //
 // The form is read as EPDFForm_LoadModel reads it: the /AcroForm field tree
 // merged by full name and joined with a sweep of every page's /Annots, so a
@@ -80,9 +83,11 @@ extern "C" {
 // "backgroundColor" (/MK /BG) are numbers as written, any length;
 // "rotation" is /MK /R and "caption" /MK /CA. "q", "da" are inherited along
 // /Parent; "tooltip" is the widget's own /TU and "pmd" true when the widget
-// has /PMD. "scripts" holds /AA's actions by their keys, each key from the
-// nearest dictionary along /Parent (the widget first) that has JavaScript
-// under it, and "A" for the widget's own /A. "action" is the widget's own /A
+// has /PMD. "scripts" holds /AA's actions by their keys, and "A" for the
+// widget's own /A. Here the report applies a rule: /AA is merged along
+// /Parent, each key from the nearest dictionary (the widget first) whose
+// action under it holds JavaScript. That is how PDF.js reads a widget's
+// actions, and the viewer's reader follows it today. "action" is the widget's own /A
 // when it is a dictionary; only the first action of a chain is described.
 //
 // "calculationOrder" has an entry for each entry of /AcroForm /CO: the index
@@ -91,13 +96,25 @@ extern "C" {
 // "calculationOrderRefs" the same
 // entries as references, null for one that is not a reference.
 // "fieldTreeDepth" is the deepest level of /Fields and /Kids below /Fields
-// (1 for a top-level field), and "fieldTreeLoops" whether a /Kids entry names a
-// dictionary the walk already reached. The walk goes 1,000 levels deep.
-// At most 50,000 fields and 50,000 /CO entries. When the field tree holds more
-// than 50,000 dictionaries, or the pages more than 50,000 widgets, no field is
-// read: PDFium's field tree takes time that grows with the square of what it
-// loads. The fields take at most half the report, so /CO always fits.
-// "truncated" says when a cap or the 16 MB cut the report short.
+// (1 for a top-level field), and "fieldTreeRevisits" whether the walk reached
+// a dictionary or a /Kids array a second time (a loop, or one shared). The
+// walk reads each dictionary and each /Kids array once and goes 1,000 levels
+// deep.
+//
+// "tooLarge": the form is refused, not cut short. When the field tree holds
+// more than 50,000 dictionaries, or those and the widgets the page sweep would
+// add to the form (widget annotations outside the tree with /FT along
+// /Parent) number more than 50,000, PDFium's form is not loaded and "fields"
+// is []: its field tree takes time that grows with the square of what it
+// loads, about 19 s for 50,000 fields, so no part of the list can be had
+// cheaply. /CO is still reported.
+//
+// "truncated": a cap cut the report short. At most 50,000 fields and 50,000
+// /CO entries; the fields take at most half the report, charged as they are
+// written (keys 1 KB an entry, a number 16 bytes, text, names and scripts what
+// they write), so /CO always fits and objects the file shares between many
+// fields or widgets cannot grow one entry past the cap. A field or widget cut
+// by the budget has "truncated": true and ends the list.
 char* INK_Form(FPDF_DOCUMENT doc);
 
 // { "document": [ { "name": Text, "source": "..." } ],
@@ -110,7 +127,9 @@ char* INK_Form(FPDF_DOCUMENT doc);
 // catalog's /OpenAction when it is an action and /AA, as Scripts.
 // "pageActions" has an entry for each page whose /AA holds JavaScript, every
 // page of the file in order. The name tree is walked 1,000 levels deep, each
-// node once, and at most 50,000 names are read.
+// node, /Names array and /Kids array once, and at most 50,000 nodes and 50,000
+// names are read. Sources are charged to the 16 MB as they are read, and the
+// report stops, "truncated", when it is spent.
 char* INK_Scripts(FPDF_DOCUMENT doc);
 
 // { "title": Text, "author": Text, "encrypted": true,

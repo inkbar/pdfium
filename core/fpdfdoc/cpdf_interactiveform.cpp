@@ -7,7 +7,6 @@
 #include "core/fpdfdoc/cpdf_interactiveform.h"
 
 #include <optional>
-#include <set>  // Inkbar: LoadField walks each dictionary once.
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -890,11 +889,11 @@ RetainPtr<const CPDF_Dictionary> CPDF_InteractiveForm::ResolveCurrentDict(
 void CPDF_InteractiveForm::LoadField(
     RetainPtr<const CPDF_Dictionary> field_dict,
     int nLevel) {
-  // Inkbar: one walk loads each dictionary once. A /Kids loop whose nodes
-  // list each other more than once otherwise doubled the work at every level
-  // down to kMaxRecursion.
-  std::set<const CPDF_Dictionary*> loaded;
-  auto load = [this, &loaded](auto& self,
+  // Inkbar: the form loads each field dictionary, and walks each /Kids array,
+  // once (|loaded_fields_|). A /Kids loop whose nodes list each other more
+  // than once doubled the work at every level down to kMaxRecursion, and
+  // fields sharing one /Kids array walked it once each.
+  auto load = [this](auto& self,
                               RetainPtr<const CPDF_Dictionary> field_dict,
                               int nLevel) -> void {
     if (nLevel > kMaxRecursion) {
@@ -907,7 +906,7 @@ void CPDF_InteractiveForm::LoadField(
     // promotions win over frozen base instances reached through base-held
     // references.
     field_dict = ResolveCurrentDict(std::move(field_dict));
-    if (!loaded.insert(field_dict.Get()).second) {
+    if (!loaded_fields_.insert(field_dict).second) {
       return;
     }
 
@@ -928,6 +927,9 @@ void CPDF_InteractiveForm::LoadField(
     if (!pFirstKid->KeyExist(pdfium::form_fields::kT) &&
         !pFirstKid->KeyExist(pdfium::form_fields::kKids)) {
       AddTerminalField(std::move(field_dict));
+      return;
+    }
+    if (!loaded_fields_.insert(kids).second) {
       return;
     }
     for (size_t i = 0; i < kids->size(); i++) {

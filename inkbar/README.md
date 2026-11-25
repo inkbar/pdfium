@@ -69,7 +69,7 @@ The checkout is mounted into the container. `scripts/embedpdf-runtime/build-targ
 
 The binary is single-threaded.
 
-Current size of `inkbar-pdfium.wasm`: 7,044,885 bytes raw, 2,966,944 bytes gzipped at level 9. It exports 112 functions. The budget is 3,256,192 bytes gzipped.
+Current size of `inkbar-pdfium.wasm`: 7,047,999 bytes raw, 2,967,860 bytes gzipped at level 9. It exports 112 functions. The budget is 3,256,192 bytes gzipped.
 
 ## The redaction check
 
@@ -160,12 +160,16 @@ The reports of `annots.h` and `form.h` say what the file holds and decide nothin
 
 Caps, each reported with `"truncated": true`:
 
-- a report writes at most 16 MB; an entry that would pass that is left out and the report stops there;
+- a report writes at most 16 MB. Each writer charges what it writes to that budget before it writes it (an entry's keys 1 KB, a number 16 bytes, text, names and scripts their written bytes), so objects the file shares between many entries (one `/JS` stream under 1,000 actions, one `/MK /BC` array under 2,000 widgets) cannot grow an entry past the cap. When the budget is spent a writer stops, nothing more is decoded, the entry it was writing says `"truncated": true`, and the report ends there;
 - 200,000 annotations a page;
 - 1,000,000 numbers in `/QuadPoints` or `/Vertices`, and in `/InkList` as a whole;
 - a text string writes at most 1 MB (512 KB of bytes in hex), a script 4 MB;
-- 50,000 fields, and 50,000 `/CO` entries. When the field tree holds more than 50,000 dictionaries, or the pages more than 50,000 widgets, no field is read: PDFium's field tree takes time that grows with the square of what it loads, about 19 s for 50,000 fields;
-- walks of a field tree, a `/Parent` chain, a structure tree and a name tree go at most 1,000 levels deep and visit each object once; an action chain is read for at most 1,000 actions.
+- 50,000 fields, and 50,000 `/CO` entries;
+- walks of a field tree, a `/Parent` chain, a structure tree and a name tree go at most 1,000 levels deep and visit each object once; the field tree and name tree walks also read each `/Kids` array once, so a `/Kids` array that 20,000 fields share is read once; the name tree reads at most 50,000 nodes; an action chain is read for at most 1,000 actions.
+
+One limit is a refusal, reported with `"tooLarge": true` in `INK_Form`: when the field tree holds more than 50,000 dictionaries, or those and the widgets the page sweep would add (widget annotations outside the tree with `/FT` along `/Parent`) number more than 50,000, the form is not loaded and `fields` is empty. PDFium's field tree takes time that grows with the square of what it loads, about 19 s for 50,000 fields, so no part of the list can be had cheaply.
+
+`INK_Form` applies one rule of its own: a widget's `"scripts"` merge `/AA` along `/Parent`, each key from the nearest dictionary whose action holds JavaScript. PDF.js reads a widget's actions that way, and the viewer's reader follows it today.
 
 PDFium loads the field tree 33 levels deep and leaves out a field with no name. A deeper field is not in `INK_Form`'s fields; `fieldTreeDepth` says how deep the tree goes.
 
@@ -173,7 +177,7 @@ PDFium loads the field tree 33 levels deep and leaves out a field with no name. 
 
 Every change this fork's Inkbar commits make outside `inkbar/`. Update this list with any further such change, and re-check each entry after every upstream merge.
 
-- `core/fpdfdoc/cpdf_interactiveform.cpp`, in `LoadField`: one walk of the field tree loads each dictionary once. A `/Kids` loop whose nodes list each other twice doubled the work at each level down to the depth limit of 32, so `EPDFForm_LoadModel`, `INK_Form` and the form-fill environment did not return. The smoke check guards it.
+- `core/fpdfdoc/cpdf_interactiveform.{h,cpp}`, `LoadField` and a member `loaded_fields_`: the form loads each field dictionary, and walks each `/Kids` array, once in its life. A `/Kids` loop whose nodes list each other twice doubled the work at each level down to the depth limit of 32, and 20,000 fields sharing one `/Kids` array walked it 20,000 times, so `EPDFForm_LoadModel`, `INK_Form` and the form-fill environment did not return. The set holds its objects, so an address is not reused. The smoke check guards both.
 
 - `core/fpdfdoc/cpdf_interactiveform.cpp`, in `InitDict`: a created `/AcroForm` is given an empty `/Fields` array. ISO 32000 requires the entry, and without it Poppler reports "Can't get Fields array". The smoke check guards it.
 - `core/fpdfapi/edit/cpdf_image_redactor.{h,cpp}`: `RedactionHoleSamples()`, a public wrapper over the file's own `HoleSamples()` and `ColorSpaceOf()`, so the redaction check compares an image with the value the redaction fills it with. The smoke check guards it.

@@ -50,6 +50,10 @@ extern "C" {
 //     "da": Text, "q": 1, "pmd": true, "parent": [9, 0],
 //     "truncated": true } ],
 //   "tabs": "S", "truncated": false }
+// Each entry takes from the report's 16 MB as it is written (keys charged
+// 1 KB, a number 16 bytes, text and names what they write), so objects the
+// file shares between many annotations cannot grow one entry past the cap:
+// an entry cut by it has "truncated": true and ends the report.
 // "annots" has an entry for every dictionary in /Annots, in order, "index" its
 // place there; any other entry, a stream included, is skipped and the entries
 // after it keep their places. At most 200,000 entries. "objectNumber" and
@@ -93,8 +97,10 @@ char* INK_Struct_Order(FPDF_DOCUMENT doc, int page_index);
 // stream with a state given, draws nothing. Nothing is written to the
 // document: a widget with no appearance is drawn from memory or not at all.
 // Returns 1 when it drew, 0 otherwise: a NULL bitmap or page, no dictionary
-// at |annot_index|, an annotation with no rectangle to draw in, or a page an
-// InkRender holds (INK_Render_Start to INK_Render_Close).
+// at |annot_index|, an annotation with no rectangle to draw in, a page an
+// InkRender holds (INK_Render_Start to INK_Render_Close), and always for a
+// hidden annotation (/F Hidden) and for a popup, open or closed: PDFium would
+// write an appearance into the file for an open popup that has none.
 int INK_Annot_Draw(FPDF_BITMAP bitmap,
                    FPDF_PAGE page,
                    int annot_index,

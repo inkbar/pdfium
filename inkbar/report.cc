@@ -146,25 +146,66 @@ RetainPtr<const CPDF_Object> EntryFor(const CPDF_Dictionary* dict,
   return object && !object->IsNull() ? object : nullptr;
 }
 
+void AppendWideText(std::string* out,
+                    const WideString& text,
+                    size_t limit,
+                    Budget* budget,
+                    bool* cut) {
+  const size_t room = std::min(limit, budget->left());
+  size_t written = 0;
+  bool text_cut = false;
+  json::AppendText(out, json::CutText(text, room, &written, &text_cut));
+  budget->Take(written);
+  if (text_cut) {
+    *cut = true;
+    if (room < limit) {
+      budget->Spend();
+    }
+  }
+}
+
 void AppendFileText(std::string* out,
                     const ByteString& bytes,
                     size_t limit,
+                    Budget* budget,
                     bool* cut) {
-  if (IsText(bytes)) {
-    size_t written = 0;
-    bool text_cut = false;
-    json::AppendText(out, json::CutText(PDF_DecodeText(bytes.unsigned_span()),
-                                        limit, &written, &text_cut));
-    *cut = *cut || text_cut;
+  if (budget->left() == 0) {
+    // Decode nothing once the budget is spent.
+    budget->Spend();
+    *cut = true;
+    out->append("\"\"");
     return;
   }
-  const size_t keep = std::min(bytes.GetLength(), limit / 2);
+  if (IsText(bytes)) {
+    AppendWideText(out, PDF_DecodeText(bytes.unsigned_span()), limit, budget,
+                   cut);
+    return;
+  }
+  const size_t room = std::min(limit, budget->left());
+  const size_t keep = std::min(bytes.GetLength(), room / 2);
+  budget->Take(keep * 2);
   if (keep < bytes.GetLength()) {
     *cut = true;
+    if (room < limit) {
+      budget->Spend();
+    }
   }
   out->append("{\"bytes\":");
   json::AppendHex(out, bytes.First(keep));
   out->push_back('}');
+}
+
+void AppendFileName(std::string* out,
+                    const ByteString& name,
+                    Budget* budget,
+                    bool* cut) {
+  const size_t mark = out->size();
+  json::AppendName(out, name);
+  if (!budget->Take(out->size() - mark)) {
+    out->resize(mark);
+    out->append("null");
+    *cut = true;
+  }
 }
 
 void AppendRef(std::string* out, const CPDF_Object* object) {
@@ -184,10 +225,15 @@ void AppendRef(std::string* out, const CPDF_Object* object) {
 void AppendNumbers(std::string* out,
                    const CPDF_Array* array,
                    size_t max,
+                   Budget* budget,
                    bool* cut) {
   out->push_back('[');
   const size_t size = array ? array->size() : 0;
   for (size_t i = 0; i < size && i < max; ++i) {
+    if (!budget->Take(16)) {
+      *cut = true;
+      break;
+    }
     if (i > 0) {
       out->push_back(',');
     }
@@ -204,9 +250,13 @@ void AppendNumbers(std::string* out,
   out->push_back(']');
 }
 
-void AppendNames(std::string* out, const CPDF_Array* array) {
+void AppendNames(std::string* out,
+                 const CPDF_Array* array,
+                 Budget* budget,
+                 bool* cut) {
   out->push_back('[');
   for (size_t i = 0; array && i < array->size(); ++i) {
+    const size_t mark = out->size();
     if (i > 0) {
       out->push_back(',');
     }
@@ -215,6 +265,11 @@ void AppendNames(std::string* out, const CPDF_Array* array) {
       json::AppendName(out, entry->GetString());
     } else {
       out->append("null");
+    }
+    if (!budget->Take(out->size() - mark)) {
+      out->resize(mark);
+      *cut = true;
+      break;
     }
   }
   out->push_back(']');
@@ -227,7 +282,9 @@ void AppendRect(std::string* out, const CPDF_Dictionary* dict) {
   bool ok = rect && rect->size() == 4;
   if (rect) {
     bool more = false;
-    AppendNumbers(out, rect, 4, &more);
+    // Four numbers at most: within the entry's own cost.
+    Budget room(4 * 16);
+    AppendNumbers(out, rect, 4, &room, &more);
     for (size_t i = 0; ok && i < 4; ++i) {
       const CPDF_Number* number = ToNumber(rect->GetDirectObjectAt(i).Get());
       ok = number && std::isfinite(number->GetNumber());
@@ -239,7 +296,10 @@ void AppendRect(std::string* out, const CPDF_Dictionary* dict) {
   out->append(Boolean(ok));
 }
 
-void AppendAppearance(std::string* out, const CPDF_Dictionary* dict) {
+void AppendAppearance(std::string* out,
+                      const CPDF_Dictionary* dict,
+                      Budget* budget,
+                      bool* cut) {
   RetainPtr<const CPDF_Object> ap_object = EntryFor(dict, "AP");
   const CPDF_Dictionary* ap = ap_object ? ap_object->AsDictionary() : nullptr;
   RetainPtr<const CPDF_Object> normal = EntryFor(ap, "N");
@@ -250,7 +310,7 @@ void AppendAppearance(std::string* out, const CPDF_Dictionary* dict) {
   bool has_appearance = normal && normal->IsStream();
   if (states && has_as) {
     RetainPtr<const CPDF_Object> chosen =
-        EntryFor(states, as->GetString().c_str());
+        states->GetDirectObjectFor(as->GetString().AsStringView());
     has_appearance = chosen && chosen->IsStream();
   }
   AppendNextKey(out, "hasAppearance");
@@ -265,17 +325,29 @@ void AppendAppearance(std::string* out, const CPDF_Dictionary* dict) {
     bool first = true;
     CPDF_DictionaryLocker locker(states);
     for (const auto& item : locker) {
+      const size_t mark = out->size();
       if (!first) {
         out->push_back(',');
       }
-      first = false;
       json::AppendName(out, item.first);
+      if (!budget->Take(out->size() - mark)) {
+        out->resize(mark);
+        *cut = true;
+        break;
+      }
+      first = false;
     }
     out->push_back(']');
   }
   if (has_as) {
     AppendNextKey(out, "as");
+    const size_t mark = out->size();
     json::AppendName(out, as->GetString());
+    if (!budget->Take(out->size() - mark)) {
+      out->resize(mark);
+      out->append("null");
+      *cut = true;
+    }
   }
 }
 
@@ -306,11 +378,14 @@ void AppendBorder(std::string* out, const CPDF_Dictionary* dict) {
           border_object ? border_object->AsArray() : nullptr) {
     AppendNextKey(out, "border");
     bool more = false;
-    AppendNumbers(out, border, 3, &more);
+    Budget room(3 * 16);
+    AppendNumbers(out, border, 3, &room, &more);
   }
 }
 
-std::vector<WideString> CollectScripts(const CPDF_Object* action, bool* cut) {
+std::vector<WideString> CollectScripts(const CPDF_Object* action,
+                                       Budget* budget,
+                                       bool* cut) {
   std::vector<WideString> sources;
   size_t read = 0;
   std::set<const CPDF_Object*> seen;
@@ -343,12 +418,26 @@ std::vector<WideString> CollectScripts(const CPDF_Object* action, bool* cut) {
       break;
     }
     if (dict->GetNameFor("S") == "JavaScript") {
+      // Decode nothing once the budget is spent.
+      if (budget->left() == 0) {
+        budget->Spend();
+        *cut = true;
+        break;
+      }
+      const size_t room = std::min(kMaxScriptBytes, budget->left());
       CPDF_Action js(pdfium::WrapRetain(dict));
       size_t written = 0;
       bool source_cut = false;
-      sources.push_back(json::CutText(js.GetJavaScript(), kMaxScriptBytes,
-                                      &written, &source_cut));
-      *cut = *cut || source_cut;
+      sources.push_back(
+          json::CutText(js.GetJavaScript(), room, &written, &source_cut));
+      budget->Take(written + 3);
+      if (source_cut) {
+        *cut = true;
+        if (room < kMaxScriptBytes) {
+          budget->Spend();
+          break;
+        }
+      }
     }
     RetainPtr<const CPDF_Object> next = dict->GetObjectFor("Next");
     if (next) {
@@ -358,8 +447,11 @@ std::vector<WideString> CollectScripts(const CPDF_Object* action, bool* cut) {
   return sources;
 }
 
-size_t AppendScripts(std::string* out, const CPDF_Object* action, bool* cut) {
-  const std::vector<WideString> sources = CollectScripts(action, cut);
+size_t AppendScripts(std::string* out,
+                     const CPDF_Object* action,
+                     Budget* budget,
+                     bool* cut) {
+  const std::vector<WideString> sources = CollectScripts(action, budget, cut);
   out->push_back('[');
   for (size_t i = 0; i < sources.size(); ++i) {
     if (i > 0) {

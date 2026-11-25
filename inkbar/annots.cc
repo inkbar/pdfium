@@ -35,7 +35,11 @@ using inkbar::report::AppendFileText;
 using inkbar::report::AppendKey;
 using inkbar::report::AppendNextKey;
 using inkbar::report::AppendNumbers;
+using inkbar::report::AppendFileName;
 using inkbar::report::AppendRef;
+using inkbar::report::Budget;
+using inkbar::report::kEntryCost;
+using inkbar::report::kItemCost;
 using inkbar::report::Boolean;
 using inkbar::report::EntryFor;
 using inkbar::report::kMaxNumbers;
@@ -44,6 +48,8 @@ using inkbar::report::kMaxTextBytes;
 
 constexpr size_t kMaxAnnots = 200000;
 constexpr size_t kMaxStructObjects = 1000000;
+// Room kept for the keys that close a report.
+constexpr size_t kClosing = 256;
 
 const CPDF_Array* ArrayFor(const CPDF_Dictionary* dict,
                            const char* key,
@@ -52,13 +58,12 @@ const CPDF_Array* ArrayFor(const CPDF_Dictionary* dict,
   return *hold ? (*hold)->AsArray() : nullptr;
 }
 
-// ,"key":[numbers] when |key| is an array; |*budget| is what is left of
-// kMaxNumbers for this entry.
+// ,"key":[numbers] when |key| is an array, at most kMaxNumbers of them.
 void AppendNumbersFor(std::string* out,
                       const CPDF_Dictionary* dict,
                       const char* key,
                       const char* name,
-                      size_t* budget,
+                      Budget* budget,
                       bool* cut) {
   RetainPtr<const CPDF_Object> hold;
   const CPDF_Array* array = ArrayFor(dict, key, &hold);
@@ -66,42 +71,49 @@ void AppendNumbersFor(std::string* out,
     return;
   }
   AppendNextKey(out, name);
-  AppendNumbers(out, array, *budget, cut);
-  *budget -= std::min(*budget, array->size());
+  AppendNumbers(out, array, kMaxNumbers, budget, cut);
 }
 
 void AppendTextFor(std::string* out,
                    const CPDF_Dictionary* dict,
                    const char* key,
                    const char* name,
+                   Budget* budget,
                    bool* cut) {
   RetainPtr<const CPDF_Object> value = EntryFor(dict, key);
   if (!value || !value->IsString()) {
     return;
   }
   AppendNextKey(out, name);
-  AppendFileText(out, value->GetString(), kMaxTextBytes, cut);
+  AppendFileText(out, value->GetString(), kMaxTextBytes, budget, cut);
 }
 
 void AppendNameFor(std::string* out,
                    const CPDF_Dictionary* dict,
                    const char* key,
-                   const char* name) {
+                   const char* name,
+                   Budget* budget,
+                   bool* cut) {
   RetainPtr<const CPDF_Object> value = EntryFor(dict, key);
   if (!value || !value->IsName()) {
     return;
   }
   AppendNextKey(out, name);
-  AppendName(out, value->GetString());
+  AppendFileName(out, value->GetString(), budget, cut);
 }
 
-void AppendAnnot(std::string* out, size_t index, const CPDF_Dictionary* annot) {
+// Writes as much of the entry as |budget| allows, and says "truncated" when
+// it cut anything.
+void AppendAnnot(std::string* out,
+                 size_t index,
+                 const CPDF_Dictionary* annot,
+                 Budget* budget) {
   bool cut = false;
   out->push_back('{');
   AppendKey(out, "index");
   out->append(std::to_string(index));
   AppendNextKey(out, "subtype");
-  AppendName(out, annot->GetNameFor("Subtype"));
+  AppendFileName(out, annot->GetNameFor("Subtype"), budget, &cut);
   if (annot->GetObjNum() != 0) {
     AppendNextKey(out, "objectNumber");
     out->append(std::to_string(annot->GetObjNum()));
@@ -111,27 +123,25 @@ void AppendAnnot(std::string* out, size_t index, const CPDF_Dictionary* annot) {
   inkbar::report::AppendRect(out, annot);
   AppendNextKey(out, "flags");
   out->append(std::to_string(annot->GetIntegerFor("F")));
-  inkbar::report::AppendAppearance(out, annot);
+  inkbar::report::AppendAppearance(out, annot, budget, &cut);
 
-  // Each array has a budget of its own.
   for (const auto& [key, name] :
        {std::pair{"QuadPoints", "quads"}, std::pair{"C", "color"},
         std::pair{"IC", "interiorColor"}, std::pair{"L", "line"},
         std::pair{"Vertices", "vertices"}}) {
-    size_t numbers = kMaxNumbers;
-    AppendNumbersFor(out, annot, key, name, &numbers, &cut);
+    AppendNumbersFor(out, annot, key, name, budget, &cut);
   }
 
   if (const CPDF_Number* opacity = ToNumber(EntryFor(annot, "CA").Get())) {
     AppendNextKey(out, "opacity");
     AppendNumber(out, opacity->GetNumber());
   }
-  AppendTextFor(out, annot, "Contents", "contents", &cut);
-  AppendTextFor(out, annot, "T", "author", &cut);
-  AppendTextFor(out, annot, "CreationDate", "created", &cut);
-  AppendTextFor(out, annot, "M", "modified", &cut);
-  AppendNameFor(out, annot, "Name", "icon");
-  AppendNameFor(out, annot, "IT", "intent");
+  AppendTextFor(out, annot, "Contents", "contents", budget, &cut);
+  AppendTextFor(out, annot, "T", "author", budget, &cut);
+  AppendTextFor(out, annot, "CreationDate", "created", budget, &cut);
+  AppendTextFor(out, annot, "M", "modified", budget, &cut);
+  AppendNameFor(out, annot, "Name", "icon", budget, &cut);
+  AppendNameFor(out, annot, "IT", "intent", budget, &cut);
   RetainPtr<const CPDF_Object> irt = annot->GetObjectFor("IRT");
   if (irt && irt->IsReference()) {
     AppendNextKey(out, "inReplyTo");
@@ -140,14 +150,14 @@ void AppendAnnot(std::string* out, size_t index, const CPDF_Dictionary* annot) {
   RetainPtr<const CPDF_Object> hold;
   if (const CPDF_Array* le = ArrayFor(annot, "LE", &hold)) {
     AppendNextKey(out, "lineEndings");
-    inkbar::report::AppendNames(out, le);
+    inkbar::report::AppendNames(out, le, budget, &cut);
   }
   if (const CPDF_Array* ink = ArrayFor(annot, "InkList", &hold)) {
     AppendNextKey(out, "inkLists");
     out->push_back('[');
     size_t left = kMaxNumbers;
     for (size_t i = 0; i < ink->size(); ++i) {
-      if (left == 0) {
+      if (left == 0 || !budget->Take(kItemCost)) {
         cut = true;
         break;
       }
@@ -160,13 +170,13 @@ void AppendAnnot(std::string* out, size_t index, const CPDF_Dictionary* annot) {
         out->append("null");
         continue;
       }
-      AppendNumbers(out, points, left, &cut);
+      AppendNumbers(out, points, left, budget, &cut);
       left -= std::min(left, points->size());
     }
     out->push_back(']');
   }
   inkbar::report::AppendBorder(out, annot);
-  AppendTextFor(out, annot, "DA", "da", &cut);
+  AppendTextFor(out, annot, "DA", "da", budget, &cut);
   if (const CPDF_Number* q = ToNumber(EntryFor(annot, "Q").Get())) {
     AppendNextKey(out, "q");
     AppendNumber(out, q->GetNumber());
@@ -215,8 +225,18 @@ char* INK_Annots_Page(FPDF_DOCUMENT doc, int page_index) {
   if (!page) {
     return nullptr;
   }
-  std::string out = "{\"annots\":[";
+  // Room is kept for the keys that close the report.
+  Budget budget(kMaxReportBytes - kClosing);
   bool truncated = false;
+  std::string out = "{\"tabs\":";
+  RetainPtr<const CPDF_Object> tabs = EntryFor(page.Get(), "Tabs");
+  if (tabs && tabs->IsName()) {
+    inkbar::report::AppendFileName(&out, tabs->GetString(), &budget,
+                                   &truncated);
+  } else {
+    out.append("null");
+  }
+  out.append(",\"annots\":[");
   size_t listed = 0;
   RetainPtr<const CPDF_Array> annots = page->GetArrayFor("Annots");
   for (size_t i = 0; annots && i < annots->size(); ++i) {
@@ -227,7 +247,7 @@ char* INK_Annots_Page(FPDF_DOCUMENT doc, int page_index) {
     if (!annot) {
       continue;
     }
-    if (listed == kMaxAnnots) {
+    if (listed == kMaxAnnots || !budget.Take(kEntryCost)) {
       truncated = true;
       break;
     }
@@ -235,22 +255,21 @@ char* INK_Annots_Page(FPDF_DOCUMENT doc, int page_index) {
     if (listed > 0) {
       out.push_back(',');
     }
-    AppendAnnot(&out, i, annot);
-    if (out.size() > kMaxReportBytes - 64) {
+    AppendAnnot(&out, i, annot, &budget);
+    // The budget charges at least what is written; this is a backstop.
+    if (out.size() > kMaxReportBytes - kClosing) {
       out.resize(mark);
       truncated = true;
       break;
     }
     ++listed;
+    // An entry the budget cut ends the report.
+    if (budget.spent()) {
+      truncated = true;
+      break;
+    }
   }
-  out.append("],\"tabs\":");
-  RetainPtr<const CPDF_Object> tabs = EntryFor(page.Get(), "Tabs");
-  if (tabs && tabs->IsName()) {
-    AppendName(&out, tabs->GetString());
-  } else {
-    out.append("null");
-  }
-  out.append(",\"truncated\":");
+  out.append("],\"truncated\":");
   out.append(Boolean(truncated));
   out.push_back('}');
   return inkbar::report::Copy(out);
@@ -345,6 +364,19 @@ int INK_Annot_Draw(FPDF_BITMAP bitmap,
   {
     ScopedFPDFPageView view(page);
     if (!view || view.Get()->GetRenderContext()) {
+      return 0;
+    }
+  }
+  {
+    // A popup is not drawn: an open one with no appearance would get one
+    // written into the file (CPDF_Annot::GenerateAPIfNeeded).
+    ScopedFPDFPageView view(page);
+    RetainPtr<const CPDF_Array> annots = view.Get()->GetAnnotsArray();
+    RetainPtr<const CPDF_Dictionary> dict =
+        annots && static_cast<size_t>(annot_index) < annots->size()
+            ? ToDictionary(annots->GetDirectObjectAt(annot_index))
+            : nullptr;
+    if (!dict || dict->GetNameFor("Subtype") == "Popup") {
       return 0;
     }
   }
