@@ -251,10 +251,19 @@ void AppendValue(std::string* out,
       if (entry && entry->IsString()) {
         AppendFileText(out, entry->GetString(), kMaxTextBytes, budget, cut);
       } else if (entry && entry->IsName()) {
-        // Within the entry's kItemCost; the name charges what it writes.
-        out->append("{\"name\":");
-        AppendFileName(out, entry->GetString(), budget, cut);
-        out->push_back('}');
+        // The wrapper is within the entry's kItemCost; the name is charged
+        // what it writes. A name the budget cannot take leaves the entry
+        // null.
+        std::string name;
+        inkbar::json::AppendName(&name, entry->GetString());
+        if (budget->Take(name.size())) {
+          out->append("{\"name\":");
+          out->append(name);
+          out->push_back('}');
+        } else {
+          *cut = true;
+          out->append("null");
+        }
       } else {
         out->append("null");
       }

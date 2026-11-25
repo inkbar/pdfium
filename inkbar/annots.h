@@ -31,11 +31,11 @@ extern "C" {
 // bytes, each the code point of its value (U+0000 to U+00FF). An integer is
 // written exactly as PDFium holds it (32 bits; an unsigned one past INT_MAX
 // unsigned). A real is written as the shortest decimal that reads back as the
-// 32-bit float PDFium keeps for it (0.4 as 0.4); PDFium keeps no more of the
-// token. A number that is absent where a number is due, not a number or not
-// finite is null. A reference is [number,
-// generation], the generation that of the object the file holds under the
-// number, 0 when none.
+// 32-bit float PDFium keeps for it, fixed or scientific, whichever is
+// shorter (0.4 as 0.4, 600.0 as 600, 1e20 as 1e+20); PDFium keeps no more of
+// the token. A number that is absent where a number is due, not a number or
+// not finite is null. A reference is [number, generation], the generation
+// that of the object the file holds under the number, 0 when none.
 
 // Reads /Annots from the page dictionary without parsing the page's content,
 // so it loads no font.
@@ -73,8 +73,9 @@ extern "C" {
 // "vertices" /Vertices are arrays of numbers as written, any length;
 // "inkLists" is /InkList, an array of arrays (an entry that is not an array
 // is null). /QuadPoints, /Vertices and /InkList as a whole are read up to
-// 1,000,000 numbers, and an entry cut there has "truncated": true. "opacity" is /CA; "contents" /Contents,
-// "author" /T, "created" /CreationDate and "modified" /M are text strings.
+// 1,000,000 numbers, and an entry cut there has "truncated": true.
+// "opacity" is /CA; "contents" /Contents, "author" /T, "created"
+// /CreationDate and "modified" /M are text strings.
 // "icon" is /Name, "intent" /IT and "lineEndings" /LE names (an entry of /LE
 // that is not a name is null). "inReplyTo" is /IRT when it is a reference;
 // it may name the annotation itself. "da" is /DA and "q" /Q, the

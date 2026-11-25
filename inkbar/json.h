@@ -10,8 +10,8 @@
 
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 
+#include <charconv>
 #include <cmath>
 #include <string>
 
@@ -92,23 +92,23 @@ inline void AppendNumber(std::string* out, float value) {
   out->append(buffer);
 }
 
-// A float as the shortest decimal (at most 9 significant digits) that reads
-// back as the same float: 0.4f is written 0.4, not 0.400000006. null when it
-// is not finite.
+// A float as the shortest decimal that reads back as the same float, as
+// std::to_chars writes it with no format: fixed or scientific, whichever is
+// shorter (fixed on a tie), so 0.4f is 0.4, 600.0f is 600 and 1e20f is
+// 1e+20. Its forms are all JSON numbers: an optional "-", digits with a "0"
+// before any point, and an exponent of "e", a sign and at least two digits
+// (1e-05). At most 15 bytes: a sign, 9 digits, a point and an exponent of
+// 4, so a number with its comma fits the 16 bytes a report charges it. null
+// when it is not finite.
 inline void AppendShortestNumber(std::string* out, float value) {
   if (!std::isfinite(value)) {
     out->append("null");
     return;
   }
   char buffer[32];
-  for (int digits = 1; digits <= 9; ++digits) {
-    snprintf(buffer, sizeof(buffer), "%.*g", digits,
-             static_cast<double>(value));
-    if (strtof(buffer, nullptr) == value) {
-      break;
-    }
-  }
-  out->append(buffer);
+  const std::to_chars_result result =
+      std::to_chars(buffer, buffer + sizeof(buffer), value);
+  out->append(buffer, result.ptr);
 }
 
 // The bytes AppendCodePoint writes for |c|: 2 for a quote or a backslash, 6

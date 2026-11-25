@@ -128,8 +128,8 @@ void AppendRef(std::string* out, const CPDF_Object* object);
 // an unsigned one past INT_MAX is written unsigned. A real is kept by PDFium
 // only as a 32-bit float, the token being dropped as it parses, so it is
 // written as the shortest decimal that reads back as that float
-// (json::AppendShortestNumber): 0.4 is written 0.4, not 0.400000006. A real
-// that is not finite is null.
+// (json::AppendShortestNumber, std::to_chars): 0.4 is written 0.4, not
+// 0.400000006, and 600.0 is written 600. A real that is not finite is null.
 void AppendNumber(std::string* out, const CPDF_Number* number);
 
 // An array's entries as AppendNumber writes them, each null when it is not a

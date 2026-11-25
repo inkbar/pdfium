@@ -5308,6 +5308,32 @@ function scriptReports(pdf, within, what) {
   })
 }
 
+{
+  // How numbers are written, read from the report's text, which parsed values
+  // cannot show: whole reals without an exponent or a point, minus zero, a
+  // denormal, an unsigned integer past INT_MAX written exactly, a large real,
+  // a colour component of n/255, and 0.4 and 0.1 as written.
+  const tiny = `0.${'0'.repeat(44)}14`
+  const pdf = onePagePdf('', { page: '/Annots [6 0 R]' }, [
+    `<< /Type /Annot /Subtype /Square /Rect [100.0 0 600.0 10.5] /C [-0.0 ${tiny} 3000000000 3000000000.5 0.9490196 0.4 0.1] /CA 0.1 >>`,
+  ])
+  withPdf(pdf, (doc) => {
+    const ptr = m._INK_Annots_Page(doc, 0)
+    const text = cString(ptr)
+    m._INK_Json_Free(ptr)
+    assert.ok(text.includes('"rect":[100,0,600,10.5]'), text)
+    assert.ok(text.includes('"color":[-0,1e-45,3000000000,3e+09,0.9490196,0.4,0.1]'), text)
+    assert.ok(text.includes('"opacity":0.1'), text)
+    const { annots } = JSON.parse(text)
+    assert.ok(Object.is(annots[0].color[0], -0), 'minus zero')
+    assert.deepEqual(
+      annots[0].color.slice(1).map((v) => Math.fround(v)),
+      [1e-45, 3000000000, 3000000000.5, 0.9490196, 0.4, 0.1].map((v) => Math.fround(v)),
+      'each reads back as the float',
+    )
+  })
+}
+
 m._INK_Destroy()
 // SMOKE_OUT, SMOKE_FORM_OUT and SMOKE_IMAGE_OUT name files to receive the saved
 // documents, for qpdf --check: the appearance document, the text box, border
