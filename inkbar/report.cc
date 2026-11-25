@@ -23,9 +23,12 @@
 #include "core/fpdfapi/parser/cpdf_stream.h"
 #include "core/fpdfapi/parser/cpdf_stream_acc.h"
 #include "core/fpdfapi/parser/fpdf_parser_decode.h"
+#include "core/fxcodec/image_predictors.h"
 #include "core/fxcrt/data_vector.h"
 #include "core/fxcrt/span.h"
 #include "inkbar/json.h"
+// Links without a dependency of its own: libembedpdf.a is a complete
+// library and bundles the zlib PDFium is built with.
 #include "third_party/zlib/zlib.h"
 
 namespace inkbar::report {
@@ -189,42 +192,81 @@ DataVector<uint8_t> InflateFirst(pdfium::span<const uint8_t> raw,
   return out;
 }
 
-// Whether PDFium's decoding of |decoders| holds at most |limit| bytes at any
-// stage for |raw_size| stored bytes, by the most each filter can grow what it
-// reads: 1,032 times for Flate (258 bytes from 2 bits), 4,096 for LZW (a
-// code of 9 bits or more gives at most 4,000 bytes), 128 for run lengths (one
-// byte can ask for 128), 4 for ASCII85 (a "z" is four bytes), and nothing for
-// ASCIIHex and Crypt. A predictor never grows its input.
-bool DecodesWithin(const DecoderArray& decoders, size_t raw_size, size_t limit) {
+// No bound on what a filter gives.
+constexpr size_t kNoBound = std::numeric_limits<size_t>::max();
+
+// The most bytes a filter PDFium decodes can give for each byte it reads:
+// 1,032 for Flate (258 bytes from 2 bits), 4,096 for LZW (a code of 9 bits
+// or more gives at most 4,000 bytes), 128 for run lengths (one byte can ask
+// for 128), 4 for ASCII85 (a "z" is four bytes), 1 for ASCIIHex and Crypt.
+// A predictor never grows its input. 0 for any other name: PDFium takes it
+// for an image's filter and stops there, with what it has decoded so far.
+size_t Growth(const ByteString& filter) {
+  if (filter == "FlateDecode" || filter == "Fl") {
+    return 1032;
+  }
+  if (filter == "LZWDecode" || filter == "LZW") {
+    return 4096;
+  }
+  if (filter == "RunLengthDecode" || filter == "RL") {
+    return 128;
+  }
+  if (filter == "ASCII85Decode" || filter == "A85") {
+    return 4;
+  }
+  if (filter == "ASCIIHexDecode" || filter == "AHx" || filter == "Crypt") {
+    return 1;
+  }
+#if defined(PDF_ENABLE_BROTLI)
+  if (filter == "BrotliDecode") {
+    return kNoBound;
+  }
+#endif
+  return 0;
+}
+
+// The most bytes PDFium's decoding of |decoders| can produce over all its
+// stages for |raw_size| stored bytes, each stage taken at the most its filter
+// can grow the stage before; nullopt when a stage could pass |limit|. A
+// stage may do that much work and leave almost nothing (ASCIIHex over 16 MB
+// of spaces), so this, not the result, is what a decode costs.
+std::optional<size_t> DecodeCost(const DecoderArray& decoders,
+                                 size_t raw_size,
+                                 size_t limit) {
   size_t bound = raw_size;
+  size_t cost = 0;
   for (const auto& decoder : decoders) {
-    const ByteString& filter = decoder.first;
-    size_t growth = 1;
-    if (filter == "FlateDecode" || filter == "Fl") {
-      growth = 1032;
-    } else if (filter == "LZWDecode" || filter == "LZW") {
-      growth = 4096;
-    } else if (filter == "RunLengthDecode" || filter == "RL") {
-      growth = 128;
-    } else if (filter == "ASCII85Decode" || filter == "A85") {
-      growth = 4;
-    } else if (filter == "ASCIIHexDecode" || filter == "AHx" ||
-               filter == "Crypt") {
-      growth = 1;
-    } else if (filter == "BrotliDecode") {
-      // No bound.
-      return false;
-    } else {
-      // PDFium takes any other filter for an image's and stops there, with
-      // what it has decoded so far.
+    const size_t growth = Growth(decoder.first);
+    if (growth == 0) {
       break;
     }
-    if (bound > limit / growth) {
-      return false;
+    if (growth == kNoBound || bound > limit / growth) {
+      return std::nullopt;
     }
     bound *= growth;
+    cost += bound;
   }
-  return bound <= limit;
+  if (bound > limit) {
+    return std::nullopt;
+  }
+  return cost;
+}
+
+// Whether PDFium inflates a stream with |filter| and |params| and does
+// nothing else to it: FlateDecode with no /DecodeParms dictionary, or with
+// one PDFium accepts whose /Predictor it reads as none.
+bool IsPlainFlate(const ByteString& filter, const CPDF_Object* params) {
+  if (filter != "FlateDecode" && filter != "Fl") {
+    return false;
+  }
+  const CPDF_Dictionary* dict = params ? params->AsDictionary() : nullptr;
+  if (!dict) {
+    return true;
+  }
+  std::optional<fxcodec::DecodeParams> checked = GetAndCheckDecodeParams(dict);
+  return checked.has_value() &&
+         fxcodec::GetPredictor(checked.value().predictor) ==
+             fxcodec::PredictorType::kNone;
 }
 
 }  // namespace
@@ -578,6 +620,11 @@ DataVector<uint8_t> ScriptReader::StreamBytes(const CPDF_Stream* stream,
     // No filter, or a /Filter PDFium cannot use: it reads the stored bytes.
     return StoredBytes(stream, cut);
   }
+  if (Growth(decoders.value().front().first) == 0) {
+    // PDFium takes the first filter for an image's and decodes nothing: it
+    // reads the stored bytes.
+    return StoredBytes(stream, cut);
+  }
   // A filtered stream is read whole before it is decoded.
   if (raw_size > decode_left_) {
     decode_left_ = 0;
@@ -590,33 +637,38 @@ DataVector<uint8_t> ScriptReader::StreamBytes(const CPDF_Stream* stream,
     *cut = true;
     return DataVector<uint8_t>();
   }
-  const ByteString& filter = decoders.value().front().first;
   auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(pdfium::WrapRetain(stream));
-  DataVector<uint8_t> bytes;
   if (decoders.value().size() == 1 &&
-      (filter == "FlateDecode" || filter == "Fl") &&
-      !ToDictionary(decoders.value().front().second)) {
-    // The one case PDFium inflates with FlateUncompress() and nothing else.
+      IsPlainFlate(decoders.value().front().first,
+                   decoders.value().front().second.Get())) {
     acc->LoadAllDataRaw();
+    pdfium::span<const uint8_t> raw = acc->GetSpan();
     bool more = false;
-    bytes = InflateFirst(acc->GetSpan(), limit, &more);
+    DataVector<uint8_t> bytes = InflateFirst(raw, limit, &more);
     if (bytes.empty()) {
       // As PDFium does: a stream that inflates to nothing keeps its stored
-      // bytes.
-      return StoredBytes(stream, cut);
+      // bytes, which are charged already.
+      if (raw.size() > limit) {
+        raw = raw.first(limit);
+        *cut = true;
+      }
+      return DataVector<uint8_t>(raw.begin(), raw.end());
     }
     *cut = *cut || more;
-  } else if (DecodesWithin(decoders.value(), raw_size, limit)) {
-    acc->LoadAllDataFiltered();
-    bytes = acc->DetachData();
-  } else {
-    // PDFium's stream reader runs these filters to the end with no cap, so
-    // what may pass the limit is not decoded at all.
-    *cut = true;
+    decode_left_ -= bytes.size();
     return bytes;
   }
-  decode_left_ -= std::min(decode_left_, bytes.size());
-  return bytes;
+  // PDFium's stream reader runs these filters to the end with no cap, so the
+  // stream is decoded only when no stage of it can pass the limit, and it is
+  // charged the most its stages can produce before it is decoded.
+  std::optional<size_t> cost = DecodeCost(decoders.value(), raw_size, limit);
+  if (!cost.has_value() || cost.value() > decode_left_) {
+    *cut = true;
+    return DataVector<uint8_t>();
+  }
+  decode_left_ -= cost.value();
+  acc->LoadAllDataFiltered();
+  return acc->DetachData();
 }
 
 const std::vector<WideString>& ScriptReader::Sources(const CPDF_Object* action,

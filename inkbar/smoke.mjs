@@ -4930,11 +4930,15 @@ function scriptReports(pdf, within, what) {
       // of them can pass the cap: PDFium decodes them.
       streamObject('/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 100 >>', deflateSync(rows(small)), true),
       streamObject('/Filter [/ASCIIHexDecode /FlateDecode]', Buffer.from(`${deflateSync(Buffer.from('chained()')).toString('hex')}>`), true),
+      // k4 and k5: /DecodeParms PDFium reads as no predictor: inflated in
+      // full like k0.
+      streamObject('/Filter /FlateDecode /DecodeParms << >>', packed, true),
+      streamObject('/Filter /FlateDecode /DecodeParms << /Predictor 1 >>', packed, true),
     ]),
     2000,
-    'four ordinary scripts',
+    'six ordinary scripts',
   )
-  assert.deepEqual(scripts.documentActions, { k0: [script], k1: [script], k2: [small], k3: ['chained()'] })
+  assert.deepEqual(scripts.documentActions, { k0: [script], k1: [script], k2: [small], k3: ['chained()'], k4: [script], k5: [script] })
   assert.equal(scripts.truncated, false, 'an ordinary script was marked cut')
   assert.deepEqual(form.fields[0].widgets[0].scripts, scripts.documentActions)
   assert.deepEqual([form.fields[0].widgets[0].truncated, form.truncated], [undefined, false])
@@ -4948,6 +4952,23 @@ function scriptReports(pdf, within, what) {
     assert.deepEqual([cutScripts.documentActions, cutScripts.truncated], [{ k0: [''] }, true])
     assert.deepEqual([cutForm.fields[0].widgets[0].scripts, cutForm.fields[0].widgets[0].truncated, cutForm.truncated], [{ k0: [''] }, true, true])
   }
+}
+
+{
+  // 1,000 /JS streams of 15 KB stored that inflate to a "0" and 15 MB of
+  // spaces and then go through ASCIIHex, which leaves one byte. A stream
+  // PDFium decodes is charged what its stages could produce, not what they
+  // leave, so the report decodes two and stops.
+  const packed = deflateSync(Buffer.concat([Buffer.from('0'), Buffer.alloc(15 * 1024 * 1024, ' ')]), { level: 9 })
+  assert.ok(packed.length * 1032 <= 16 * 1024 * 1024 + 3, `${packed.length} bytes stored`)
+  const stream = streamObject('/Filter [/FlateDecode /ASCIIHexDecode]', packed, true)
+  const [scripts, form] = scriptReports(scriptsPdf(Array.from({ length: 1000 }, () => stream)), 2000, '1,000 streams of 15 MB that leave a byte')
+  const sources = Object.values(scripts.documentActions).map(([source]) => source)
+  assert.equal(sources.length, 1000)
+  assert.equal(sources[0].length, 1, 'the first stream was not decoded')
+  assert.ok(sources.filter((source) => source !== '').length <= 4, 'more streams were decoded than the allowance covers')
+  assert.equal(scripts.truncated, true, 'the decode allowance ran out unmarked')
+  assert.deepEqual([form.fields[0].widgets[0].truncated, form.truncated], [true, true], 'the decode allowance ran out unmarked in the form')
 }
 
 {

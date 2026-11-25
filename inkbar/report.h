@@ -168,24 +168,31 @@ constexpr size_t kMaxDecodedBytes = 16 * 1024 * 1024;
 // The most bytes decoded from one /JS stream, all of which are turned into
 // text: enough for kMaxScriptBytes of text in any encoding (4 bytes a
 // character at most). No more of a stream is ever held decoded:
-//  - a stream with no filter gives its first stored bytes;
-//  - a stream whose one filter is FlateDecode with no /DecodeParms is
-//    inflated here with zlib, which stops at the cap;
-//  - any other (a chain of filters, /DecodeParms, another filter) is decoded
+//  - a stream with no filter, with a /Filter PDFium cannot use, or whose
+//    first filter PDFium takes for an image's (any name it does not decode,
+//    BrotliDecode among them in this build) gives its first stored bytes, as
+//    PDFium reads it;
+//  - a stream whose one filter is FlateDecode, with no /DecodeParms or with
+//    one PDFium reads as no predictor, is inflated here with zlib, which
+//    stops at the cap;
+//  - any other (a chain of filters, a predictor, another filter) is decoded
 //    by PDFium, whose stream reader runs the filters to the end with no cap,
-//    and only when its stored size times the most its filters can grow it is
-//    within the cap; a larger one is not decoded, and its source is empty and
-//    cut.
+//    and only when no stage of it can pass the cap: its stored size times
+//    the most its filters can grow it. A larger one is not decoded, and its
+//    source is empty and cut.
 // An encrypted file's streams are read the same way: PDFium decrypts a
 // stream when it parses the object, so its stored bytes are already plain.
 constexpr size_t kMaxScriptStreamBytes = 4 * kMaxScriptBytes + 3;
 // The most bytes one report reads from /JS streams and decodes from them,
-// whatever text they leave: a filtered stream is charged its stored bytes
-// and the bytes decoded from it, an unfiltered one the bytes taken. A stream
-// is cut to what is left, and once it is spent no stream is read. It is four
-// times the most bytes that can become text a report keeps (kMaxDecodedBytes
-// is 4 M characters, of 4 bytes at most), and decoding all of it takes a
-// fraction of a second.
+// whatever text they leave. A stream read as stored is charged the bytes
+// taken. A stream inflated here is charged its stored bytes and the bytes
+// inflated. A stream PDFium decodes is charged its stored bytes and, before
+// it is decoded, the most every stage of its filters could produce (a stage
+// can do that work and leave nothing), and is not decoded when that is more
+// than is left. A stream is cut to what is left, and once it is spent no
+// stream is read. It is four times the most bytes that can become text a
+// report keeps (kMaxDecodedBytes is 4 M characters, of 4 bytes at most), and
+// decoding all of it takes a fraction of a second.
 constexpr size_t kMaxDecodeBytes = 64 * 1024 * 1024;
 
 // Reads the JavaScript of action chains and /AA dictionaries for one report.
