@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Edward Coleridge Smith
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { deflateSync, inflateSync } from 'node:zlib'
+import { constants, deflateRawSync, deflateSync, inflateSync } from 'node:zlib'
 import createModule from './out/inkbar-pdfium.mjs'
 
 const pdfPath = process.argv[2]
@@ -4824,6 +4825,172 @@ const inked = (bytes) => bytes.some((b) => b !== 0)
     // already holds.
     assert.equal(widget('b').scripts.K[0].length, 4 * 1024 * 1024 - 5)
     assert.equal(widget('b').truncated, true, 'a cut /JS reached a second time lost its mark')
+  })
+}
+
+// A zlib stream that inflates to |piece| |times| over, built a piece at a
+// time so the whole is never held.
+function repeatedDeflate(piece, times) {
+  const block = deflateRawSync(piece, { finishFlush: constants.Z_FULL_FLUSH })
+  let a = 1n
+  let b = 0n
+  for (const byte of piece) {
+    a = (a + BigInt(byte)) % 65521n
+    b = (b + a) % 65521n
+  }
+  // Adler-32 of the piece repeated: each repeat adds the piece's sums, and
+  // its length times the sum so far.
+  let allA = 1n
+  let allB = 0n
+  for (let i = 0; i < times; i++) {
+    allB = (allB + b + BigInt(piece.length) * (allA - 1n)) % 65521n
+    allA = (allA + a - 1n) % 65521n
+  }
+  const adler = Buffer.alloc(4)
+  adler.writeUInt32BE(Number((allB << 16n) | allA))
+  return Buffer.concat([Buffer.from([0x78, 0x9c]), ...Array.from({ length: times }, () => block), Buffer.from([0x03, 0x00]), adler])
+}
+// A catalog whose /AA and a widget whose /AA hold the /JS |streams|, objects
+// 8 on.
+const scriptsPdf = (streams) =>
+  buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R] >> /AA 6 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
+    '<< >>',
+    '<< >>',
+    `<< ${streams.map((_, i) => `/k${i} << /S /JavaScript /JS ${i + 8} 0 R >>`).join(' ')} >>`,
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (f) /Rect [0 0 10 10] /AA 6 0 R >>',
+    ...streams,
+  ])
+// Both reports of |pdf|, each checked to return within |within| ms.
+function scriptReports(pdf, within, what) {
+  return withPdf(pdf, (doc) =>
+    ['_INK_Scripts', '_INK_Form'].map((call) => {
+      const started = Date.now()
+      const ptr = m[call](doc)
+      const took = Date.now() - started
+      assert.notEqual(ptr, 0, call)
+      const report = takeJson(ptr)
+      assert.ok(took < within, `${call} took ${took} ms over ${what}`)
+      return report
+    }),
+  )
+}
+
+{
+  // One /JS stream of 1 MB that inflates to 1,008 MB: only its first 16 MB
+  // are inflated, and the source is cut.
+  const bomb = repeatedDeflate(Buffer.alloc(16 * 1024 * 1024, 'a'), 63)
+  assert.ok(bomb.length < 1100000, `${bomb.length} bytes stored`)
+  const [scripts, form] = scriptReports(scriptsPdf([streamObject('/Filter /FlateDecode', bomb, true)]), 1000, 'a stream of 1,008 MB')
+  assert.equal(scripts.documentActions.k0[0], 'a'.repeat(4 * 1024 * 1024))
+  assert.equal(scripts.truncated, true, 'the cut source is not marked')
+  const widget = form.fields[0].widgets[0]
+  assert.equal(widget.scripts.k0[0].length, 4 * 1024 * 1024)
+  assert.deepEqual([widget.truncated, form.truncated], [true, true], 'the cut source is not marked in the form')
+}
+
+{
+  // 300 /JS streams that each inflate to 64 MB and leave no text: UTF-16 with
+  // a language escape that never closes. What is decoded is charged, whatever
+  // text it leaves, so the report stops decoding after 64 MB.
+  const piece = Buffer.alloc(1024 * 1024)
+  for (let i = 1; i < piece.length; i += 2) piece[i] = 0x41
+  const silent = Buffer.concat([Buffer.from([0x78, 0x9c]), deflateRawSync(Buffer.from([0xfe, 0xff, 0x00, 0x1b]), { finishFlush: constants.Z_FULL_FLUSH }), repeatedDeflate(piece, 64).subarray(2)])
+  const stream = streamObject('/Filter /FlateDecode', silent, true)
+  const [scripts, form] = scriptReports(scriptsPdf(Array.from({ length: 300 }, () => stream)), 2000, '300 streams of 64 MB')
+  assert.equal(Object.keys(scripts.documentActions).length, 300)
+  assert.ok(Object.values(scripts.documentActions).every((sources) => sources.length === 1 && sources[0] === ''), 'a silent stream left text')
+  assert.equal(scripts.truncated, true, 'the decode allowance ran out unmarked')
+  assert.deepEqual([form.fields[0].widgets[0].truncated, form.truncated], [true, true], 'the decode allowance ran out unmarked in the form')
+}
+
+{
+  // A script of 30,000 characters that Flate cannot shrink below 16 KB.
+  let seed = 1
+  const script = Array.from({ length: 30000 }, () => {
+    seed ^= seed << 13
+    seed ^= seed >>> 17
+    seed ^= seed << 5
+    return String.fromCharCode(48 + ((seed >>> 0) % 64))
+  }).join('')
+  const packed = deflateSync(Buffer.from(script, 'latin1'))
+  assert.ok(packed.length * 1032 > 16 * 1024 * 1024 + 3, `${packed.length} bytes stored`)
+  // PNG "up" rows of 100 bytes, as /Predictor 12 reads them.
+  const rows = (text) => Buffer.concat(Array.from({ length: text.length / 100 }, (_, i) => Buffer.from(`\0${text.slice(i * 100, i * 100 + 100)}`, 'latin1')))
+  const small = 'app.alert("predicted");'.padEnd(100) + ' '.repeat(100)
+  const [scripts, form] = scriptReports(
+    scriptsPdf([
+      // k0: one FlateDecode, no /DecodeParms: inflated in full, not cut.
+      streamObject('/Filter /FlateDecode', packed, true),
+      // k1: no filter.
+      streamObject('', Buffer.from(script, 'latin1'), true),
+      // k2 and k3: a predictor and a chain, small enough that no decoding
+      // of them can pass the cap: PDFium decodes them.
+      streamObject('/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 100 >>', deflateSync(rows(small)), true),
+      streamObject('/Filter [/ASCIIHexDecode /FlateDecode]', Buffer.from(`${deflateSync(Buffer.from('chained()')).toString('hex')}>`), true),
+    ]),
+    2000,
+    'four ordinary scripts',
+  )
+  assert.deepEqual(scripts.documentActions, { k0: [script], k1: [script], k2: [small], k3: ['chained()'] })
+  assert.equal(scripts.truncated, false, 'an ordinary script was marked cut')
+  assert.deepEqual(form.fields[0].widgets[0].scripts, scripts.documentActions)
+  assert.deepEqual([form.fields[0].widgets[0].truncated, form.truncated], [undefined, false])
+  // The same predictor and chain over stored bytes that could decode past the
+  // cap (stored size times 1,032 for Flate): not decoded, empty and cut.
+  for (const stream of [
+    streamObject('/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 100 >>', deflateSync(rows(script)), true),
+    streamObject('/Filter [/ASCIIHexDecode /FlateDecode]', Buffer.from(`${packed.toString('hex')}>`), true),
+  ]) {
+    const [cutScripts, cutForm] = scriptReports(scriptsPdf([stream]), 2000, 'a stream PDFium would decode whole')
+    assert.deepEqual([cutScripts.documentActions, cutScripts.truncated], [{ k0: [''] }, true])
+    assert.deepEqual([cutForm.fields[0].widgets[0].scripts, cutForm.fields[0].widgets[0].truncated, cutForm.truncated], [{ k0: [''] }, true, true])
+  }
+}
+
+{
+  // An encrypted file (RC4, 40 bits, empty user password) with a Flate /JS
+  // stream: the bytes inflated are the decrypted ones.
+  const rc4 = (key, data) => {
+    const s = Uint8Array.from({ length: 256 }, (_, i) => i)
+    for (let i = 0, j = 0; i < 256; i++) {
+      j = (j + s[i] + key[i % key.length]) & 255
+      ;[s[i], s[j]] = [s[j], s[i]]
+    }
+    const out = Buffer.alloc(data.length)
+    for (let n = 0, i = 0, j = 0; n < data.length; n++) {
+      i = (i + 1) & 255
+      j = (j + s[i]) & 255
+      ;[s[i], s[j]] = [s[j], s[i]]
+      out[n] = data[n] ^ s[(s[i] + s[j]) & 255]
+    }
+    return out
+  }
+  const md5 = (...parts) => createHash('md5').update(Buffer.concat(parts)).digest()
+  const pad = Buffer.from('28bf4e5e4e758a4164004e56fffa01082e2e00b6d0683e802f0ca9fe6453697a', 'hex')
+  const id = Buffer.alloc(16, 7)
+  const owner = rc4(md5(pad).subarray(0, 5), pad)
+  const key = md5(pad, owner, Buffer.from([0xfc, 0xff, 0xff, 0xff]), id).subarray(0, 5)
+  const user = rc4(key, pad)
+  const source = 'app.alert("locked");\n'.repeat(500)
+  // Object 4's key: the file key, then the object and generation numbers.
+  const stored = rc4(md5(key, Buffer.from([4, 0, 0, 0, 0])).subarray(0, 10), deflateSync(Buffer.from(source)))
+  const pdf = buildPdf(
+    [
+      '<< /Type /Catalog /Pages 2 0 R /OpenAction << /S /JavaScript /JS 4 0 R >> >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
+      streamObject('/Filter /FlateDecode', stored, true),
+      `<< /Filter /Standard /V 1 /R 2 /O <${owner.toString('hex')}> /U <${user.toString('hex')}> /P -4 >>`,
+    ],
+    `/Encrypt 5 0 R /ID [<${id.toString('hex')}> <${id.toString('hex')}>]`,
+  )
+  withPdf(pdf, (doc) => {
+    assert.equal(takeJson(m._INK_Doc_Facts(doc)).encrypted, true)
+    const scripts = takeJson(m._INK_Scripts(doc))
+    assert.deepEqual([scripts.documentActions.OpenAction, scripts.truncated], [[source], false])
   })
 }
 

@@ -17,12 +17,14 @@
 #include <vector>
 
 #include "core/fxcrt/bytestring.h"
+#include "core/fxcrt/data_vector.h"
 #include "core/fxcrt/retain_ptr.h"
 #include "core/fxcrt/widestring.h"
 
 class CPDF_Array;
 class CPDF_Dictionary;
 class CPDF_Object;
+class CPDF_Stream;
 
 namespace inkbar::report {
 
@@ -163,16 +165,36 @@ constexpr size_t kMaxScriptWork = 4000000;
 // so this, not the report's 16 MB, bounds the decoding: past it nothing more
 // is decoded and the sources are cut.
 constexpr size_t kMaxDecodedBytes = 16 * 1024 * 1024;
-// The most bytes of a decoded /JS stream turned into text: enough for
-// kMaxScriptBytes of text in any encoding (4 bytes a character at most).
+// The most bytes decoded from one /JS stream, all of which are turned into
+// text: enough for kMaxScriptBytes of text in any encoding (4 bytes a
+// character at most). No more of a stream is ever held decoded:
+//  - a stream with no filter gives its first stored bytes;
+//  - a stream whose one filter is FlateDecode with no /DecodeParms is
+//    inflated here with zlib, which stops at the cap;
+//  - any other (a chain of filters, /DecodeParms, another filter) is decoded
+//    by PDFium, whose stream reader runs the filters to the end with no cap,
+//    and only when its stored size times the most its filters can grow it is
+//    within the cap; a larger one is not decoded, and its source is empty and
+//    cut.
+// An encrypted file's streams are read the same way: PDFium decrypts a
+// stream when it parses the object, so its stored bytes are already plain.
 constexpr size_t kMaxScriptStreamBytes = 4 * kMaxScriptBytes + 3;
+// The most bytes one report reads from /JS streams and decodes from them,
+// whatever text they leave: a filtered stream is charged its stored bytes
+// and the bytes decoded from it, an unfiltered one the bytes taken. A stream
+// is cut to what is left, and once it is spent no stream is read. It is four
+// times the most bytes that can become text a report keeps (kMaxDecodedBytes
+// is 4 M characters, of 4 bytes at most), and decoding all of it takes a
+// fraction of a second.
+constexpr size_t kMaxDecodeBytes = 64 * 1024 * 1024;
 
 // Reads the JavaScript of action chains and /AA dictionaries for one report.
 // Each chain is read once, memoised by its first action, each /JS string or
 // stream decoded once, and each /AA dictionary's keys read once, so an object
 // the file shares is read once a report however often it is reached. All of
 // it is charged to a work allowance (kMaxScriptWork); once that is spent
-// nothing more is read and every call sets its |*cut|.
+// nothing more is read and every call sets its |*cut|. Decoding /JS streams
+// has an allowance of its own (kMaxDecodeBytes).
 class ScriptReader {
  public:
   explicit ScriptReader(Budget* budget);
@@ -203,6 +225,12 @@ class ScriptReader {
     bool cut = false;
   };
   const WideString& Decode(const CPDF_Dictionary* action, bool* cut);
+  // The decoded bytes of a /JS stream, at most kMaxScriptStreamBytes and what
+  // the decode allowance has left, charged to it. Sets |*cut| when the stream
+  // held more or was not decoded.
+  DataVector<uint8_t> StreamBytes(const CPDF_Stream* stream, bool* cut);
+  // The first stored bytes of |stream|, bounded and charged the same way.
+  DataVector<uint8_t> StoredBytes(const CPDF_Stream* stream, bool* cut);
 
   Budget* const budget_;
   size_t work_left_ = kMaxScriptWork;
@@ -215,6 +243,8 @@ class ScriptReader {
   std::map<const CPDF_Object*, Decoded> decoded_;
   // What decoded text the reader may still hold, in the bytes it takes.
   size_t decoded_left_ = kMaxDecodedBytes;
+  // What the reader may still read and decode from /JS streams.
+  size_t decode_left_ = kMaxDecodeBytes;
   std::map<const CPDF_Dictionary*, Keyed> keyed_;
   const std::vector<WideString> none_;
   const Keyed no_keys_;

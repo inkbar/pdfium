@@ -69,7 +69,7 @@ The checkout is mounted into the container. `scripts/embedpdf-runtime/build-targ
 
 The binary is single-threaded.
 
-Current size of `inkbar-pdfium.wasm`: 7,051,139 bytes raw, 2,968,532 bytes gzipped at level 9. It exports 112 functions. The budget is 3,256,192 bytes gzipped.
+Current size of `inkbar-pdfium.wasm`: 7,053,305 bytes raw, 2,969,267 bytes gzipped at level 9. It exports 112 functions. The budget is 3,256,192 bytes gzipped.
 
 ## The redaction check
 
@@ -167,7 +167,15 @@ Caps, each reported with `"truncated": true`:
 - 50,000 fields, and 50,000 `/CO` entries;
 - reading JavaScript has a work allowance of 4,000,000 reads a report (an action, a `/Next` array entry, an `/AA` key, a `/Parent` level), and a chain, a decoded `/JS` and an `/AA` dictionary's keys are each read once a report however many places share them;
 - walks of a field tree, a `/Parent` chain, a structure tree and a name tree go at most 1,000 levels deep and visit each object once; the field tree and name tree walks also read each `/Kids` array once, so a `/Kids` array that 20,000 fields share is read once; the name tree reads at most 50,000 nodes; an action chain is read for at most 1,000 objects (actions, `/Next` arrays and any other entry they hold count alike);
-- a report holds at most 16 MB of decoded JavaScript (4 bytes a character, each `/JS` decoded once and kept for the report); past that nothing more is decoded and the sources are cut. Only the first 16 MB of a decoded `/JS` stream become text, but its filters decode all of it first: PDFium gives no way to stop a decode sooner, and its Flate decoder stops at 1 GiB. So one `/JS` stream that decodes to hundreds of MB costs that much memory for a moment, and one near 1 GiB can exhaust the module's memory. This is a known limit.
+- a report holds at most 16 MB of decoded JavaScript (4 bytes a character, each `/JS` decoded once and kept for the report); past that nothing more is decoded and the sources are cut;
+- at most the first 16 MB of a `/JS` stream are decoded and become text, and no more of it is ever held decoded. How a stream is read depends on its filters:
+  - no `/Filter`, or one PDFium cannot use: the first 16 MB of the stored bytes are read;
+  - one `/FlateDecode` with no `/DecodeParms` dictionary, as almost every compressed script is stored: `report.cc` inflates it with zlib itself and stops at 16 MB, and the source says it was cut when more remained. It reads as PDFium does (to the end of the zlib stream, the first bad byte or the end of the data, and a stream that inflates to nothing keeps its stored bytes), so a stream under the cap gives the text it gave before;
+  - anything else (a chain of filters, `/DecodeParms` with or without a predictor, LZW, run lengths, ASCII85, ASCIIHex): PDFium decodes it, and its stream reader runs a filter chain to the end with no cap, so it is decoded only when no decoding of it can pass 16 MB: its stored size times the most each of its filters can grow what it reads (1,032 times for Flate, 4,096 for LZW, 128 for run lengths, 4 for ASCII85, nothing for ASCIIHex and Crypt; PDFium takes any other filter for an image's and stops there with what it has) is within the cap. So a Flate stream with a predictor is decoded up to about 16 KB stored. A larger one is not decoded: its source is empty and cut;
+  - an encrypted file is read the same way. PDFium decrypts a stream when it parses the object, before any filter, so the stored bytes `report.cc` inflates are already decrypted;
+- a report reads and decodes at most 64 MB from `/JS` streams, whatever text they leave: a filtered stream is charged its stored bytes and the bytes decoded from it, an unfiltered one the bytes taken. A stream is cut to what is left, and once the allowance is spent no stream is read and each source reached is empty and cut. This bounds the time: 300 streams that each inflate to 64 MB of text PDFium throws away (a language escape that never closes) return in about 0.15 s. 64 MB is four times the most bytes that can become text a report keeps (4 M characters of at most 4 bytes).
+
+Decoding one `/JS` stream holds at most its stored bytes, under 32 MB while the 16 MB buffer grows, and then PDFium's text of it: 4 bytes a character, so 64 MB for 16 MB of one-byte characters, before the source is cut to 4 MB. The stored bytes of a filtered stream are within the 64 MB allowance or the stream is not read. A `/JS` given as a string, not a stream, is decoded whole: it is as long as the file makes it.
 
 One limit is a refusal, reported with `"tooLarge": true` in `INK_Form`: when the field tree holds more than 50,000 dictionaries, or those and the widgets the page sweep would add (widget annotations outside the tree with `/FT` along `/Parent`) number more than 50,000, the form is not loaded and `fields` is empty. PDFium's field tree takes time that grows with the square of what it loads, about 19 s for 50,000 fields, so no part of the list can be had cheaply.
 

@@ -27,13 +27,16 @@ extern "C" {
 // chain gives them (the action, then its /Next, depth first, each object once,
 // at most 1,000 objects of the chain: actions, /Next arrays and any other
 // entry they hold count alike). A source is cut after the last character
-// whose written form ends within 4 MB; only the first 16 MB of a decoded /JS
-// stream are read. Each /JS is decoded once a report and held for it, and a
-// report holds at most 16 MB of decoded text (4 bytes a character): past that,
-// and once the report's 16 MB are spent, nothing more is decoded. Sources are
-// charged to the 16 MB as they are written. A key whose chain holds no
-// JavaScript is left out. A cut source or chain sets the entry's "truncated",
-// wherever the source is reached from.
+// whose written form ends within 4 MB; only the first 16 MB of a /JS stream
+// are decoded (one FlateDecode stops there; a stream with a filter chain or
+// /DecodeParms that could decode past them is not decoded, and its source is
+// empty and cut), and a report reads and decodes at most 64 MB from /JS
+// streams in all (report.h). Each /JS is decoded once a report and held for
+// it, and a report holds at most 16 MB of decoded text (4 bytes a character):
+// past that, and once the report's 16 MB are spent, nothing more is decoded.
+// Sources are charged to the 16 MB as they are written. A key whose chain
+// holds no JavaScript is left out. A cut source or chain sets the entry's
+// "truncated", wherever the source is reached from.
 
 // { "kind": "none" | "acroform" | "xfa", "needAppearances": false,
 //   "da": Text, "q": 0,
