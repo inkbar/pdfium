@@ -11,7 +11,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 106)
+assert.equal(names.length, 112)
 
 const m = await createModule()
 for (const name of names) {
@@ -2928,8 +2928,8 @@ withDoc(standardPdf, (doc) => {
 // Renders page |index| through the INK_Render_* calls, |slice| ms a call, onto
 // white, with FPDF_RenderPageBitmap's arguments |args| (start_x, start_y,
 // size_x, size_y, rotate) and |flags|, leaving out the annotations numbered in
-// |skip|. Returns the bytes and the statuses INK_Render_Continue returned.
-function inkRender(doc, { index = 0, flags = FPDF_ANNOT, skip = [], slice = 1000, args } = {}) {
+// |skip| and those at the places in /Annots in |skipAt|. Returns the bytes and the statuses INK_Render_Continue returned.
+function inkRender(doc, { index = 0, flags = FPDF_ANNOT, skip = [], skipAt = [], slice = 1000, args } = {}) {
   const page = m._FPDF_LoadPage(doc, index)
   assert.notEqual(page, 0)
   const width = Math.round(m._FPDF_GetPageWidthF(page))
@@ -2939,9 +2939,12 @@ function inkRender(doc, { index = 0, flags = FPDF_ANNOT, skip = [], slice = 1000
   m._FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0xffffffff)
   const skipPtr = skip.length ? m._malloc(skip.length * 4) : 0
   if (skipPtr) m.HEAPU32.set(skip, skipPtr / 4)
-  const r = m._INK_Render_Start(bitmap, page, startX, startY, sizeX, sizeY, rotate, flags, skipPtr, skip.length)
-  // Start reads the list before it returns.
+  const skipAtPtr = skipAt.length ? m._malloc(skipAt.length * 4) : 0
+  skipAt.forEach((at, i) => m.setValue(skipAtPtr + i * 4, at, 'i32'))
+  const r = m._INK_Render_Start(bitmap, page, startX, startY, sizeX, sizeY, rotate, flags, skipPtr, skip.length, skipAtPtr, skipAt.length)
+  // Start reads the lists before it returns.
   if (skipPtr) m._free(skipPtr)
+  if (skipAtPtr) m._free(skipAtPtr)
   assert.notEqual(r, 0, 'INK_Render_Start failed')
   const statuses = []
   for (;;) {
@@ -3031,7 +3034,7 @@ withDoc(bigImagePdf, (doc) => {
   const page = m._FPDF_LoadPage(doc, 0)
   const bitmap = m._FPDFBitmap_CreateEx(400, 400, 4, 0, 0)
   m._FPDFBitmap_FillRect(bitmap, 0, 0, 400, 400, 0xffffffff)
-  const r = m._INK_Render_Start(bitmap, page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0)
+  const r = m._INK_Render_Start(bitmap, page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0, 0, 0)
   assert.notEqual(r, 0)
   assert.equal(m._INK_Render_Continue(r, 0), 0, 'the render ended in its first slice')
   m._INK_Render_Close(r)
@@ -3067,7 +3070,7 @@ m._INK_Render_Close(0)
     m._FPDFBitmap_FillRect(bitmap, 0, 0, 400, 200, 0xffffffff)
     const skipPtr = m._malloc(4)
     m.HEAPU32[skipPtr / 4] = SQUARE_OBJ
-    const r = m._INK_Render_Start(bitmap, page, 0, 0, 400, 200, 0, FPDF_ANNOT, skipPtr, 1)
+    const r = m._INK_Render_Start(bitmap, page, 0, 0, 400, 200, 0, FPDF_ANNOT, skipPtr, 1, 0, 0)
     m._free(skipPtr)
     assert.notEqual(r, 0)
     assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), neverRendered[0]), 'a save during a render differs')
@@ -3092,10 +3095,10 @@ withDoc(bigImagePdf, (doc) => {
     m._FPDFBitmap_FillRect(bitmap, 0, 0, 400, 400, 0xffffffff)
     return bitmap
   })
-  const r1 = m._INK_Render_Start(bitmaps[0], page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0)
+  const r1 = m._INK_Render_Start(bitmaps[0], page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0, 0, 0)
   assert.notEqual(r1, 0)
   m._FPDF_RenderPageBitmap(bitmaps[1], page, 0, 0, 400, 400, 0, FPDF_ANNOT)
-  const r2 = m._INK_Render_Start(bitmaps[2], page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0)
+  const r2 = m._INK_Render_Start(bitmaps[2], page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0, 0, 0)
   assert.notEqual(r2, 0, 'a render could not start after a stale one')
   assert.equal(m._INK_Render_Continue(r1, 1000), -1, 'a stale render continued')
   m._INK_Render_Close(r1)
@@ -4281,6 +4284,446 @@ m._INK_Json_Free(0)
     assert.equal(outline.items.length, 100000)
     assert.equal(outline.items.at(-1).title, 'I99999')
     assert.equal(outline.truncated, true, 'the item cap does not truncate')
+  })
+}
+
+// INK_Annots_Page, INK_Form, INK_Scripts, INK_Doc_Facts, INK_Struct_Order and
+// INK_Annot_Draw: what the file says about a page's annotations, its form, its
+// scripts and itself, the order its structure gives annotations, and one
+// annotation drawn alone. None of them writes to the document.
+
+// A float[6] matrix in the heap. The caller frees it.
+function heapMatrix(values) {
+  const ptr = m._malloc(24)
+  values.forEach((v, i) => m.setValue(ptr + i * 4, v, 'float'))
+  return ptr
+}
+
+// Draws annotation |index| of page |pageIndex| alone onto a transparent bitmap
+// of the page's size, in |state| (null: the one /AS selects). Returns the
+// result and the bytes.
+function drawAnnot(doc, pageIndex, index, state) {
+  const page = m._FPDF_LoadPage(doc, pageIndex)
+  assert.notEqual(page, 0)
+  const width = Math.round(m._FPDF_GetPageWidthF(page))
+  const height = Math.round(m._FPDF_GetPageHeightF(page))
+  const bitmap = m._FPDFBitmap_CreateEx(width, height, 4, 0, 0)
+  m._FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0)
+  const matrix = heapMatrix([width / m._FPDF_GetPageWidthF(page), 0, 0, height / m._FPDF_GetPageHeightF(page), 0, 0])
+  const drew = state === null ? m._INK_Annot_Draw(bitmap, page, index, 0, matrix) : withStrings([state], (name) => m._INK_Annot_Draw(bitmap, page, index, name, matrix))
+  const bytes = bitmapBytes(bitmap, height)
+  m._free(matrix)
+  m._FPDFBitmap_Destroy(bitmap)
+  m._FPDF_ClosePage(page)
+  return { drew, bytes }
+}
+
+const inked = (bytes) => bytes.some((b) => b !== 0)
+
+{
+  // form-fields.pdf, from the monorepo's fixtures: every field kind, 23
+  // widgets, 20 of them on page 0, and page 1 turned 90 degrees.
+  const formFields = readFileSync(new URL('./testdata/form-fields.pdf', import.meta.url))
+  const KINDS = {
+    agree: 'checkbox',
+    auto: 'text',
+    city: 'combo',
+    code: 'text',
+    country: 'combo',
+    email: 'text',
+    'header.ref': 'text',
+    interests: 'list',
+    internal: 'text',
+    locked: 'text',
+    name: 'text',
+    notes: 'text',
+    pin: 'text',
+    plan: 'radio',
+    reset: 'button',
+    rotated: 'text',
+    shared: 'radio',
+    sig: 'signature',
+    sig2: 'signature',
+    styled: 'text',
+  }
+  withPdf(formFields, (doc) => {
+    const unread = [saveWith(doc, NO_INCREMENTAL), saveWith(doc, 1)]
+
+    const form = takeJson(m._INK_Form(doc))
+    assert.equal(form.kind, 'acroform')
+    assert.equal(form.truncated, false)
+    assert.deepEqual(Object.fromEntries(form.fields.map((f) => [f.name, f.kind])), KINDS)
+    assert.equal(form.fields.length, Object.keys(KINDS).length, 'a field is listed twice')
+    assert.equal(form.fields.flatMap((f) => f.widgets).length, 23)
+    const field = (name) => form.fields.find((f) => f.name === name)
+
+    const { annots, tabs, truncated } = takeJson(m._INK_Annots_Page(doc, 0))
+    assert.equal(truncated, false)
+    assert.equal(tabs, 'R')
+    assert.equal(annots.length, 20)
+    assert.deepEqual(
+      annots.map((a) => [a.index, a.subtype]),
+      annots.map((_, i) => [i, 'Widget']),
+    )
+    // Every widget on page 0 is the annotation at its place in /Annots.
+    const onPage0 = form.fields.flatMap((f) => f.widgets).filter((w) => w.page === 0)
+    assert.equal(onPage0.length, 20)
+    for (const w of onPage0) assert.equal(annots[w.annotIndex].objectNumber, w.objectNumber)
+    // shared's second widget sits after country's in /Annots, apart from its first.
+    assert.equal(field('shared').widgets[1].annotIndex, field('country').widgets[0].annotIndex + 1)
+    assert.notEqual(field('shared').widgets[0].annotIndex + 1, field('shared').widgets[1].annotIndex)
+    // header.ref's second widget is on the turned page, turned back by /MK /R.
+    assert.deepEqual([field('header.ref').widgets[1].page, field('header.ref').widgets[1].rotation], [1, 90])
+    assert.equal(takeJson(m._INK_Annots_Page(doc, 1)).annots.length, 3)
+    assert.equal(field('email').tooltip, 'Email address')
+    assert.equal(field('pin').maxLength, 4)
+    assert.deepEqual([field('country').valueKind, field('country').value], ['string', 'gb'])
+    assert.deepEqual(field('country').options[0], { exportValue: 'gb', displayValue: 'United Kingdom' })
+    assert.deepEqual([field('plan').valueKind, field('plan').value, field('plan').defaultValue], ['name', 'monthly', 'yearly'])
+    assert.deepEqual(
+      field('plan').widgets.map((w) => w.onState),
+      ['monthly', 'yearly'],
+    )
+    assert.deepEqual(field('reset').widgets[0].action, { s: 'ResetForm', fields: [], refs: [], flags: 0 })
+    assert.equal(field('styled').widgets[0].da, '/F1 10 Tf 0 0 1 rg')
+
+    // The checkbox drawn off and on gives different pixels; with no state it
+    // draws what /AS selects, Off.
+    const agree = field('agree').widgets[0]
+    assert.ok(agree.states.includes('Off') && agree.states.includes(agree.onState), JSON.stringify(agree.states))
+    const off = drawAnnot(doc, 0, agree.annotIndex, 'Off')
+    const on = drawAnnot(doc, 0, agree.annotIndex, agree.onState)
+    assert.deepEqual([off.drew, on.drew], [1, 1])
+    assert.ok(inked(on.bytes), 'the checked box drew nothing')
+    assert.ok(!off.bytes.equals(on.bytes), 'Off and on draw the same')
+    assert.ok(drawAnnot(doc, 0, agree.annotIndex, null).bytes.equals(off.bytes), 'no state is not /AS')
+    assert.equal(drawAnnot(doc, 0, agree.annotIndex, 'Missing').drew, 0, 'a state /N lacks')
+    assert.equal(drawAnnot(doc, 0, 99, null).drew, 0, 'no annotation at 99')
+
+    // Drawn alone, a widget lands where the page with its widgets draws it:
+    // laid over the page drawn without widgets, it gives the pixels of the page
+    // drawn with them, to within 1 level, on the turned page too. On page 0 its
+    // pixels fill its /Rect's box.
+    for (const w of [field('name').widgets[0], field('plan').widgets[1], field('header.ref').widgets[1], field('rotated').widgets[0]]) {
+      const page = m._FPDF_LoadPage(doc, w.page)
+      const width = Math.round(m._FPDF_GetPageWidthF(page))
+      const height = Math.round(m._FPDF_GetPageHeightF(page))
+      m._FPDF_ClosePage(page)
+      const alone = drawAnnot(doc, w.page, w.annotIndex, null)
+      assert.equal(alone.drew, 1)
+      const full = renderPixels(doc, w.page, FPDF_ANNOT | EPDF_RENDER_WIDGETS).bytes
+      const bare = renderPixels(doc, w.page, FPDF_ANNOT).bytes
+      const box = [width, height, -1, -1]
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          if (alone.bytes[(y * width + x) * 4 + 3] === 0) continue
+          box[0] = Math.min(box[0], x)
+          box[1] = Math.min(box[1], y)
+          box[2] = Math.max(box[2], x)
+          box[3] = Math.max(box[3], y)
+        }
+      }
+      assert.ok(box[2] >= box[0], `widget ${w.objectNumber} drew nothing`)
+      let worst = 0
+      for (let y = box[1]; y <= box[3]; y++) {
+        for (let x = box[0]; x <= box[2]; x++) {
+          const i = (y * width + x) * 4
+          const a = alone.bytes[i + 3] / 255
+          for (let c = 0; c < 3; c++) worst = Math.max(worst, Math.abs(Math.round(alone.bytes[i + c] * a + bare[i + c] * (1 - a)) - full[i + c]))
+        }
+      }
+      assert.ok(worst <= 1, `widget ${w.objectNumber} drawn alone is ${worst} levels off the page's render`)
+      if (w.page === 0) {
+        const [l, b, r, t] = w.rect
+        assert.deepEqual(box, [Math.floor(l), height - Math.ceil(t), Math.ceil(r) - 1, height - Math.floor(b) - 1], `widget ${w.objectNumber} is not in its /Rect`)
+      }
+    }
+
+    // A draw fails while a render holds the page.
+    {
+      const page = m._FPDF_LoadPage(doc, 0)
+      const bitmap = m._FPDFBitmap_CreateEx(612, 792, 4, 0, 0)
+      const r = m._INK_Render_Start(bitmap, page, 0, 0, 612, 792, 0, FPDF_ANNOT, 0, 0, 0, 0)
+      assert.notEqual(r, 0)
+      assert.equal(m._INK_Annot_Draw(bitmap, page, agree.annotIndex, 0, 0), 0, 'a draw during a render')
+      m._INK_Render_Close(r)
+      assert.equal(m._INK_Annot_Draw(bitmap, page, agree.annotIndex, 0, 0), 1, 'a draw after the render closed')
+      assert.equal(m._INK_Annot_Draw(0, page, agree.annotIndex, 0, 0), 0, 'a NULL bitmap')
+      m._FPDFBitmap_Destroy(bitmap)
+      m._FPDF_ClosePage(page)
+    }
+
+    assert.deepEqual(takeJson(m._INK_Scripts(doc)), { document: [], documentActions: {}, pageActions: [], truncated: false })
+    assert.deepEqual(takeJson(m._INK_Doc_Facts(doc)), { title: 'Inkbar fixture', author: 'Inkbar', encrypted: false, openedAs: 'none' })
+    assert.deepEqual(takeJson(m._INK_Struct_Order(doc, 0)), { order: [], truncated: false })
+
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread[0]), 'a read or a draw changed what a save writes')
+    assert.ok(sameSave(saveWith(doc, 1), unread[1]), 'a read or a draw changed what an incremental save writes')
+  })
+  for (const call of ['_INK_Annots_Page', '_INK_Struct_Order']) {
+    assert.equal(m[call](0, 0), 0, `${call} of a NULL document`)
+    withPdf(onePagePdf(''), (doc) => assert.equal(m[call](doc, 1), 0, `${call} of page 1 of a one-page file`))
+  }
+  for (const call of ['_INK_Form', '_INK_Scripts', '_INK_Doc_Facts']) assert.equal(m[call](0), 0, `${call} of a NULL document`)
+}
+
+{
+  // Annotations whose dictionaries are wrong: /Rect missing, a colour of five
+  // components and /Contents in no encoding, /IRT naming itself and a UTF-16
+  // string with an unpaired surrogate, an /InkList entry that is not a number
+  // and one that is not an array, /Rect with a string in it, and a direct
+  // dictionary. No AcroForm.
+  const pdf = onePagePdf('', { mediaBox: letterBox, page: '/Annots [6 0 R 7 0 R 8 0 R 9 0 R << /Subtype /Square /Rect [0 0 10 10] /F 2 >> 10 0 R]' }, [
+    '<< /Type /Annot /Subtype /Square /C [1 0 0] >>',
+    '<< /Type /Annot /Subtype /Text /Rect [10 10 30 30] /C [1 0 0 0 0] /Contents (a\\177b) /Name /Comment /T <FEFF00E9> /CA 0.5 >>',
+    '<< /Type /Annot /Subtype /Text /Rect [30 30 10 10] /IRT 8 0 R /Contents <FEFFD800> /M (D:20261125) >>',
+    '<< /Type /Annot /Subtype /Ink /Rect [0 0 (x) 10] /InkList [[1 2 /x 4] 5] /BS << /W 2 /S /D >> /Border [0 0 3] >>',
+    `<< /Type /Annot /Subtype /Ink /Rect [0 0 10 10] /InkList [[${'1 '.repeat(600000)}] [${'2 '.repeat(600000)}]] >>`,
+  ])
+  withPdf(pdf, (doc) => {
+    const unread = saveWith(doc, NO_INCREMENTAL)
+    const { annots, truncated } = takeJson(m._INK_Annots_Page(doc, 0))
+    assert.equal(truncated, false)
+    assert.deepEqual(
+      annots.map((a) => [a.index, a.objectNumber]),
+      [
+        [0, 6],
+        [1, 7],
+        [2, 8],
+        [3, 9],
+        [4, undefined],
+        [5, 10],
+      ],
+    )
+    assert.deepEqual([annots[0].rect, annots[0].rectOk], [null, false], '/Rect missing')
+    assert.deepEqual(annots[1].color, [1, 0, 0, 0, 0])
+    assert.deepEqual(annots[1].contents, { bytes: hex('a\x7fb') })
+    assert.deepEqual([annots[1].author, annots[1].icon, annots[1].opacity], ['é', 'Comment', 0.5])
+    assert.deepEqual([annots[2].inReplyTo, annots[2].contents, annots[2].modified], [[8, 0], { bytes: 'feffd800' }, 'D:20261125'])
+    assert.deepEqual([annots[2].rect, annots[2].rectOk], [[30, 30, 10, 10], true], 'corners as written')
+    assert.deepEqual([annots[3].rect, annots[3].rectOk], [[0, 0, null, 10], false])
+    assert.deepEqual(annots[3].inkLists, [[1, 2, null, 4], null])
+    assert.deepEqual([annots[3].borderStyle, annots[3].border], [{ width: 2, style: 'D' }, [0, 0, 3]])
+    assert.deepEqual([annots[4].flags, annots[4].hasAppearance, annots[4].appearance], [2, false, null])
+    // /InkList is read up to 1,000,000 numbers in all.
+    assert.deepEqual(
+      annots[5].inkLists.map((path) => path.length),
+      [600000, 400000],
+    )
+    assert.equal(annots[5].truncated, true)
+    assert.equal(annots[4].truncated, undefined)
+    const form = takeJson(m._INK_Form(doc))
+    assert.deepEqual(form, { kind: 'none', needAppearances: false, fields: [], calculationOrder: [], calculationOrderRefs: [], fieldTreeDepth: 0, fieldTreeLoops: false, truncated: false })
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'a report changed what a save writes')
+  })
+}
+
+{
+  // A field tree whose /Kids loop, each node listing the other twice (walked
+  // without care, the work doubles at each level), a field whose widget no
+  // page holds, a field with no widget, a widget with no /T and no parent, and
+  // a widget /Fields does not reach. /CO names a field, a page and a number.
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 8 0 R 10 0 R 11 0 R] /CO [8 0 R 3 0 R 12] /DA (/Helv 0 Tf 0 g) >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [11 0 R 12 0 R] >>`,
+    '<< >>',
+    '<< >>',
+    '<< /T (a) /Kids [7 0 R 7 0 R] >>',
+    '<< /T (b) /Parent 6 0 R /Kids [6 0 R 6 0 R] >>',
+    '<< /FT /Tx /T (lost) /Kids [9 0 R] >>',
+    '<< /Type /Annot /Subtype /Widget /Parent 8 0 R /Rect [0 0 10 10] >>',
+    '<< /FT /Tx /T (unplaced) >>',
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /Rect [0 0 10 10] >>',
+    '<< /Type /Annot /Subtype /Widget /FT /Btn /T (stray) /Rect [20 20 30 30] >>',
+  ])
+  withPdf(pdf, (doc) => {
+    const unread = saveWith(doc, NO_INCREMENTAL)
+    const started = Date.now()
+    const form = takeJson(m._INK_Form(doc))
+    assert.ok(Date.now() - started < 5000, `the looping tree took ${Date.now() - started} ms`)
+    assert.equal(form.fieldTreeLoops, true)
+    assert.equal(form.truncated, false)
+    const field = (name) => form.fields.find((f) => f.name === name)
+    assert.deepEqual(
+      form.fields.map((f) => f.name).sort(),
+      ['lost', 'stray', 'unplaced'],
+    )
+    assert.deepEqual(
+      field('lost').widgets.map((w) => [w.objectNumber, w.page, w.annotIndex]),
+      [[9, -1, -1]],
+    )
+    assert.deepEqual(field('unplaced').widgets, [])
+    assert.deepEqual([field('stray').origin, field('stray').widgets[0].page, field('stray').widgets[0].annotIndex], ['recovered', 0, 1])
+    assert.equal(field('lost').origin, 'acroform')
+    assert.deepEqual(form.calculationOrder, [form.fields.indexOf(field('lost')), -1, -1])
+    assert.deepEqual(form.calculationOrderRefs, [[8, 0], [3, 0], null])
+    assert.equal(form.da, '/Helv 0 Tf 0 g')
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'the form report changed what a save writes')
+  })
+}
+
+{
+  // 50,001 fields: none is read, and the report says so at once. 200,001
+  // annotations on a page: the report stops within 16 MB and 200,000 entries.
+  const fields = 50001
+  const pdf = buildPdf([
+    `<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [${Array.from({ length: fields }, (_, i) => `${i + 4} 0 R`).join(' ')}] >> >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [${'<< /Subtype /Square /Rect [0 0 1 1] >> '.repeat(200001)}] >>`,
+    ...Array.from({ length: fields }, (_, i) => `<< /FT /Tx /T (f${i}) >>`),
+  ])
+  withPdf(pdf, (doc) => {
+    const started = Date.now()
+    const form = takeJson(m._INK_Form(doc))
+    assert.ok(Date.now() - started < 5000, `50,001 fields took ${Date.now() - started} ms`)
+    assert.deepEqual([form.fields.length, form.truncated], [0, true])
+    const ptr = m._INK_Annots_Page(doc, 0)
+    const text = cString(ptr)
+    m._INK_Json_Free(ptr)
+    assert.ok(Buffer.byteLength(text) <= 16 * 1024 * 1024, `${Buffer.byteLength(text)} bytes of JSON`)
+    const { annots, truncated } = JSON.parse(text)
+    assert.equal(truncated, true)
+    assert.ok(annots.length > 0 && annots.length <= 200000, `${annots.length} annotations`)
+    assert.deepEqual(
+      annots.slice(0, 2).map((a) => a.index),
+      [0, 1],
+    )
+  })
+}
+
+{
+  // A field tree 1,005 levels deep: the walk stops at 1,000; PDFium loads 33
+  // levels, so the text field at the bottom is not a field.
+  const levels = 1005
+  const nodes = Array.from({ length: levels }, (_, i) => `<< /T (n${i}) ${i > 0 ? `/Parent ${i + 5} 0 R` : ''} ${i + 1 < levels ? `/Kids [${i + 7} 0 R]` : '/FT /Tx'} >>`)
+  const pdf = onePagePdf('', { mediaBox: letterBox, catalog: '/AcroForm << /Fields [6 0 R] >>' }, nodes)
+  withPdf(pdf, (doc) => {
+    const form = takeJson(m._INK_Form(doc))
+    assert.deepEqual([form.fieldTreeDepth, form.truncated, form.fields.length], [1000, true, 0])
+  })
+}
+
+{
+  // Widget facts: /MK, /Q, /TU, /PMD, /DA inherited, scripts by event from the
+  // widget and its field, the widget's own /A, a URI and a Named action.
+  const js = (source) => `<< /S /JavaScript /JS (${source}) >>`
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 8 0 R 9 0 R] /DA (/Helv 0 Tf 0 g) >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [7 0 R 8 0 R 9 0 R] >>`,
+    '<< >>',
+    '<< >>',
+    `<< /FT /Tx /T (total) /Q 1 /DA (/Helv 9 Tf 1 0 0 rg) /AA << /C ${js('calc()')} /K ${js('parentK()')} >> /Kids [7 0 R] >>`,
+    `<< /Type /Annot /Subtype /Widget /Parent 6 0 R /Rect [0 0 100 20] /F 4 /AA << /K ${js('ownK()')} /Fo << /S /JavaScript /JS (focus\\(\\)) /Next [${js('then()')} << /S /URI /URI (x) >>] >> /U << /S /URI /URI (x) >> >> /A ${js('click()')} /MK << /BC [1 0 0] /BG [0 0 1 0 0] /R 90 /CA (OK) >> /TU (tip) /PMD << >> >>`,
+    '<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (go) /Rect [0 30 100 50] /A << /S /URI /URI (https://example.com/a) >> >>',
+    '<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (print) /Rect [0 60 100 80] /A << /S /Named /N /Print >> >>',
+  ])
+  withPdf(pdf, (doc) => {
+    const unread = saveWith(doc, NO_INCREMENTAL)
+    const form = takeJson(m._INK_Form(doc))
+    const field = (name) => form.fields.find((f) => f.name === name)
+    const w = field('total').widgets[0]
+    assert.deepEqual(w.scripts, { A: ['click()'], C: ['calc()'], Fo: ['focus()', 'then()'], K: ['ownK()'] })
+    assert.deepEqual(w.action, { s: 'JavaScript' })
+    assert.deepEqual([w.borderColor, w.backgroundColor, w.rotation, w.caption], [[1, 0, 0], [0, 0, 1, 0, 0], 90, 'OK'])
+    assert.deepEqual([w.q, w.tooltip, w.da, w.pmd, w.flags], [1, 'tip', '/Helv 9 Tf 1 0 0 rg', true, 4])
+    assert.deepEqual(field('go').widgets[0].action, { s: 'URI', uriHex: hex('https://example.com/a') })
+    assert.deepEqual(field('go').widgets[0].scripts, {})
+    assert.deepEqual(field('print').widgets[0].action, { s: 'Named', name: 'Print' })
+    assert.equal(field('go').kind, 'button')
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'the form report changed what a save writes')
+  })
+}
+
+{
+  // The document's scripts: a name tree whose first script's /Next names
+  // itself and whose second is a stream, an open action with a /Next, /AA on
+  // the catalog and on the page.
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /Names << /JavaScript 6 0 R >> /OpenAction << /S /JavaScript /JS (open\\(\\)) /Next << /S /JavaScript /JS (next\\(\\)) >> >> /AA << /WC << /S /JavaScript /JS (bye\\(\\)) >> /WS << /S /URI /URI (x) >> >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /AA << /O << /S /JavaScript /JS (opened\\(\\)) >> /C << /S /URI /URI (x) >> >> >>`,
+    '<< >>',
+    '<< >>',
+    '<< /Kids [9 0 R] >>',
+    '<< /S /JavaScript /JS (var a = 1;) /Next 7 0 R >>',
+    streamObject('', 'var b = "two";'),
+    '<< /Names [(init) 7 0 R <FEFF00E9> << /S /JavaScript /JS 8 0 R >>] >>',
+  ])
+  withPdf(pdf, (doc) => {
+    assert.deepEqual(takeJson(m._INK_Scripts(doc)), {
+      document: [
+        { name: 'init', source: 'var a = 1;' },
+        { name: 'é', source: 'var b = "two";' },
+      ],
+      documentActions: { OpenAction: ['open()', 'next()'], WC: ['bye()'] },
+      pageActions: [{ page: 0, scripts: { O: ['opened()'] } }],
+      truncated: false,
+    })
+  })
+}
+
+{
+  // Structure order: the tree reaches annotation 8, then 7 through a nested
+  // element (whose /K also points back up), then 6; 5 is not an annotation of
+  // the page, and 6 is reached twice.
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [6 0 R 7 0 R 8 0 R] /Tabs /S >>`,
+    '<< >>',
+    '<< >>',
+    '<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] >>',
+    '<< /Type /Annot /Subtype /Link /Rect [0 20 10 30] >>',
+    '<< /Type /Annot /Subtype /Link /Rect [0 40 10 50] >>',
+    '<< /Type /StructTreeRoot /K 10 0 R >>',
+    '<< /Type /StructElem /S /Document /K [<< /Type /OBJR /Obj 8 0 R >> 11 0 R << /Type /OBJR /Obj 6 0 R >> << /Type /OBJR /Obj 5 0 R >>] >>',
+    '<< /Type /StructElem /S /P /K [5 << /Type /OBJR /Obj 7 0 R >> 10 0 R << /Type /OBJR /Obj 6 0 R >>] >>',
+  ])
+  withPdf(pdf, (doc) => {
+    assert.deepEqual(takeJson(m._INK_Struct_Order(doc, 0)), { order: [8, 7, 6], truncated: false })
+    assert.equal(takeJson(m._INK_Annots_Page(doc, 0)).tabs, 'S')
+  })
+}
+
+{
+  // /Info's title and author, and an encrypted file opened with its user and
+  // its owner password.
+  withPdf(onePagePdf('', { trailer: '/Info 6 0 R' }, ['<< /Title (Facts) /Author <FEFF00C9> /Subject 5 >>']), (doc) => {
+    assert.deepEqual(takeJson(m._INK_Doc_Facts(doc)), { title: 'Facts', author: 'É', encrypted: false, openedAs: 'none' })
+  })
+  withPdf(onePagePdf('', { trailer: '/Info << /Title <FEFF00> >>' }), (doc) => {
+    assert.deepEqual(takeJson(m._INK_Doc_Facts(doc)), { title: { bytes: 'feff00' }, encrypted: false, openedAs: 'none' }, 'a direct /Info')
+  })
+  const encrypted = readFileSync(new URL('../testing/resources/encrypted.pdf', import.meta.url))
+  for (const [password, openedAs] of [
+    ['1234', 'user'],
+    ['5678', 'owner'],
+  ]) {
+    const buf = heapBytes(encrypted)
+    const doc = withStrings([password], (pw) => m._FPDF_LoadMemDocument64(buf, encrypted.length, pw))
+    assert.notEqual(doc, 0, `encrypted.pdf did not open with ${password}`)
+    assert.deepEqual(takeJson(m._INK_Doc_Facts(doc)), { title: 'Title', encrypted: true, openedAs }, `opened with ${password}`)
+    m._FPDF_CloseDocument(doc)
+    m._free(buf)
+  }
+}
+
+{
+  // A direct annotation is left out of a render by its place in /Annots.
+  const pdf = onePagePdf('', {
+    page: '/Annots [<< /Type /Annot /Subtype /Square /Rect [100 20 300 120] /AP << /N 6 0 R >> >>]',
+  }, [streamObject('/Type /XObject /Subtype /Form /BBox [100 20 300 120]', '1 0 0 rg 100 20 200 100 re f')])
+  const neverRendered = withPdf(pdf, (doc) => saveWith(doc, NO_INCREMENTAL))
+  withPdf(pdf, (doc) => {
+    const withAnnots = referenceRender(doc)
+    const withoutAnnots = referenceRender(doc, { flags: 0 })
+    assert.ok(!withAnnots.equals(withoutAnnots), 'the direct square draws nothing')
+    assert.ok(inkRender(doc, { skipAt: [0] }).bytes.equals(withoutAnnots), 'the square left out by place was drawn')
+    assert.ok(inkRender(doc, { skipAt: [1] }).bytes.equals(withAnnots), 'a place past /Annots left the square out')
+    assert.ok(referenceRender(doc).equals(withAnnots), 'the square stays hidden after the render')
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), neverRendered), 'a render by place changed what a save writes')
   })
 }
 

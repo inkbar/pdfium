@@ -104,3 +104,9 @@ INK_Links_Page
 INK_Outline
 INK_Dest_Named
 INK_Json_Free
+INK_Annots_Page
+INK_Struct_Order
+INK_Annot_Draw
+INK_Form
+INK_Scripts
+INK_Doc_Facts

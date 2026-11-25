@@ -90,6 +90,51 @@ inline void AppendNumber(std::string* out, float value) {
   out->append(buffer);
 }
 
+// The bytes AppendCodePoint writes for |c|: 2 for a quote or a backslash, 6
+// for a control character or DEL (\u00XX), else its UTF-8. A surrogate and a
+// value past U+10FFFF become U+FFFD, which takes 3.
+inline size_t WrittenSize(uint32_t c) {
+  if (c == '"' || c == '\\') {
+    return 2;
+  }
+  if (c < 0x20 || c == 0x7F) {
+    return 6;
+  }
+  if (c < 0x80) {
+    return 1;
+  }
+  if (c < 0x800) {
+    return 2;
+  }
+  if (c < 0x10000 || c > 0x10FFFF) {
+    return 3;
+  }
+  return 4;
+}
+
+// |text| cut after the last character whose written form ends within |limit|
+// bytes. Adds the bytes it keeps to |*written| and sets |*cut| when it was
+// longer.
+inline WideString CutText(const WideString& text,
+                          size_t limit,
+                          size_t* written,
+                          bool* cut) {
+  size_t bytes = 0;
+  size_t length = 0;
+  *cut = false;
+  for (wchar_t c : text) {
+    const size_t size = WrittenSize(static_cast<uint32_t>(c));
+    if (bytes + size > limit) {
+      *cut = true;
+      break;
+    }
+    bytes += size;
+    ++length;
+  }
+  *written += bytes;
+  return *cut ? text.First(length) : text;
+}
+
 }  // namespace inkbar::json
 
 #endif  // INKBAR_JSON_H_
