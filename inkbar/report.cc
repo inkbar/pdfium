@@ -227,12 +227,15 @@ size_t Growth(const ByteString& filter) {
 
 // The most bytes PDFium's decoding of |decoders| can produce over all its
 // stages for |raw_size| stored bytes, each stage taken at the most its filter
-// can grow the stage before; nullopt when a stage could pass |limit|. A
-// stage may do that much work and leave almost nothing (ASCIIHex over 16 MB
-// of spaces), so this, not the result, is what a decode costs.
+// can grow the stage before; nullopt when a stage could pass |limit| or the
+// sum would pass |allowance|, which also keeps the sum from wrapping however
+// many stages a chain has. A stage may do that much work and leave almost
+// nothing (ASCIIHex over 16 MB of spaces), so this, not the result, is what
+// a decode costs.
 std::optional<size_t> DecodeCost(const DecoderArray& decoders,
                                  size_t raw_size,
-                                 size_t limit) {
+                                 size_t limit,
+                                 size_t allowance) {
   size_t bound = raw_size;
   size_t cost = 0;
   for (const auto& decoder : decoders) {
@@ -244,6 +247,9 @@ std::optional<size_t> DecodeCost(const DecoderArray& decoders,
       return std::nullopt;
     }
     bound *= growth;
+    if (bound > allowance - cost) {
+      return std::nullopt;
+    }
     cost += bound;
   }
   if (bound > limit) {
@@ -661,8 +667,9 @@ DataVector<uint8_t> ScriptReader::StreamBytes(const CPDF_Stream* stream,
   // PDFium's stream reader runs these filters to the end with no cap, so the
   // stream is decoded only when no stage of it can pass the limit, and it is
   // charged the most its stages can produce before it is decoded.
-  std::optional<size_t> cost = DecodeCost(decoders.value(), raw_size, limit);
-  if (!cost.has_value() || cost.value() > decode_left_) {
+  std::optional<size_t> cost =
+      DecodeCost(decoders.value(), raw_size, limit, decode_left_);
+  if (!cost.has_value()) {
     *cut = true;
     return DataVector<uint8_t>();
   }

@@ -4972,6 +4972,36 @@ function scriptReports(pdf, within, what) {
 }
 
 {
+  // The same 15 MB of spaces under one Flate and a few hundred ASCIIHex
+  // filters, each a stage that could hold 15.8 MB. The stored length and the
+  // number of stages are picked so the stages' sum is a small number modulo
+  // 2^32, the size of the module's size_t: the charge stops at the allowance
+  // and cannot wrap, so none of 1,000 such streams is decoded.
+  const packed = deflateSync(Buffer.concat([Buffer.from('0'), Buffer.alloc(15 * 1024 * 1024, ' ')]), { level: 9 })
+  let stored = 0
+  let stages = 0
+  for (let length = packed.length; !stages && length <= 16256; length++) {
+    for (let n = 257; n <= 1200; n++) {
+      if ((length * 1032 * n) % 2 ** 32 < 30000) {
+        stored = length
+        stages = n
+        break
+      }
+    }
+  }
+  assert.ok(stages, 'no chain wraps the sum')
+  // Bytes after the end of the zlib data are not read.
+  const padded = Buffer.concat([packed, Buffer.alloc(stored - packed.length)])
+  const stream = streamObject(`/Filter [/FlateDecode${' /ASCIIHexDecode'.repeat(stages - 1)}]`, padded, true)
+  const [scripts, form] = scriptReports(scriptsPdf(Array.from({ length: 1000 }, () => stream)), 2000, `1,000 streams of ${stages} stages`)
+  const sources = Object.values(scripts.documentActions).map(([source]) => source)
+  assert.equal(sources.length, 1000)
+  assert.ok(sources.every((source) => source === ''), 'a stream past the allowance was decoded')
+  assert.equal(scripts.truncated, true, 'the refused streams are not marked')
+  assert.deepEqual([form.fields[0].widgets[0].truncated, form.truncated], [true, true], 'the refused streams are not marked in the form')
+}
+
+{
   // An encrypted file (RC4, 40 bits, empty user password) with a Flate /JS
   // stream: the bytes inflated are the decrypted ones.
   const rc4 = (key, data) => {
