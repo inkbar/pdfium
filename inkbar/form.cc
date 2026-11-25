@@ -561,19 +561,21 @@ void AppendTexts(std::string* out,
   out->push_back(']');
 }
 
-// ,"t": the dictionary's own /T, Text when it is a string, null when it is
-// anything else, nothing when it has none; and ,"parentIsWalkParent":false
-// when its /Parent is not the dictionary |walk_parent| (null for an entry of
-// /Fields, whose /Parent should be absent).
+// ,"t": the dictionary's own /T, present when the key is (as PDF.js's has()
+// and "hasT" read it): Text when it is a string, null when it is anything
+// else, null and a reference to an object the file lacks included. And
+// ,"parentIsWalkParent":false when its /Parent is not the dictionary
+// |walk_parent| (null for an entry of /Fields, whose /Parent should be
+// absent).
 void AppendNameFacts(std::string* out,
                      const CPDF_Dictionary* dict,
                      const CPDF_Dictionary* walk_parent,
                      Budget* budget,
                      bool* cut) {
-  RetainPtr<const CPDF_Object> t = EntryFor(dict, "T");
-  if (t) {
+  if (dict->KeyExist("T")) {
     AppendNextKey(out, "t");
-    if (t->IsString()) {
+    RetainPtr<const CPDF_Object> t = dict->GetDirectObjectFor("T");
+    if (t && t->IsString()) {
       AppendFileText(out, t->GetString(), kMaxTextBytes, budget, cut);
     } else {
       out->append("null");
@@ -585,9 +587,20 @@ void AppendNameFacts(std::string* out,
   }
 }
 
-// { "ref": [n, g] | null, "dictionary": bool, "hasT": bool, "hasKids": bool }
-// for an entry of /Fields or /Kids; at most about 85 bytes.
-void AppendKid(std::string* out, const CPDF_Object* entry) {
+// What one entry of /Kids or /Fields writes besides its "t" text, which is
+// charged what it writes: at most 123 bytes ({"ref":[n,g]} with two 10-digit
+// numbers, the three booleans, the "t" key with the quotes or the bytes
+// wrapper around its text, "parentIsWalkParent":false and a comma).
+constexpr size_t kKidCost = 4 * kItemCost;
+
+// { "ref": [n, g] | null, "dictionary": bool, "hasT": bool, "hasKids": bool,
+//   "t": Text | null, "parentIsWalkParent": false } for an entry of the /Kids
+// of |container|, or of /Fields when |container| is null.
+void AppendKid(std::string* out,
+               const CPDF_Object* entry,
+               const CPDF_Dictionary* container,
+               Budget* budget,
+               bool* cut) {
   out->append("{\"ref\":");
   AppendRef(out, entry);
   RetainPtr<const CPDF_Object> target = entry ? entry->GetDirect() : nullptr;
@@ -599,28 +612,45 @@ void AppendKid(std::string* out, const CPDF_Object* entry) {
     out->append(Boolean(kid->KeyExist("T")));
     AppendNextKey(out, "hasKids");
     out->append(Boolean(kid->KeyExist("Kids")));
+    AppendNameFacts(out, kid, container, budget, cut);
   }
   out->push_back('}');
 }
 
-// The entries of /Kids or /Fields as AppendKid writes them, at most kMaxFields
-// and as many as |budget| allows.
+// The entries of |container|'s /Kids, or of /Fields when it is null, as
+// AppendKid writes them, at most kMaxFields and as many as |budget| allows.
 void AppendKids(std::string* out,
                 const CPDF_Array* kids,
+                const CPDF_Dictionary* container,
                 Budget* budget,
                 bool* cut) {
   out->push_back('[');
   for (size_t i = 0; kids && i < kids->size(); ++i) {
-    if (i == kMaxFields || !budget->Take(3 * kItemCost)) {
+    if (i == kMaxFields || !budget->Take(kKidCost)) {
       *cut = true;
       break;
     }
     if (i > 0) {
       out->push_back(',');
     }
-    AppendKid(out, kids->GetObjectAt(i).Get());
+    AppendKid(out, kids->GetObjectAt(i).Get(), container, budget, cut);
+    if (budget->spent()) {
+      *cut = true;
+      break;
+    }
   }
   out->push_back(']');
+}
+
+// "rotate": |dict|'s own /Rotate when it has one, a number or null. PDF.js
+// takes a widget's or a container's rotation from it when the dictionary has
+// no /MK.
+void AppendRotate(std::string* out, const CPDF_Dictionary* dict) {
+  RetainPtr<const CPDF_Object> rotate = EntryFor(dict, "Rotate");
+  if (rotate) {
+    AppendNextKey(out, "rotate");
+    AppendNumber(out, ToNumber(rotate.Get()));
+  }
 }
 
 // "borderColor" (/MK /BC), "backgroundColor" (/MK /BG), "rotation" (/MK /R)
@@ -694,6 +724,7 @@ bool AppendWidget(std::string* out,
   }
   inkbar::report::AppendBorder(out, widget, budget, &cut);
   AppendMk(out, widget, budget, &cut);
+  AppendRotate(out, widget);
   if (toggle && field_dict != widget) {
     // The widget's own /Opt, where PDF.js starts its lookup.
     RetainPtr<const CPDF_Object> own = EntryFor(widget, "Opt");
@@ -917,8 +948,9 @@ bool AppendGroup(std::string* out,
   }
   AppendNextKey(out, "kids");
   RetainPtr<const CPDF_Object> kids = EntryFor(dict, "Kids");
-  AppendKids(out, kids ? kids->AsArray() : nullptr, budget, &cut);
+  AppendKids(out, kids ? kids->AsArray() : nullptr, dict, budget, &cut);
   AppendMk(out, dict, budget, &cut);
+  AppendRotate(out, dict);
   if (RetainPtr<const CPDF_Object> p = EntryFor(dict, "P")) {
     AppendNextKey(out, "page");
     out->append(std::to_string(pages->IndexOf(p->AsDictionary())));
@@ -1180,8 +1212,8 @@ char* INK_Form(FPDF_DOCUMENT doc) {
   AppendNextKey(&out, "fieldsRoot");
   {
     const size_t mark = out.size();
-    AppendKids(&out, too_large ? nullptr : root_fields.Get(), &budget,
-               &truncated);
+    AppendKids(&out, too_large ? nullptr : root_fields.Get(), nullptr,
+               &budget, &truncated);
     // The budget charges at least what is written; this is a backstop.
     if (out.size() > kMaxReportBytes / 2) {
       out.resize(mark);

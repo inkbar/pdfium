@@ -5343,20 +5343,22 @@ function scriptReports(pdf, within, what) {
   // /MK, /P and a script of its own, and a widget with its own /Opt), list2,
   // and mix, whose first kid is a bare widget and whose second has /T. A
   // top-level field whose /Parent names another, an empty /T, a /Link
-  // subtype and /Fields itself.
+  // subtype and /Fields itself. Kid facts for every dictionary listed: a /T
+  // that is null or a reference to nothing, a /Parent that names another
+  // dictionary, and /Rotate on a group with no /MK and on a widget.
   const widget = (rest) => `<< /Type /Annot /Subtype /Widget /Rect [10 10 60 30] ${rest} >>`
   const pdf = onePagePdf(
     '',
-    { catalog: '/AcroForm 6 0 R', page: '/Annots [9 0 R 10 0 R 12 0 R 13 0 R 15 0 R 17 0 R 18 0 R 21 0 R 23 0 R 24 0 R 25 0 R 27 0 R]' },
+    { catalog: '/AcroForm 6 0 R', page: '/Annots [9 0 R 10 0 R 12 0 R 13 0 R 15 0 R 17 0 R 18 0 R 21 0 R 23 0 R 24 0 R 25 0 R 27 0 R 29 0 R 30 0 R]' },
     [
-      '<< /Fields [7 0 R 11 0 R 14 0 R 16 0 R 19 0 R 22 0 R 25 0 R 26 0 R] /CO [7 0 R 9 0 R] >>',
+      '<< /Fields [7 0 R 11 0 R 14 0 R 16 0 R 19 0 R 22 0 R 25 0 R 26 0 R 28 0 R] /CO [7 0 R 9 0 R] >>',
       '<< /T (group) /Kids [8 0 R] /MK << /BC [1 0 0] /BG [0 1 0] /R 90 >> /P 3 0 R >>',
       '<< /T (sub) /Parent 7 0 R /Kids [10 0 R 9 0 R] /AA << /K << /S /JavaScript /JS (subK) >> >> >>',
       widget('/T (a) /FT /Tx /Parent 8 0 R'),
       widget('/T (b) /FT /Tx /Parent 8 0 R'),
       '<< /T (r) /FT /Btn /Ff 49152 /Opt [(Alpha) <FEFF00E9> /Nm 5] /Kids [12 0 R 13 0 R] /MK << /BC [0 0 1] >> /P 3 0 R /AA << /F << /S /JavaScript /JS (rF) >> >> >>',
       widget('/Parent 11 0 R /Opt [(W)]'),
-      widget('/Parent 11 0 R'),
+      widget('/Parent 11 0 R /Rotate 180'),
       '<< /T (lp) /I [1] /Kids [15 0 R] >>',
       widget('/T (list) /FT /Ch /Opt [(x) (y)] /Parent 14 0 R'),
       '<< /T (list2) /FT /Ch /Opt [(x) (y)] /I [0] /Kids [17 0 R 18 0 R] >>',
@@ -5371,6 +5373,9 @@ function scriptReports(pdf, within, what) {
       widget('/T (orphan) /FT /Tx /Parent 7 0 R'),
       '<< /T () /Kids [27 0 R] >>',
       widget('/T (e) /FT /Tx /Parent 26 0 R'),
+      '<< /T (tn) /FT /Tx /Rotate 90 /Kids [29 0 R 30 0 R] >>',
+      widget('/T null /Parent 28 0 R'),
+      widget('/T 99 0 R /Parent 7 0 R'),
     ],
   )
   withPdf(pdf, (doc) => {
@@ -5386,7 +5391,7 @@ function scriptReports(pdf, within, what) {
     const form = takeJson(m._INK_Form(doc))
     const field = (name) => form.fields.find((f) => f.name === name)
     const group = (name) => form.groups?.find((g) => g.name === name)
-    const kid = (n, hasKids = false) => ({ ref: [n, 0], dictionary: true, hasT: true, hasKids })
+    const kid = (n, t, hasKids = false, extra = {}) => ({ ref: [n, 0], dictionary: true, hasT: true, hasKids, t, ...extra })
 
     const bare = (n) => ({ ref: [n, 0], dictionary: true, hasT: false, hasKids: false })
     const indexOf = (name) => form.fields.findIndex((f) => f.name === name)
@@ -5404,6 +5409,7 @@ function scriptReports(pdf, within, what) {
           ['loop.inner', 20, 13, undefined],
           ['mix', 22, 15, indexOf('mix')],
           ['', 26, 19, undefined],
+          ['tn', 28, 21, undefined],
         ],
       ),
     )
@@ -5414,7 +5420,7 @@ function scriptReports(pdf, within, what) {
         generation: 0,
         walkIndex: 0,
         t: 'group',
-        kids: [kid(8, true)],
+        kids: [kid(8, 'sub', true)],
         borderColor: [1, 0, 0],
         backgroundColor: [0, 1, 0],
         rotation: 90,
@@ -5423,23 +5429,25 @@ function scriptReports(pdf, within, what) {
       }),
     )
     check('sub: kids in file order and its script', () =>
-      assert.deepEqual([group('group.sub').kids, group('group.sub').scripts], [[kid(10), kid(9)], { K: ['subK'] }]),
+      assert.deepEqual([group('group.sub').kids, group('group.sub').scripts], [[kid(10, 'b'), kid(9, 'a')], { K: ['subK'] }]),
     )
     check('the radio parent: kids, /MK, page and its own script', () => {
       const r = group('r')
       assert.deepEqual([r.kids, r.borderColor, r.page, r.scripts], [[bare(12), bare(13)], [0, 0, 1], 0, { F: ['rF'] }])
     })
     check('list2 with its widget kids', () => assert.deepEqual(group('list2').kids, [bare(17), bare(18)]))
-    check('a later kid with /T under a bare first widget', () => assert.deepEqual(group('mix').kids, [bare(23), { ...bare(24), hasT: true }]))
+    check('a later kid with /T under a bare first widget', () => assert.deepEqual(group('mix').kids, [bare(23), { ...bare(24), hasT: true, t: 'x' }]))
     check('the walk order rebuilt', () => {
       const byIndex = new Map([...form.groups, ...form.fields.filter((f) => 'walkIndex' in f)].map((e) => [e.walkIndex, e.objectNumber]))
       assert.deepEqual(
         [...byIndex].sort((x, y) => x[0] - y[0]).map((e) => e[1]),
-        [7, 8, 10, 9, 11, 14, 15, 16, 19, 20, 21, 22, 25, 26, 27],
+        // 29 is a field of PDFium's, whose kids under tn have /T; 30's /T
+        // names no object.
+        [7, 8, 10, 9, 11, 14, 15, 16, 19, 20, 21, 22, 25, 26, 27, 28, 29],
       )
     })
     check('/Fields itself', () =>
-      assert.deepEqual(form.fieldsRoot.map((e) => [e.ref[0], e.dictionary, e.hasT]), [7, 11, 14, 16, 19, 22, 25, 26].map((n) => [n, true, true])),
+      assert.deepEqual(form.fieldsRoot.map((e) => [e.ref[0], e.dictionary, e.hasT]), [7, 11, 14, 16, 19, 22, 25, 26, 28].map((n) => [n, true, true])),
     )
     check('own /T and /Parent against the walk', () => {
       const orphan = form.fields.find((f) => f.objectNumber === 25)
@@ -5454,7 +5462,24 @@ function scriptReports(pdf, within, what) {
       const list2 = field('list2')
       assert.deepEqual([list2.selectedIndices, list2.selectedIndicesOwn, list2.widgets[0].selectedIndices, 'selectedIndices' in list2.widgets[1]], [[0], true, [1], false])
     })
-    check('the loop ends', () => assert.deepEqual(group('loop.inner')?.kids, [kid(19, true), kid(21)]))
+    check('the loop ends', () => assert.deepEqual(group('loop.inner')?.kids, [kid(19, 'loop', true, { parentIsWalkParent: false }), kid(21, 'w')]))
+    check('a /T null, a /T to nothing and a /Parent elsewhere', () =>
+      assert.deepEqual(form.groups.find((g) => g.objectNumber === 28)?.kids, [
+        { ...bare(29), hasT: true, t: null },
+        { ...bare(30), hasT: true, t: null, parentIsWalkParent: false },
+      ]),
+    )
+    check('/Fields with each entry\'s /T and /Parent', () =>
+      assert.deepEqual(
+        form.fieldsRoot.map((e) => [e.ref[0], e.t, e.parentIsWalkParent]),
+        [[7, 'group'], [11, 'r'], [14, 'lp'], [16, 'list2'], [19, 'loop'], [22, 'mix'], [25, 'orphan', false], [26, ''], [28, 'tn']].map(([n, t, p]) => [n, t, p]),
+      ),
+    )
+    check('a field whose /T is null says t: null', () => {
+      const f = form.fields.find((x) => x.objectNumber === 29)
+      assert.deepEqual([f?.t, 'parentIsWalkParent' in f], [null, false])
+    })
+    check('/Rotate on a group without /MK and on a widget', () => assert.deepEqual([form.groups.find((g) => g.objectNumber === 28)?.rotate, field('r').widgets[1].rotate, 'rotate' in field('r').widgets[0]], [90, 180, false]))
     assert.deepEqual(failures, [], failures.join('\n'))
     assert.equal(form.truncated, false)
     assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'a report changed what a save writes')

@@ -60,7 +60,7 @@ extern "C" {
 //       "onState": "Yes", "exportValue": "Yes",
 //       "borderStyle": {...}, "border": [...], "borderColor": [...],
 //       "backgroundColor": [...], "rotation": 90, "caption": Text,
-//       "q": 1, "tooltip": Text, "da": Text, "pmd": true,
+//       "rotate": 90, "q": 1, "tooltip": Text, "da": Text, "pmd": true,
 //       "selectedIndices": [1],
 //       "scripts": Scripts,
 //       "action": { "s": "URI", "uriHex": "..." } | { "s": "Named",
@@ -79,12 +79,14 @@ extern "C" {
 //     "walkIndex": 1, "field": 4, "t": Text | null,
 //     "parentIsWalkParent": false, "subtype": "Widget",
 //     "kids": [ { "ref": [10, 0] | null, "dictionary": true, "hasT": true,
-//                 "hasKids": false } ],
+//                 "hasKids": false, "t": Text | null,
+//                 "parentIsWalkParent": false } ],
 //     "borderColor": [...], "backgroundColor": [...], "rotation": 90,
-//     "caption": Text, "page": 0, "scripts": Scripts,
+//     "caption": Text, "rotate": 90, "page": 0, "scripts": Scripts,
 //     "truncated": true } ],
 //   "fieldsRoot": [ { "ref": [7, 0] | null, "dictionary": true, "hasT": true,
-//                     "hasKids": true } ],
+//                     "hasKids": true, "t": Text | null,
+//                     "parentIsWalkParent": false } ],
 //   "calculationOrder": [3, -1], "calculationOrderRefs": [[11, 0], null],
 //   "fieldTreeDepth": 2, "fieldTreeRevisits": false, "tooLarge": false,
 //   "truncated": false }
@@ -179,24 +181,38 @@ extern "C" {
 // second dictionary with a field's full name, which PDFium merges into the
 // first. "objectNumber" and "generation" are absent for a direct dictionary.
 // "field" is the index in "fields" of the field whose own dictionary it is,
-// absent for any other. "name" is its full name as PDFium builds it (the /T of
-// it and its /Parent chain, an empty /T left out). PDF.js builds a name from
-// the walk instead: the names above it in the walk, then its own /T, and
-// /Parent only when it has no /T; "t" and "parentIsWalkParent" give what that
-// needs. "t" is the dictionary's own /T: Text when it is a string ("" for an
-// empty one), null when it is something else, absent when it has none.
+// absent for any other, and absent too when the list of fields was cut short
+// before that field was written. "name" is its full name as PDFium builds it
+// (the /T of it and its /Parent chain, an empty /T left out). PDF.js builds
+// a name from the walk instead: the names above it in the walk, then its own
+// /T, and /Parent only when it has no /T; "t" and "parentIsWalkParent" give
+// what that needs. "t" is the dictionary's own /T, present whenever the key
+// is (as "hasT" and PDF.js's has() read it): Text when it is a string ("" for
+// an empty one), null when it is anything else (null, a reference to an
+// object the file lacks, another type), absent when it has no /T key.
 // "parentIsWalkParent" is present, and false, only when its /Parent is not
 // the dictionary whose /Kids the walk reached it through (for an entry of
 // /Fields, when it has a /Parent at all). "subtype" is its /Subtype when that
 // is a name (PDF.js skips a /Link and what lies under it). "kids" is its
 // /Kids in the file's order, at most 50,000: "ref" the entry as a reference
 // (null when it is written direct), "dictionary" whether it resolves to a
-// dictionary, and for one that does whether it has the keys /T and /Kids.
+// dictionary, and for one that does whether it has the keys /T and /Kids,
+// its "t", and "parentIsWalkParent" false when its /Parent is not the
+// dictionary whose /Kids lists it (for "fieldsRoot", when it has a /Parent).
+// So "t" and "parentIsWalkParent" are given for every dictionary the walk
+// lists, whether or not it is a group or a field: a widget kid with its own
+// /T under a bare first widget, which PDF.js names "parent.t" as a field of
+// its own, included. An entry is charged 128 bytes, at least what it writes
+// besides its "t" text (at most 123), and its "t" text what it writes.
 // PDFium treats a dictionary's kids as widgets when its first kid has neither,
 // PDF.js names a kid without /T by its parent, and the consumer can apply
 // either rule from these facts. "borderColor", "backgroundColor", "rotation"
-// and "caption" are its own /MK's, as for a widget. "page" is the index of the
-// page /P names, -1 when /P is not a page of the file, absent with no /P.
+// and "caption" are its own /MK's, as for a widget. "rotate" is its own
+// /Rotate, a number or null, absent when it has none; PDF.js takes a
+// container's or a widget's rotation from /Rotate when the dictionary has no
+// /MK dictionary (/MK /R otherwise). A widget gives "rotate" too. "page" is
+// the index of the page /P names, -1 when /P is not a page of the file,
+// absent with no /P.
 // "scripts" is read as a widget's: /AA merged along /Parent, each key from the
 // nearest dictionary (the group first) whose action holds JavaScript, and "A"
 // the group's own /A only; its kids' scripts are not merged into it. Groups
