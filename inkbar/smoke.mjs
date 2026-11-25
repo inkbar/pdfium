@@ -4747,6 +4747,87 @@ const inked = (bytes) => bytes.some((b) => b !== 0)
 }
 
 {
+  // A field whose five widgets share one /AA of 1,000 keys, each holding a
+  // script, at each of 1,000 /Parent levels: about 5,000,000 units of work,
+  // past the allowance of 4,000,000. The report stops reading and says so.
+  const levels = 1000
+  // 6: the /AA; 7: the field; 8 to 12: the widgets; 13 on: the levels.
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R] >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
+    '<< >>',
+    '<< >>',
+    `<< ${Array.from({ length: 1000 }, (_, i) => `/k${i} << /S /JavaScript /JS (s${i}) >>`).join(' ')} >>`,
+    '<< /FT /Tx /T (five) /Kids [8 0 R 9 0 R 10 0 R 11 0 R 12 0 R] /AA 6 0 R /Parent 13 0 R >>',
+    ...Array.from({ length: 5 }, () => '<< /Type /Annot /Subtype /Widget /Parent 7 0 R /Rect [0 0 10 10] /AA 6 0 R >>'),
+    ...Array.from({ length: levels }, (_, i) => `<< /AA 6 0 R ${i + 1 < levels ? `/Parent ${i + 14} 0 R` : ''} >>`),
+  ])
+  withPdf(pdf, (doc) => {
+    const started = Date.now()
+    const form = takeJson(m._INK_Form(doc))
+    assert.ok(Date.now() - started < 2000, `five widgets under 1,000 levels took ${Date.now() - started} ms`)
+    assert.deepEqual([form.fields[0].truncated, form.truncated], [true, true], 'the work allowance ran out unmarked')
+  })
+}
+
+{
+  // 130 Flate /JS streams, each 4 MB of text from a few KB, under one /AA of
+  // the catalog and of a widget: a report holds at most 16 MB of decoded text,
+  // so it returns, cut.
+  const bomb = deflateSync(Buffer.alloc(4 * 1024 * 1024, 'x'))
+  const count = 130
+  const stream = Buffer.concat([Buffer.from(`<< /Length ${bomb.length} /Filter /FlateDecode >>\nstream\n`), bomb, Buffer.from('\nendstream')])
+  // 6: the /AA; 7: the widget; 8 on: the streams.
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R] >> /AA 6 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
+    '<< >>',
+    '<< >>',
+    `<< ${Array.from({ length: count }, (_, i) => `/k${i} << /S /JavaScript /JS ${i + 8} 0 R >>`).join(' ')} >>`,
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (bomb) /Rect [0 0 10 10] /AA 6 0 R >>',
+    ...Array.from({ length: count }, () => stream),
+  ])
+  withPdf(pdf, (doc) => {
+    for (const call of ['_INK_Scripts', '_INK_Form']) {
+      const ptr = m[call](doc)
+      assert.notEqual(ptr, 0, call)
+      const text = cString(ptr)
+      m._INK_Json_Free(ptr)
+      assert.equal(JSON.parse(text).truncated, true, `${call} was not cut`)
+    }
+  })
+}
+
+{
+  // One /JS stream of 5 MB, cut at 4 MB, read first through a parent's /AA
+  // under field a (a's own /K is nearer) and then through field b's own
+  // chain: b's source is cut too, and says so.
+  const big = deflateSync(Buffer.alloc(5 * 1024 * 1024, 'y'))
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R 8 0 R] >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
+    '<< >>',
+    '<< >>',
+    Buffer.concat([Buffer.from(`<< /Length ${big.length} /Filter /FlateDecode >>\nstream\n`), big, Buffer.from('\nendstream')]),
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (a) /Rect [0 0 10 10] /Parent 9 0 R /AA << /K << /S /JavaScript /JS (small) >> >> >>',
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (b) /Rect [0 20 10 30] /AA << /K << /S /JavaScript /JS 6 0 R >> >> >>',
+    '<< /AA << /K << /S /JavaScript /JS 6 0 R >> >> >>',
+  ])
+  withPdf(pdf, (doc) => {
+    const form = takeJson(m._INK_Form(doc))
+    const widget = (name) => form.fields.find((f) => f.name === name).widgets[0]
+    assert.deepEqual(widget('a').scripts, { K: ['small'] })
+    // Cut at 4 MB, less the 5 characters of 'small' the decoded allowance
+    // already holds.
+    assert.equal(widget('b').scripts.K[0].length, 4 * 1024 * 1024 - 5)
+    assert.equal(widget('b').truncated, true, 'a cut /JS reached a second time lost its mark')
+  })
+}
+
+{
   // A field tree 1,005 levels deep: the walk stops at 1,000; PDFium loads 33
   // levels, so the text field at the bottom is not a field.
   const levels = 1005

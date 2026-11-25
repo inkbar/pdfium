@@ -158,6 +158,14 @@ void AppendBorder(std::string* out, const CPDF_Dictionary* dict);
 // level of a /Parent chain or a memoised result looked up each cost one. A
 // few million reads take well under a second.
 constexpr size_t kMaxScriptWork = 4000000;
+// The most decoded JavaScript one report holds, in the bytes it takes in
+// memory (4 a character). Each /JS is decoded once and kept for the report,
+// so this, not the report's 16 MB, bounds the decoding: past it nothing more
+// is decoded and the sources are cut.
+constexpr size_t kMaxDecodedBytes = 16 * 1024 * 1024;
+// The most bytes of a decoded /JS stream turned into text: enough for
+// kMaxScriptBytes of text in any encoding (4 bytes a character at most).
+constexpr size_t kMaxScriptStreamBytes = 4 * kMaxScriptBytes + 3;
 
 // Reads the JavaScript of action chains and /AA dictionaries for one report.
 // Each chain is read once, memoised by its first action, each /JS string or
@@ -172,7 +180,8 @@ class ScriptReader {
 
   // The sources of the JavaScript actions in the chain |action| starts, in
   // the order /Next gives them, depth first, each object once and at most
-  // kMaxChain objects (actions and /Next arrays). Each source is cut as
+  // kMaxChain objects (actions, /Next arrays and any other entry they hold
+  // count alike). Each source is cut as
   // CutText cuts it at kMaxScriptBytes; no source is decoded once the budget
   // is spent. Sets |*cut| when one was cut or the chain was longer.
   const std::vector<WideString>& Sources(const CPDF_Object* action, bool* cut);
@@ -199,7 +208,13 @@ class ScriptReader {
   size_t work_left_ = kMaxScriptWork;
   bool exhausted_ = false;
   std::map<const CPDF_Object*, Chain> chains_;
-  std::map<const CPDF_Object*, WideString> decoded_;
+  struct Decoded {
+    WideString text;
+    bool cut = false;
+  };
+  std::map<const CPDF_Object*, Decoded> decoded_;
+  // What decoded text the reader may still hold, in the bytes it takes.
+  size_t decoded_left_ = kMaxDecodedBytes;
   std::map<const CPDF_Dictionary*, Keyed> keyed_;
   const std::vector<WideString> none_;
   const Keyed no_keys_;

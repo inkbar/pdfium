@@ -18,6 +18,8 @@
 #include "core/fpdfapi/parser/cpdf_number.h"
 #include "core/fpdfapi/parser/cpdf_object.h"
 #include "core/fpdfapi/parser/cpdf_reference.h"
+#include "core/fpdfapi/parser/cpdf_stream.h"
+#include "core/fpdfapi/parser/cpdf_stream_acc.h"
 #include "core/fpdfapi/parser/fpdf_parser_decode.h"
 #include "core/fxcrt/span.h"
 #include "inkbar/json.h"
@@ -405,20 +407,45 @@ const WideString& ScriptReader::Decode(const CPDF_Dictionary* action,
   }
   auto it = decoded_.find(js.Get());
   if (it != decoded_.end()) {
-    return it->second;
+    *cut = *cut || it->second.cut;
+    return it->second.text;
   }
-  // Decode nothing once the budget is spent.
-  if (budget_->left() == 0) {
-    budget_->Spend();
+  // Decode nothing once the budget or the decoding allowance is spent.
+  if (budget_->left() == 0 || decoded_left_ == 0) {
     *cut = true;
     return *kEmpty;
   }
+  Decoded decoded;
+  WideString text;
+  if (const CPDF_Stream* stream = js->AsStream()) {
+    // Only the first kMaxScriptStreamBytes of the stream become text. Its
+    // filters still decode all of it first: PDFium's Flate decoder stops at
+    // 1 GiB, and gives no way to stop sooner.
+    auto acc = pdfium::MakeRetain<CPDF_StreamAcc>(pdfium::WrapRetain(stream));
+    acc->LoadAllDataFiltered();
+    pdfium::span<const uint8_t> bytes = acc->GetSpan();
+    if (bytes.size() > kMaxScriptStreamBytes) {
+      bytes = bytes.first(kMaxScriptStreamBytes);
+      decoded.cut = true;
+    }
+    text = PDF_DecodeText(bytes);
+  } else {
+    text = js->GetUnicodeText();
+  }
   size_t written = 0;
   bool source_cut = false;
-  WideString text = json::CutText(js->GetUnicodeText(), kMaxScriptBytes,
-                                  &written, &source_cut);
-  *cut = *cut || source_cut;
-  return decoded_.emplace(js.Get(), std::move(text)).first->second;
+  decoded.text = json::CutText(text, kMaxScriptBytes, &written, &source_cut);
+  decoded.cut = decoded.cut || source_cut;
+  const size_t room = decoded_left_ / sizeof(wchar_t);
+  if (decoded.text.GetLength() > room) {
+    decoded.text = decoded.text.First(room);
+    decoded.cut = true;
+    decoded_left_ = 0;
+  } else {
+    decoded_left_ -= decoded.text.GetLength() * sizeof(wchar_t);
+  }
+  *cut = *cut || decoded.cut;
+  return decoded_.emplace(js.Get(), std::move(decoded)).first->second.text;
 }
 
 const std::vector<WideString>& ScriptReader::Sources(const CPDF_Object* action,

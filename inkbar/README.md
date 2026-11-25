@@ -69,7 +69,7 @@ The checkout is mounted into the container. `scripts/embedpdf-runtime/build-targ
 
 The binary is single-threaded.
 
-Current size of `inkbar-pdfium.wasm`: 7,050,588 bytes raw, 2,968,459 bytes gzipped at level 9. It exports 112 functions. The budget is 3,256,192 bytes gzipped.
+Current size of `inkbar-pdfium.wasm`: 7,051,139 bytes raw, 2,968,532 bytes gzipped at level 9. It exports 112 functions. The budget is 3,256,192 bytes gzipped.
 
 ## The redaction check
 
@@ -166,7 +166,8 @@ Caps, each reported with `"truncated": true`:
 - a text string writes at most 1 MB (512 KB of bytes in hex), a script 4 MB;
 - 50,000 fields, and 50,000 `/CO` entries;
 - reading JavaScript has a work allowance of 4,000,000 reads a report (an action, a `/Next` array entry, an `/AA` key, a `/Parent` level), and a chain, a decoded `/JS` and an `/AA` dictionary's keys are each read once a report however many places share them;
-- walks of a field tree, a `/Parent` chain, a structure tree and a name tree go at most 1,000 levels deep and visit each object once; the field tree and name tree walks also read each `/Kids` array once, so a `/Kids` array that 20,000 fields share is read once; the name tree reads at most 50,000 nodes; an action chain is read for at most 1,000 actions.
+- walks of a field tree, a `/Parent` chain, a structure tree and a name tree go at most 1,000 levels deep and visit each object once; the field tree and name tree walks also read each `/Kids` array once, so a `/Kids` array that 20,000 fields share is read once; the name tree reads at most 50,000 nodes; an action chain is read for at most 1,000 objects (actions, `/Next` arrays and any other entry they hold count alike);
+- a report holds at most 16 MB of decoded JavaScript (4 bytes a character, each `/JS` decoded once and kept for the report); past that nothing more is decoded and the sources are cut. Only the first 16 MB of a decoded `/JS` stream become text, but its filters decode all of it first: PDFium gives no way to stop a decode sooner, and its Flate decoder stops at 1 GiB. So one `/JS` stream that decodes to hundreds of MB costs that much memory for a moment, and one near 1 GiB can exhaust the module's memory. This is a known limit.
 
 One limit is a refusal, reported with `"tooLarge": true` in `INK_Form`: when the field tree holds more than 50,000 dictionaries, or those and the widgets the page sweep would add (widget annotations outside the tree with `/FT` along `/Parent`) number more than 50,000, the form is not loaded and `fields` is empty. PDFium's field tree takes time that grows with the square of what it loads, about 19 s for 50,000 fields, so no part of the list can be had cheaply.
 

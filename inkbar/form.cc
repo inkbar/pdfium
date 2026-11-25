@@ -400,7 +400,8 @@ void AppendAction(std::string* out,
   out->push_back('}');
 }
 
-void AppendWidget(std::string* out,
+// Returns whether it cut anything.
+bool AppendWidget(std::string* out,
                   const CPDF_FormControl* control,
                   bool toggle,
                   const Places& places,
@@ -465,11 +466,12 @@ void AppendWidget(std::string* out,
     out->append("true");
   }
   out->push_back('}');
+  return cut;
 }
 
 // Writes as much of the field as |budget| allows, and says "truncated" when
-// it cut anything.
-void AppendField(std::string* out,
+// it cut anything; returns whether it did.
+bool AppendField(std::string* out,
                  CPDF_FormField* field,
                  bool recovered,
                  const Places& places,
@@ -552,14 +554,19 @@ void AppendField(std::string* out,
       out->push_back(',');
     }
     first = false;
-    AppendWidget(out, control, toggle, places, reader);
+    // A field with a cut widget is cut too.
+    if (AppendWidget(out, control, toggle, places, reader)) {
+      cut = true;
+    }
   }
   out->push_back(']');
-  if (cut || budget->spent()) {
+  cut = cut || budget->spent();
+  if (cut) {
     AppendNextKey(out, "truncated");
     out->append("true");
   }
   out->push_back('}');
+  return cut;
 }
 
 // The JavaScript under each key of |dict| that holds some, as "key":[...]
@@ -740,7 +747,10 @@ char* INK_Form(FPDF_DOCUMENT doc) {
         out.push_back(',');
       }
       const CPDF_Dictionary* dict = field->GetFieldDict().Get();
-      AppendField(&out, field, !declared.count(dict), places, &reader);
+      // A cut field cuts the report.
+      if (AppendField(&out, field, !declared.count(dict), places, &reader)) {
+        truncated = true;
+      }
       // The budget charges at least what is written; this is a backstop.
       if (out.size() > kMaxReportBytes / 2) {
         out.resize(mark);
