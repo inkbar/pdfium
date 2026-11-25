@@ -23,6 +23,7 @@
 
 class CPDF_Array;
 class CPDF_Dictionary;
+class CPDF_Number;
 class CPDF_Object;
 class CPDF_Stream;
 
@@ -120,9 +121,20 @@ void AppendFileName(std::string* out,
 // the file holds under it (PDFium keeps none in a reference), 0 when none.
 void AppendRef(std::string* out, const CPDF_Object* object);
 
-// An array's entries as numbers, each null when it is not a finite number,
-// at most |max| of them and as many as |budget| allows. Sets |*cut| when
-// there were more.
+// A number of the file as AppendNumber writes it, null for none.
+//
+// An integer is written exactly as PDFium holds it: a token without a point
+// is kept as a 32-bit integer (one out of that range PDFium reads as 0), and
+// an unsigned one past INT_MAX is written unsigned. A real is kept by PDFium
+// only as a 32-bit float, the token being dropped as it parses, so it is
+// written as the shortest decimal that reads back as that float
+// (json::AppendShortestNumber): 0.4 is written 0.4, not 0.400000006. A real
+// that is not finite is null.
+void AppendNumber(std::string* out, const CPDF_Number* number);
+
+// An array's entries as AppendNumber writes them, each null when it is not a
+// finite number, at most |max| of them and as many as |budget| allows. Sets
+// |*cut| when there were more.
 void AppendNumbers(std::string* out,
                    const CPDF_Array* array,
                    size_t max,
@@ -144,16 +156,28 @@ void AppendNames(std::string* out,
 void AppendRect(std::string* out, const CPDF_Dictionary* dict);
 // "hasAppearance": /AP /N is a stream, or a dictionary whose entry under /AS
 // is one. "appearance": "stream", "states" (a dictionary) or null. "states":
-// the names of /N's entries, in byte order (PDFium keeps a dictionary
-// sorted), when /N is a dictionary.
+// the names of /N's entries when /N is a dictionary, in the unsigned byte
+// order of the names, not the file's: PDFium's parser stores a dictionary as
+// a map sorted by key and keeps no trace of the order the keys were written
+// in, and a key written twice is listed once (the parser keeps the last).
 // "as": /AS when it is a name.
 void AppendAppearance(std::string* out,
                       const CPDF_Dictionary* dict,
                       Budget* budget,
                       bool* cut);
 // "borderStyle": { "width": /W or null, "style": /S or null } when /BS is a
-// dictionary. "border": /Border's first three entries when it is an array.
-void AppendBorder(std::string* out, const CPDF_Dictionary* dict);
+// dictionary, with "dash": /D's entries as numbers (null for one that is not
+// a number), or null when /D is not an array, present when /BS has /D.
+// "border": /Border's first three entries when it is an array, and
+// "borderDash" its fourth as numbers (null when that is not an array),
+// present when /Border has a fourth entry. The dash arrays are written as the
+// file has them, an empty, negative or all-zero one included, at most
+// kMaxNumbers entries each and as many as |budget| allows; |*cut| is set when
+// one was cut.
+void AppendBorder(std::string* out,
+                  const CPDF_Dictionary* dict,
+                  Budget* budget,
+                  bool* cut);
 
 // The most units of work one report spends reading JavaScript: an object of
 // an action chain, an entry of a /Next array, a key of an /AA dictionary, a

@@ -377,6 +377,25 @@ void AppendRef(std::string* out, const CPDF_Object* object) {
   out->push_back(']');
 }
 
+void AppendNumber(std::string* out, const CPDF_Number* number) {
+  if (!number) {
+    out->append("null");
+    return;
+  }
+  if (number->IsInteger()) {
+    const int value = number->GetInteger();
+    // An unsigned integer past INT_MAX comes back from GetInteger() wrapped
+    // negative; its float says it is not.
+    if (value < 0 && number->GetNumber() >= 0) {
+      out->append(std::to_string(static_cast<uint32_t>(value)));
+    } else {
+      out->append(std::to_string(value));
+    }
+    return;
+  }
+  json::AppendShortestNumber(out, number->GetNumber());
+}
+
 void AppendNumbers(std::string* out,
                    const CPDF_Array* array,
                    size_t max,
@@ -392,12 +411,7 @@ void AppendNumbers(std::string* out,
     if (i > 0) {
       out->push_back(',');
     }
-    const CPDF_Number* number = ToNumber(array->GetDirectObjectAt(i).Get());
-    if (number) {
-      json::AppendNumber(out, number->GetNumber());
-    } else {
-      out->append("null");
-    }
+    AppendNumber(out, ToNumber(array->GetDirectObjectAt(i).Get()));
   }
   if (size > max) {
     *cut = true;
@@ -506,25 +520,45 @@ void AppendAppearance(std::string* out,
   }
 }
 
-void AppendBorder(std::string* out, const CPDF_Dictionary* dict) {
+namespace {
+
+// ,"key": the entry's numbers, or null when it is not an array.
+void AppendDash(std::string* out,
+                const char* key,
+                const CPDF_Object* dash,
+                Budget* budget,
+                bool* cut) {
+  AppendNextKey(out, key);
+  const CPDF_Array* array = dash ? dash->AsArray() : nullptr;
+  if (array) {
+    AppendNumbers(out, array, kMaxNumbers, budget, cut);
+  } else {
+    out->append("null");
+  }
+}
+
+}  // namespace
+
+void AppendBorder(std::string* out,
+                  const CPDF_Dictionary* dict,
+                  Budget* budget,
+                  bool* cut) {
   RetainPtr<const CPDF_Object> bs_object = EntryFor(dict, "BS");
   if (const CPDF_Dictionary* bs = bs_object ? bs_object->AsDictionary()
                                             : nullptr) {
     AppendNextKey(out, "borderStyle");
     out->push_back('{');
     AppendKey(out, "width");
-    const CPDF_Number* width = ToNumber(EntryFor(bs, "W").Get());
-    if (width) {
-      json::AppendNumber(out, width->GetNumber());
-    } else {
-      out->append("null");
-    }
+    AppendNumber(out, ToNumber(EntryFor(bs, "W").Get()));
     AppendNextKey(out, "style");
     RetainPtr<const CPDF_Object> style = EntryFor(bs, "S");
     if (style && style->IsName()) {
       json::AppendName(out, style->GetString());
     } else {
       out->append("null");
+    }
+    if (RetainPtr<const CPDF_Object> dash = EntryFor(bs, "D")) {
+      AppendDash(out, "dash", dash.Get(), budget, cut);
     }
     out->push_back('}');
   }
@@ -535,6 +569,10 @@ void AppendBorder(std::string* out, const CPDF_Dictionary* dict) {
     bool more = false;
     Budget room(3 * 16);
     AppendNumbers(out, border, 3, &room, &more);
+    if (border->size() > 3) {
+      AppendDash(out, "borderDash", border->GetDirectObjectAt(3).Get(),
+                 budget, cut);
+    }
   }
 }
 

@@ -37,12 +37,12 @@
 namespace {
 
 using inkbar::json::AppendHex;
-using inkbar::json::AppendNumber;
 using inkbar::json::AppendText;
 using inkbar::report::AppendFileName;
 using inkbar::report::AppendFileText;
 using inkbar::report::AppendKey;
 using inkbar::report::AppendNextKey;
+using inkbar::report::AppendNumber;
 using inkbar::report::AppendNumbers;
 using inkbar::report::AppendRef;
 using inkbar::report::ScriptReader;
@@ -209,16 +209,22 @@ void AppendTextFor(std::string* out,
   AppendFileText(out, value->GetString(), kMaxTextBytes, budget, cut);
 }
 
-// ,"<kind_key>":"..." and, for a string, a name or an array, ,"<key>":value.
+// ,"<kind_key>":"..." and, for a string, a name or an array, ,"<key>":value;
+// for a value present as null, ,"<null_key>":true.
 void AppendValue(std::string* out,
                  const CPDF_Object* value,
                  const char* kind_key,
                  const char* key,
+                 const char* null_key,
                  Budget* budget,
                  bool* cut) {
   AppendNextKey(out, kind_key);
   if (!value || value->IsNull()) {
     out->append("\"none\"");
+    if (value) {
+      AppendNextKey(out, null_key);
+      out->append("true");
+    }
     return;
   }
   if (value->IsString()) {
@@ -244,6 +250,11 @@ void AppendValue(std::string* out,
       RetainPtr<const CPDF_Object> entry = array->GetDirectObjectAt(i);
       if (entry && entry->IsString()) {
         AppendFileText(out, entry->GetString(), kMaxTextBytes, budget, cut);
+      } else if (entry && entry->IsName()) {
+        // Within the entry's kItemCost; the name charges what it writes.
+        out->append("{\"name\":");
+        AppendFileName(out, entry->GetString(), budget, cut);
+        out->push_back('}');
       } else {
         out->append("null");
       }
@@ -328,6 +339,21 @@ void AppendWidgetScripts(std::string* out,
   out->push_back('}');
 }
 
+// A byte string as hex, at most kMaxTextBytes / 2 bytes of it and as many as
+// |budget| allows.
+void AppendHexBytes(std::string* out,
+                    const ByteString& bytes,
+                    Budget* budget,
+                    bool* cut) {
+  const size_t keep =
+      std::min({bytes.GetLength(), kMaxTextBytes / 2, budget->left() / 2});
+  budget->Take(keep * 2);
+  if (keep < bytes.GetLength()) {
+    *cut = true;
+  }
+  AppendHex(out, bytes.First(keep));
+}
+
 // The widget's own /A, its first action only.
 void AppendAction(std::string* out,
                   const CPDF_Dictionary* widget,
@@ -348,14 +374,31 @@ void AppendAction(std::string* out,
     const ByteString bytes = uri && (uri->IsString() || uri->IsName())
                                  ? uri->GetString()
                                  : ByteString();
-    const size_t keep = std::min(
-        {bytes.GetLength(), kMaxTextBytes / 2, budget->left() / 2});
-    budget->Take(keep * 2);
-    if (keep < bytes.GetLength()) {
-      *cut = true;
-    }
     AppendNextKey(out, "uriHex");
-    AppendHex(out, bytes.First(keep));
+    AppendHexBytes(out, bytes, budget, cut);
+  } else if (s == "Launch" || s == "GoToR") {
+    // /F as the file gives it: a string, or a file specification's /F and
+    // /UF. No address is built from them.
+    RetainPtr<const CPDF_Object> file = EntryFor(action, "F");
+    if (file) {
+      const CPDF_Dictionary* spec = file->AsDictionary();
+      AppendNextKey(out, "fileKind");
+      out->append(file->IsString() ? "\"string\""
+                  : spec           ? "\"spec\""
+                                   : "\"other\"");
+      if (file->IsString()) {
+        AppendNextKey(out, "fileHex");
+        AppendHexBytes(out, file->GetString(), budget, cut);
+      }
+      for (const auto& [key, name] : {std::pair{"F", "fileSpecFHex"},
+                                      std::pair{"UF", "fileSpecUFHex"}}) {
+        RetainPtr<const CPDF_Object> entry = EntryFor(spec, key);
+        if (entry && entry->IsString()) {
+          AppendNextKey(out, name);
+          AppendHexBytes(out, entry->GetString(), budget, cut);
+        }
+      }
+    }
   } else if (s == "Named") {
     RetainPtr<const CPDF_Object> name = EntryFor(action, "N");
     AppendNextKey(out, "name");
@@ -429,7 +472,7 @@ bool AppendWidget(std::string* out,
     AppendWideText(out, control->GetExportValue(), kMaxTextBytes, budget,
                    &cut);
   }
-  inkbar::report::AppendBorder(out, widget);
+  inkbar::report::AppendBorder(out, widget, budget, &cut);
   RetainPtr<const CPDF_Object> mk_object = EntryFor(widget, "MK");
   if (const CPDF_Dictionary* mk =
           mk_object ? mk_object->AsDictionary() : nullptr) {
@@ -443,14 +486,14 @@ bool AppendWidget(std::string* out,
     }
     if (const CPDF_Number* r = ToNumber(EntryFor(mk, "R").Get())) {
       AppendNextKey(out, "rotation");
-      AppendNumber(out, r->GetNumber());
+      AppendNumber(out, r);
     }
     AppendTextFor(out, EntryFor(mk, "CA").Get(), "caption", budget, &cut);
   }
   if (const CPDF_Number* q = ToNumber(
           CPDF_FormField::GetFieldAttrForDict(widget, "Q").Get())) {
     AppendNextKey(out, "q");
-    AppendNumber(out, q->GetNumber());
+    AppendNumber(out, q);
   }
   AppendTextFor(out, EntryFor(widget, "TU").Get(), "tooltip", budget, &cut);
   AppendTextFor(out, CPDF_FormField::GetFieldAttrForDict(widget, "DA").Get(),
@@ -493,9 +536,21 @@ bool AppendField(std::string* out,
   AppendNextKey(out, "flags");
   out->append(std::to_string(field->GetFieldFlags()));
   AppendValue(out, CPDF_FormField::GetFieldAttrForDict(dict, "V").Get(),
-              "valueKind", "value", budget, &cut);
+              "valueKind", "value", "valueNull", budget, &cut);
   AppendValue(out, CPDF_FormField::GetFieldAttrForDict(dict, "DV").Get(),
-              "defaultValueKind", "defaultValue", budget, &cut);
+              "defaultValueKind", "defaultValue", "defaultValueNull", budget,
+              &cut);
+  // /I, inherited as /V is, from the same dictionaries.
+  RetainPtr<const CPDF_Object> selected =
+      CPDF_FormField::GetFieldAttrForDict(dict, "I");
+  if (selected && !selected->IsNull()) {
+    AppendNextKey(out, "selectedIndices");
+    if (const CPDF_Array* indices = selected->AsArray()) {
+      AppendNumbers(out, indices, kMaxNumbers, budget, &cut);
+    } else {
+      out->append("null");
+    }
+  }
   if (type == CPDF_FormField::kComboBox || type == CPDF_FormField::kListBox) {
     AppendNextKey(out, "options");
     out->push_back('[');
@@ -708,7 +763,7 @@ char* INK_Form(FPDF_DOCUMENT doc) {
                 &truncated);
   if (const CPDF_Number* q = ToNumber(EntryFor(acro_form.Get(), "Q").Get())) {
     AppendNextKey(&out, "q");
-    AppendNumber(&out, q->GetNumber());
+    AppendNumber(&out, q);
   }
 
   const FieldTree tree = WalkFieldTree(

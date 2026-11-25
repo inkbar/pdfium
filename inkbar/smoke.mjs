@@ -5229,6 +5229,85 @@ function scriptReports(pdf, within, what) {
   })
 }
 
+{
+  // Facts PDF.js reads that the reports carry as the file has them: a choice
+  // field's /I (here disagreeing with /V, inherited from a parent, with wrong
+  // entries, and not an array), /V and /DV present as null against absent, a
+  // name inside a /V array, a Launch and a GoToR action's /F, border dashes
+  // (valid, from /Border, invalid, all zeros, not arrays) and reals written
+  // as the shortest decimal that reads back as PDFium's float.
+  const widget = (rest) => `<< /Type /Annot /Subtype /Widget /Rect [10 10 60 30] ${rest} >>`
+  const square = (rest) => `<< /Type /Annot /Subtype /Square /Rect [0 0 10 10] ${rest} >>`
+  const pdf = onePagePdf(
+    '',
+    { catalog: '/AcroForm 6 0 R', page: '/Annots [7 0 R 8 0 R 9 0 R 10 0 R 11 0 R 12 0 R 13 0 R 15 0 R 16 0 R 17 0 R 18 0 R 19 0 R 20 0 R 21 0 R]' },
+    [
+      '<< /Fields [7 0 R 8 0 R 9 0 R 10 0 R 11 0 R 12 0 R 13 0 R 14 0 R] >>',
+      widget('/FT /Ch /Ff 2097152 /T (list) /Opt [(a) (b) (c)] /V (a) /I [1 2]'),
+      widget('/FT /Tx /T (vnull) /V null /DV null'),
+      widget('/FT /Tx /T (vnone)'),
+      widget('/FT /Ch /Ff 2097152 /T (varr) /Opt [(x) (y)] /V [/Nm (str) 3] /DV [/D1] /I [(x) /n 2.5 -1]'),
+      widget('/FT /Btn /Ff 65536 /T (launch) /A << /S /Launch /F (app.exe) >>'),
+      widget('/FT /Btn /Ff 65536 /T (gotor) /A << /S /GoToR /F << /Type /Filespec /F (other.pdf) /UF <FEFF00E9> >> /D [0 /Fit] >>'),
+      widget('/FT /Btn /Ff 65536 /T (oddfile) /I 3 /A << /S /Launch /F 5 >>'),
+      '<< /T (group) /FT /Ch /V (p) /I [0] /Kids [15 0 R] >>',
+      widget('/Parent 14 0 R /T (kid)'),
+      square('/BS << /W 0.4 /S /D /D [3 2] >> /C [0.1 0.4 0.7] /CA 0.4'),
+      square('/Border [0 0 1 [4 2]]'),
+      square('/BS << /D [-1 (x) 0] >> /Border [0 0 1 5]'),
+      square('/BS << /D [0 0] >> /Border [0 0 1 [] 9]'),
+      square('/BS << /D 7 >> /Border [0 0 1 null]'),
+      // One array of 1,000,001 numbers as both dashes: the first is cut at
+      // 1,000,000, the second by the report's budget, and the report is
+      // still JSON.
+      square('/BS << /D 22 0 R >> /Border [0 0 1 22 0 R]'),
+      `[${'1 '.repeat(1000001)}]`,
+    ],
+  )
+  withPdf(pdf, (doc) => {
+    const unread = saveWith(doc, NO_INCREMENTAL)
+    const failures = []
+    const check = (label, fn) => {
+      try {
+        fn()
+      } catch (error) {
+        failures.push(`${label}: ${error.message.split('\n')[0]}`)
+      }
+    }
+    const form = takeJson(m._INK_Form(doc))
+    const field = (name) => form.fields.find((f) => f.name === name)
+    const { annots, truncated } = takeJson(m._INK_Annots_Page(doc, 0))
+    const annot = (i) => annots.find((a) => a.index === i)
+
+    check('/I disagreeing with /V', () => assert.deepEqual([field('list').value, field('list').selectedIndices], ['a', [1, 2]]))
+    check('/I inherited from the parent', () => assert.deepEqual([field('group.kid').value, field('group.kid').selectedIndices], ['p', [0]]))
+    check('/I with wrong entries', () => assert.deepEqual(field('varr').selectedIndices, [null, null, 2.5, -1]))
+    check('/I not an array', () => assert.equal(field('oddfile').selectedIndices, null))
+    check('no /I', () => assert.ok(!('selectedIndices' in field('vnull'))))
+    check('/V null', () => assert.deepEqual([field('vnull').valueKind, field('vnull').valueNull, field('vnull').defaultValueNull], ['none', true, true]))
+    check('no /V', () => assert.deepEqual([field('vnone').valueKind, 'valueNull' in field('vnone'), 'defaultValueNull' in field('vnone')], ['none', false, false]))
+    check('a name in a /V array', () => assert.deepEqual([field('varr').valueKind, field('varr').value, field('varr').defaultValue], ['array', [{ name: 'Nm' }, 'str', null], [{ name: 'D1' }]]))
+    check('Launch /F', () => assert.deepEqual(field('launch').widgets[0].action, { s: 'Launch', fileKind: 'string', fileHex: hex('app.exe') }))
+    check('GoToR /F', () => assert.deepEqual(field('gotor').widgets[0].action, { s: 'GoToR', fileKind: 'spec', fileSpecFHex: hex('other.pdf'), fileSpecUFHex: 'feff00e9' }))
+    check('Launch /F of another type', () => assert.deepEqual(field('oddfile').widgets[0].action, { s: 'Launch', fileKind: 'other' }))
+    check('/BS /D', () => assert.deepEqual(annot(8).borderStyle, { width: 0.4, style: 'D', dash: [3, 2] }))
+    check('/Border dash', () => assert.deepEqual([annot(9).border, annot(9).borderDash], [[0, 0, 1], [4, 2]]))
+    check('an invalid dash', () => assert.deepEqual([annot(10).borderStyle.dash, annot(10).borderDash], [[-1, null, 0], null]))
+    check('an all-zero dash and an empty one', () => assert.deepEqual([annot(11).borderStyle.dash, annot(11).borderDash], [[0, 0], []]))
+    check('dashes that are not arrays', () => assert.deepEqual([annot(12).borderStyle.dash, annot(12).borderDash], [null, null]))
+    check('a long shared dash', () => {
+      assert.equal(annot(13).borderStyle.dash.length, 1000000)
+      assert.ok(annot(13).borderDash.length < 1000000, 'the budget did not cut the second dash')
+      assert.deepEqual([annot(13).truncated, truncated], [true, true])
+    })
+    check('reals written short', () => assert.deepEqual([annot(8).color, annot(8).opacity], [[0.1, 0.4, 0.7], 0.4]))
+    // Absent when the file has none.
+    check('no dash', () => assert.ok(!('borderDash' in annot(0)) && !('borderStyle' in annot(0))))
+    assert.deepEqual(failures, [], failures.join('\n'))
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'a report changed what a save writes')
+  })
+}
+
 m._INK_Destroy()
 // SMOKE_OUT, SMOKE_FORM_OUT and SMOKE_IMAGE_OUT name files to receive the saved
 // documents, for qpdf --check: the appearance document, the text box, border

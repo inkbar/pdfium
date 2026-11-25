@@ -30,10 +30,10 @@
 namespace {
 
 using inkbar::json::AppendName;
-using inkbar::json::AppendNumber;
 using inkbar::report::AppendFileText;
 using inkbar::report::AppendKey;
 using inkbar::report::AppendNextKey;
+using inkbar::report::AppendNumber;
 using inkbar::report::AppendNumbers;
 using inkbar::report::AppendFileName;
 using inkbar::report::AppendRef;
@@ -134,7 +134,7 @@ void AppendAnnot(std::string* out,
 
   if (const CPDF_Number* opacity = ToNumber(EntryFor(annot, "CA").Get())) {
     AppendNextKey(out, "opacity");
-    AppendNumber(out, opacity->GetNumber());
+    AppendNumber(out, opacity);
   }
   AppendTextFor(out, annot, "Contents", "contents", budget, &cut);
   AppendTextFor(out, annot, "T", "author", budget, &cut);
@@ -175,11 +175,11 @@ void AppendAnnot(std::string* out,
     }
     out->push_back(']');
   }
-  inkbar::report::AppendBorder(out, annot);
+  inkbar::report::AppendBorder(out, annot, budget, &cut);
   AppendTextFor(out, annot, "DA", "da", budget, &cut);
   if (const CPDF_Number* q = ToNumber(EntryFor(annot, "Q").Get())) {
     AppendNextKey(out, "q");
-    AppendNumber(out, q->GetNumber());
+    AppendNumber(out, q);
   }
   if (EntryFor(annot, "PMD")) {
     AppendNextKey(out, "pmd");

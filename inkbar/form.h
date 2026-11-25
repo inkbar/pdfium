@@ -48,7 +48,8 @@ extern "C" {
 //     "kind": "text" | "checkbox" | "radio" | "button" | "combo" | "list" |
 //             "signature" | "unknown",
 //     "flags": 0, "valueKind": "string", "value": Text,
-//     "defaultValueKind": "none", "options": [ { "exportValue": "gb",
+//     "defaultValueKind": "none", "defaultValueNull": true,
+//     "selectedIndices": [1, 2], "options": [ { "exportValue": "gb",
 //     "displayValue": "United Kingdom" } ], "maxLength": 6, "topIndex": 0,
 //     "tooltip": "Header",
 //     "widgets": [ {
@@ -62,7 +63,10 @@ extern "C" {
 //       "scripts": Scripts,
 //       "action": { "s": "URI", "uriHex": "..." } | { "s": "Named",
 //                 "name": "Print" } | { "s": "ResetForm", "fields": [Text],
-//                 "refs": [[n, g]], "flags": 0 } | { "s": "<other /S>" },
+//                 "refs": [[n, g]], "flags": 0 } | { "s": "Launch" | "GoToR",
+//                 "fileKind": "string" | "spec" | "other", "fileHex": "...",
+//                 "fileSpecFHex": "...", "fileSpecUFHex": "..." } |
+//                 { "s": "<other /S>" },
 //       (ResetForm: an entry of /Fields written as a reference is in "refs",
 //       whatever it refers to, a text string included; one written as a
 //       string is in "fields". PDF.js reads /Fields the same way.)
@@ -83,11 +87,21 @@ extern "C" {
 // a direct dictionary; "kind" PDFium's reading of /FT and /Ff; "flags" /Ff,
 // inherited. "valueKind" is /V's type, inherited: "none" (absent or null),
 // "string", "name", "array" or "other", and "value" is present for the first
-// three: a text string's Text, a name, or an array whose strings are Text and
-// whose other entries are null. "defaultValueKind" and "defaultValue" are
-// /DV's. "options" is /Opt of a choice field as PDFium reads it. "maxLength"
-// is /MaxLen of a text field, present when it is not 0. "topIndex" is a list
-// box's /TI. "tooltip" is the field dictionary's own /TU.
+// three: a text string's Text, a name, or an array whose strings are Text,
+// whose names are { "name": "<name>" } and whose other entries are null.
+// "valueNull" is present, and true, when /V is there as null (the nearest
+// dictionary along /Parent that has /V gives null); without it a "none" /V is
+// absent. A reference to an object the file does not hold counts as absent,
+// as PDFium reads it. "defaultValueKind", "defaultValue" and
+// "defaultValueNull" are /DV's. "selectedIndices" is /I, read from the same
+// dictionaries as /V (the field's, then along /Parent, the nearest that has
+// it), for a field of any kind: its entries as numbers as written (null for
+// one that is not a number), at most 1,000,000, or null when /I is not an
+// array; absent when no dictionary has /I or it is null. It may disagree with
+// /V and with /Opt; nothing reconciles them. "options" is /Opt of a choice
+// field as PDFium reads it. "maxLength" is /MaxLen of a text field, present
+// when it is not 0. "topIndex" is a list box's /TI. "tooltip" is the field
+// dictionary's own /TU.
 //
 // A widget, in the order the field lists them: "page" is the index of the
 // page whose /Annots holds it and "annotIndex" its place there, both -1 when
@@ -105,6 +119,13 @@ extern "C" {
 // action under it holds JavaScript. That is how PDF.js reads a widget's
 // actions, and the viewer's reader follows it today. "action" is the widget's own /A
 // when it is a dictionary; only the first action of a chain is described.
+// For a Launch or GoToR action, "fileKind" says what /F is (absent when /F is
+// absent or null): a string, whose bytes are "fileHex", a file specification
+// dictionary, whose /F and /UF strings are "fileSpecFHex" and
+// "fileSpecUFHex" (each absent when that entry is not a string), or anything
+// else. The bytes are the file's, unchanged; no address is built from them
+// and nothing judges them. Each byte string, "uriHex" too, writes at most
+// 512 KB of bytes. A Launch action's /Win, /Mac and /Unix are not read.
 //
 // "calculationOrder" has an entry for each entry of /AcroForm /CO: the index
 // in "fields" of the field whose full name its dictionary has (as

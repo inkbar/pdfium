@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Edward Coleridge Smith
 //
-// JSON writing shared by text.cc and links.cc: strings escaped the same way in
-// both, and floats written so that they read back as the same float.
+// JSON writing shared by text.cc, links.cc and report.cc: strings escaped the
+// same way in each, and floats written so that they read back as the same
+// float.
 
 #ifndef INKBAR_JSON_H_
 #define INKBAR_JSON_H_
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <cmath>
 #include <string>
@@ -87,6 +89,25 @@ inline void AppendNumber(std::string* out, float value) {
   }
   char buffer[32];
   snprintf(buffer, sizeof(buffer), "%.9g", value);
+  out->append(buffer);
+}
+
+// A float as the shortest decimal (at most 9 significant digits) that reads
+// back as the same float: 0.4f is written 0.4, not 0.400000006. null when it
+// is not finite.
+inline void AppendShortestNumber(std::string* out, float value) {
+  if (!std::isfinite(value)) {
+    out->append("null");
+    return;
+  }
+  char buffer[32];
+  for (int digits = 1; digits <= 9; ++digits) {
+    snprintf(buffer, sizeof(buffer), "%.*g", digits,
+             static_cast<double>(value));
+    if (strtof(buffer, nullptr) == value) {
+      break;
+    }
+  }
   out->append(buffer);
 }
 

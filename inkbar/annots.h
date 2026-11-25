@@ -28,9 +28,12 @@ extern "C" {
 // undefined there). Text is cut after the last character whose written form
 // (UTF-8 with JSON escapes) ends within 1 MB, hex after 512 KB of bytes; an
 // entry with a cut value has "truncated": true. A name is written as its
-// bytes, each the code point of its value (U+0000 to U+00FF). A number is
-// written with 9 significant digits; one that is absent where a number is
-// due, not a number or not finite is null. A reference is [number,
+// bytes, each the code point of its value (U+0000 to U+00FF). An integer is
+// written exactly as PDFium holds it (32 bits; an unsigned one past INT_MAX
+// unsigned). A real is written as the shortest decimal that reads back as the
+// 32-bit float PDFium keeps for it (0.4 as 0.4); PDFium keeps no more of the
+// token. A number that is absent where a number is due, not a number or not
+// finite is null. A reference is [number,
 // generation], the generation that of the object the file holds under the
 // number, 0 when none.
 
@@ -46,7 +49,8 @@ extern "C" {
 //     "icon": "Comment", "inReplyTo": [7, 0], "intent": "FreeTextCallout",
 //     "line": [x1, y1, x2, y2], "lineEndings": ["None", "OpenArrow"],
 //     "vertices": [...], "inkLists": [[...], ...],
-//     "borderStyle": { "width": 1, "style": "S" }, "border": [0, 0, 1],
+//     "borderStyle": { "width": 1, "style": "D", "dash": [3, 2] },
+//     "border": [0, 0, 1], "borderDash": [4, 2],
 //     "da": Text, "q": 1, "pmd": true, "parent": [9, 0],
 //     "truncated": true } ],
 //   "truncated": false }
@@ -58,14 +62,18 @@ extern "C" {
 // place there; any other entry, a stream included, is skipped and the entries
 // after it keep their places. At most 200,000 entries. "objectNumber" and
 // "generation" are absent for a direct dictionary. "rect", "rectOk",
-// "hasAppearance", "appearance", "states", "as", "borderStyle" and "border"
-// are described in report.h. "flags" is /F. The other keys are present only
-// when the file has the entry in the right type: "quads" /QuadPoints,
-// "color" /C, "interiorColor" /IC, "line" /L and "vertices" /Vertices are
-// arrays of numbers as written, any length; "inkLists" is /InkList, an array
-// of arrays (an entry that is not an array is null). /QuadPoints, /Vertices
-// and /InkList as a whole are read up to 1,000,000 numbers, and an entry cut
-// there has "truncated": true. "opacity" is /CA; "contents" /Contents,
+// "hasAppearance", "appearance", "states", "as", "borderStyle", "border" and
+// "borderDash" are described in report.h. "states" is in the byte order of
+// the names, not the file's order: PDFium's parsed dictionary keeps none.
+// "borderStyle"'s "dash" (/BS /D) and "borderDash" (/Border's fourth entry)
+// are written as the file has them, an invalid dash included, up to
+// 1,000,000 numbers each; a non-array is null. "flags" is /F. The other
+// keys are present only when the file has the entry in the right type:
+// "quads" /QuadPoints, "color" /C, "interiorColor" /IC, "line" /L and
+// "vertices" /Vertices are arrays of numbers as written, any length;
+// "inkLists" is /InkList, an array of arrays (an entry that is not an array
+// is null). /QuadPoints, /Vertices and /InkList as a whole are read up to
+// 1,000,000 numbers, and an entry cut there has "truncated": true. "opacity" is /CA; "contents" /Contents,
 // "author" /T, "created" /CreationDate and "modified" /M are text strings.
 // "icon" is /Name, "intent" /IT and "lineEndings" /LE names (an entry of /LE
 // that is not a name is null). "inReplyTo" is /IRT when it is a reference;
