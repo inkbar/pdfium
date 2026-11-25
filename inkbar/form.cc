@@ -134,6 +134,9 @@ using WalkIndex = std::map<const CPDF_Dictionary*, int>;
 // once, at most kMaxDepth levels and kMaxFields dictionaries.
 struct FieldWalk {
   std::vector<RetainPtr<const CPDF_Dictionary>> order;
+  // For each of |order|, the dictionary whose /Kids the walk reached it
+  // through, null for an entry of /Fields.
+  std::vector<const CPDF_Dictionary*> parent;
   WalkIndex index;
   // A cap cut the walk short.
   bool cut = false;
@@ -142,23 +145,31 @@ struct FieldWalk {
 FieldWalk WalkFields(const CPDF_Array* fields) {
   FieldWalk walk;
   std::set<const CPDF_Array*> arrays;
-  // Entries to visit, last first, with their depth.
-  std::vector<std::pair<RetainPtr<const CPDF_Object>, int>> stack;
-  const auto push = [&](const CPDF_Array* array, int depth) {
+  // Entries to visit, last first, with their depth and the dictionary whose
+  // /Kids holds them.
+  struct Entry {
+    RetainPtr<const CPDF_Object> object;
+    int depth;
+    const CPDF_Dictionary* parent;
+  };
+  std::vector<Entry> stack;
+  const auto push = [&](const CPDF_Array* array, int depth,
+                        const CPDF_Dictionary* parent) {
     for (size_t i = array->size(); i > 0; --i) {
       RetainPtr<const CPDF_Object> entry = array->GetObjectAt(i - 1);
       if (entry) {
-        stack.emplace_back(std::move(entry), depth);
+        stack.push_back({std::move(entry), depth, parent});
       }
     }
   };
   if (fields) {
     arrays.insert(fields);
-    push(fields, 1);
+    push(fields, 1, nullptr);
   }
   while (!stack.empty()) {
-    RetainPtr<const CPDF_Object> object = stack.back().first->GetDirect();
-    const int depth = stack.back().second;
+    RetainPtr<const CPDF_Object> object = stack.back().object->GetDirect();
+    const int depth = stack.back().depth;
+    const CPDF_Dictionary* parent = stack.back().parent;
     stack.pop_back();
     RetainPtr<const CPDF_Dictionary> dict = ToDictionary(std::move(object));
     if (!dict || walk.index.count(dict.Get())) {
@@ -170,6 +181,7 @@ FieldWalk WalkFields(const CPDF_Array* fields) {
     }
     walk.index.emplace(dict.Get(), static_cast<int>(walk.order.size()));
     walk.order.push_back(dict);
+    walk.parent.push_back(parent);
     RetainPtr<const CPDF_Object> kids_object = EntryFor(dict.Get(), "Kids");
     const CPDF_Array* kids = kids_object ? kids_object->AsArray() : nullptr;
     if (!kids || !arrays.insert(kids).second) {
@@ -179,7 +191,7 @@ FieldWalk WalkFields(const CPDF_Array* fields) {
       walk.cut = true;
       continue;
     }
-    push(kids, depth + 1);
+    push(kids, depth + 1, dict.Get());
   }
   return walk;
 }
@@ -267,6 +279,25 @@ void AppendTextFor(std::string* out,
   AppendFileText(out, value->GetString(), kMaxTextBytes, budget, cut);
 }
 
+// An array entry that is a name as { "name": "<name>" }, the wrapper within
+// the entry's kItemCost and the name charged what it writes; null when
+// |budget| cannot take the name.
+void AppendArrayName(std::string* out,
+                     const ByteString& name,
+                     Budget* budget,
+                     bool* cut) {
+  std::string written;
+  inkbar::json::AppendName(&written, name);
+  if (budget->Take(written.size())) {
+    out->append("{\"name\":");
+    out->append(written);
+    out->push_back('}');
+  } else {
+    *cut = true;
+    out->append("null");
+  }
+}
+
 // ,"<kind_key>":"..." and, for a string, a name or an array, ,"<key>":value;
 // for a value present as null, ,"<null_key>":true.
 void AppendValue(std::string* out,
@@ -309,19 +340,7 @@ void AppendValue(std::string* out,
       if (entry && entry->IsString()) {
         AppendFileText(out, entry->GetString(), kMaxTextBytes, budget, cut);
       } else if (entry && entry->IsName()) {
-        // The wrapper is within the entry's kItemCost; the name is charged
-        // what it writes. A name the budget cannot take leaves the entry
-        // null.
-        std::string name;
-        inkbar::json::AppendName(&name, entry->GetString());
-        if (budget->Take(name.size())) {
-          out->append("{\"name\":");
-          out->append(name);
-          out->push_back('}');
-        } else {
-          *cut = true;
-          out->append("null");
-        }
+        AppendArrayName(out, entry->GetString(), budget, cut);
       } else {
         out->append("null");
       }
@@ -510,7 +529,8 @@ void AppendAction(std::string* out,
   out->push_back('}');
 }
 
-// An array's text strings as Text, each other entry null, at most
+// An array's text strings as Text, its names as { "name": "<name>" }, each
+// other entry null, at most
 // kMaxNumbers entries and as many as |budget| allows; null for no array.
 void AppendTexts(std::string* out,
                  const CPDF_Array* array,
@@ -532,9 +552,73 @@ void AppendTexts(std::string* out,
     RetainPtr<const CPDF_Object> entry = array->GetDirectObjectAt(i);
     if (entry && entry->IsString()) {
       AppendFileText(out, entry->GetString(), kMaxTextBytes, budget, cut);
+    } else if (entry && entry->IsName()) {
+      AppendArrayName(out, entry->GetString(), budget, cut);
     } else {
       out->append("null");
     }
+  }
+  out->push_back(']');
+}
+
+// ,"t": the dictionary's own /T, Text when it is a string, null when it is
+// anything else, nothing when it has none; and ,"parentIsWalkParent":false
+// when its /Parent is not the dictionary |walk_parent| (null for an entry of
+// /Fields, whose /Parent should be absent).
+void AppendNameFacts(std::string* out,
+                     const CPDF_Dictionary* dict,
+                     const CPDF_Dictionary* walk_parent,
+                     Budget* budget,
+                     bool* cut) {
+  RetainPtr<const CPDF_Object> t = EntryFor(dict, "T");
+  if (t) {
+    AppendNextKey(out, "t");
+    if (t->IsString()) {
+      AppendFileText(out, t->GetString(), kMaxTextBytes, budget, cut);
+    } else {
+      out->append("null");
+    }
+  }
+  if (dict->GetDictFor("Parent").Get() != walk_parent) {
+    AppendNextKey(out, "parentIsWalkParent");
+    out->append("false");
+  }
+}
+
+// { "ref": [n, g] | null, "dictionary": bool, "hasT": bool, "hasKids": bool }
+// for an entry of /Fields or /Kids; at most about 85 bytes.
+void AppendKid(std::string* out, const CPDF_Object* entry) {
+  out->append("{\"ref\":");
+  AppendRef(out, entry);
+  RetainPtr<const CPDF_Object> target = entry ? entry->GetDirect() : nullptr;
+  const CPDF_Dictionary* kid = target ? target->AsDictionary() : nullptr;
+  AppendNextKey(out, "dictionary");
+  out->append(Boolean(kid));
+  if (kid) {
+    AppendNextKey(out, "hasT");
+    out->append(Boolean(kid->KeyExist("T")));
+    AppendNextKey(out, "hasKids");
+    out->append(Boolean(kid->KeyExist("Kids")));
+  }
+  out->push_back('}');
+}
+
+// The entries of /Kids or /Fields as AppendKid writes them, at most kMaxFields
+// and as many as |budget| allows.
+void AppendKids(std::string* out,
+                const CPDF_Array* kids,
+                Budget* budget,
+                bool* cut) {
+  out->push_back('[');
+  for (size_t i = 0; kids && i < kids->size(); ++i) {
+    if (i == kMaxFields || !budget->Take(3 * kItemCost)) {
+      *cut = true;
+      break;
+    }
+    if (i > 0) {
+      out->push_back(',');
+    }
+    AppendKid(out, kids->GetObjectAt(i).Get());
   }
   out->push_back(']');
 }
@@ -610,6 +694,14 @@ bool AppendWidget(std::string* out,
   }
   inkbar::report::AppendBorder(out, widget, budget, &cut);
   AppendMk(out, widget, budget, &cut);
+  if (toggle && field_dict != widget) {
+    // The widget's own /Opt, where PDF.js starts its lookup.
+    RetainPtr<const CPDF_Object> own = EntryFor(widget, "Opt");
+    if (own) {
+      AppendNextKey(out, "opt");
+      AppendTexts(out, own->AsArray(), budget, &cut);
+    }
+  }
   if (choice && field_dict != widget) {
     // The widget's own /I, which PDF.js reads from the widget alone.
     RetainPtr<const CPDF_Object> own = EntryFor(widget, "I");
@@ -646,7 +738,7 @@ bool AppendField(std::string* out,
                  CPDF_FormField* field,
                  bool recovered,
                  const Places& places,
-                 const WalkIndex& walk_index,
+                 const FieldWalk& walk,
                  ScriptReader* reader) {
   Budget* budget = reader->budget();
   const CPDF_Dictionary* dict = field->GetFieldDict().Get();
@@ -730,10 +822,11 @@ bool AppendField(std::string* out,
       AppendTexts(out, opt->AsArray(), budget, &cut);
     }
   }
-  const auto walked = walk_index.find(dict);
-  if (walked != walk_index.end()) {
+  const auto walked = walk.index.find(dict);
+  if (walked != walk.index.end()) {
     AppendNextKey(out, "walkIndex");
     out->append(std::to_string(walked->second));
+    AppendNameFacts(out, dict, walk.parent[walked->second], budget, &cut);
   }
   AppendNextKey(out, "widgets");
   out->push_back('[');
@@ -767,14 +860,43 @@ bool AppendField(std::string* out,
   return cut;
 }
 
-// A field dictionary that is not a field's own: its name, its place in the
-// walk, its /Kids, /MK, /P and scripts. Returns whether it cut anything.
+// The index of each page dictionary, read the first time one is asked for.
+class Pages {
+ public:
+  explicit Pages(CPDF_Document* doc) : doc_(doc) {}
+  // -1 when |page| is not a page of the document.
+  int IndexOf(const CPDF_Dictionary* page) {
+    if (!loaded_) {
+      loaded_ = true;
+      const int count = doc_->GetPageCount();
+      for (int i = 0; i < count; ++i) {
+        RetainPtr<const CPDF_Dictionary> dict = doc_->GetPageDictionary(i);
+        if (dict) {
+          index_.try_emplace(dict.Get(), i);
+        }
+      }
+    }
+    const auto it = index_.find(page);
+    return it != index_.end() ? it->second : -1;
+  }
+
+ private:
+  CPDF_Document* const doc_;
+  bool loaded_ = false;
+  std::map<const CPDF_Dictionary*, int> index_;
+};
+
+// A dictionary of the walk that has a /Kids array: its name and own /T, its
+// place in the walk and in "fields", its /Subtype, /Kids, /MK, /P and
+// scripts. Returns whether it cut anything.
 bool AppendGroup(std::string* out,
-                 const CPDF_Dictionary* dict,
-                 int walk_index,
-                 const std::map<const CPDF_Dictionary*, int>& pages,
+                 const FieldWalk& walk,
+                 size_t walk_index,
+                 int field_index,
+                 Pages* pages,
                  ScriptReader* reader) {
   Budget* budget = reader->budget();
+  const CPDF_Dictionary* dict = walk.order[walk_index].Get();
   bool cut = false;
   out->push_back('{');
   AppendKey(out, "name");
@@ -783,40 +905,23 @@ bool AppendGroup(std::string* out,
   AppendObjectNumber(out, dict);
   AppendNextKey(out, "walkIndex");
   out->append(std::to_string(walk_index));
-  AppendNextKey(out, "kids");
-  out->push_back('[');
-  RetainPtr<const CPDF_Object> kids_object = EntryFor(dict, "Kids");
-  const CPDF_Array* kids = kids_object ? kids_object->AsArray() : nullptr;
-  for (size_t i = 0; kids && i < kids->size(); ++i) {
-    // An entry writes at most about 85 bytes.
-    if (i == kMaxFields || !budget->Take(3 * kItemCost)) {
-      cut = true;
-      break;
-    }
-    if (i > 0) {
-      out->push_back(',');
-    }
-    RetainPtr<const CPDF_Object> entry = kids->GetObjectAt(i);
-    out->append("{\"ref\":");
-    AppendRef(out, entry.Get());
-    RetainPtr<const CPDF_Object> target = entry ? entry->GetDirect() : nullptr;
-    const CPDF_Dictionary* kid = target ? target->AsDictionary() : nullptr;
-    AppendNextKey(out, "dictionary");
-    out->append(Boolean(kid));
-    if (kid) {
-      AppendNextKey(out, "hasT");
-      out->append(Boolean(kid->KeyExist("T")));
-      AppendNextKey(out, "hasKids");
-      out->append(Boolean(kid->KeyExist("Kids")));
-    }
-    out->push_back('}');
+  if (field_index >= 0) {
+    AppendNextKey(out, "field");
+    out->append(std::to_string(field_index));
   }
-  out->push_back(']');
+  AppendNameFacts(out, dict, walk.parent[walk_index], budget, &cut);
+  RetainPtr<const CPDF_Object> subtype = EntryFor(dict, "Subtype");
+  if (subtype && subtype->IsName()) {
+    AppendNextKey(out, "subtype");
+    AppendFileName(out, subtype->GetString(), budget, &cut);
+  }
+  AppendNextKey(out, "kids");
+  RetainPtr<const CPDF_Object> kids = EntryFor(dict, "Kids");
+  AppendKids(out, kids ? kids->AsArray() : nullptr, budget, &cut);
   AppendMk(out, dict, budget, &cut);
   if (RetainPtr<const CPDF_Object> p = EntryFor(dict, "P")) {
-    const auto page = pages.find(p->AsDictionary());
     AppendNextKey(out, "page");
-    out->append(std::to_string(page != pages.end() ? page->second : -1));
+    out->append(std::to_string(pages->IndexOf(p->AsDictionary())));
   }
   AppendWidgetScripts(out, dict, reader, &cut);
   cut = cut || budget->spent();
@@ -984,9 +1089,10 @@ char* INK_Form(FPDF_DOCUMENT doc) {
   out.push_back('[');
   std::map<WideString, int> index_of;
   std::string groups = "[";
+  RetainPtr<const CPDF_Array> root_fields =
+      acro_form ? acro_form->GetArrayFor("Fields") : nullptr;
   if (!too_large) {
-    const FieldWalk walk = WalkFields(
-        acro_form ? acro_form->GetArrayFor("Fields").Get() : nullptr);
+    const FieldWalk walk = WalkFields(root_fields.Get());
     truncated = truncated || walk.cut;
     // As EPDFForm_LoadModel: the declared tree, then the page sweep.
     CPDF_InteractiveForm form(pdf);
@@ -995,6 +1101,8 @@ char* INK_Form(FPDF_DOCUMENT doc) {
     epdf::SweepPageWidgets(pdf, &form);
     const size_t count = epdf::CountFormFields(form);
     int written = 0;
+    // Each written field's dictionary and its index in "fields".
+    std::map<const CPDF_Dictionary*, int> field_index;
     for (size_t i = 0; i < count; ++i) {
       CPDF_FormField* field = form.GetField(i, WideString());
       if (!field) {
@@ -1011,7 +1119,7 @@ char* INK_Form(FPDF_DOCUMENT doc) {
       }
       const CPDF_Dictionary* dict = field->GetFieldDict().Get();
       // A cut field cuts the report.
-      if (AppendField(&out, field, !declared.count(dict), places, walk.index,
+      if (AppendField(&out, field, !declared.count(dict), places, walk,
                       &reader)) {
         truncated = true;
       }
@@ -1022,6 +1130,7 @@ char* INK_Form(FPDF_DOCUMENT doc) {
         break;
       }
       index_of.try_emplace(field->GetFullName(), written);
+      field_index.try_emplace(dict, written);
       ++written;
       // A field the budget cut ends the list.
       if (budget.spent()) {
@@ -1030,29 +1139,16 @@ char* INK_Form(FPDF_DOCUMENT doc) {
       }
     }
 
-    // Every dictionary of the walk with a /Kids array that is no field's own
-    // dictionary, in walk order.
-    std::set<const CPDF_Dictionary*> field_dicts;
-    for (size_t i = 0; i < count; ++i) {
-      if (CPDF_FormField* field = form.GetField(i, WideString())) {
-        field_dicts.insert(field->GetFieldDict().Get());
-      }
-    }
-    std::map<const CPDF_Dictionary*, int> pages;
-    const int page_count = pdf->GetPageCount();
-    for (int i = 0; i < page_count; ++i) {
-      RetainPtr<const CPDF_Dictionary> page = pdf->GetPageDictionary(i);
-      if (page) {
-        pages.try_emplace(page.Get(), i);
-      }
-    }
+    // Every dictionary of the walk with a /Kids array, in walk order.
+    Pages pages(pdf);
     bool first_group = true;
     for (size_t i = 0; i < walk.order.size() && !budget.spent(); ++i) {
       const CPDF_Dictionary* dict = walk.order[i].Get();
       RetainPtr<const CPDF_Object> kids = EntryFor(dict, "Kids");
-      if (!kids || !kids->IsArray() || field_dicts.count(dict)) {
+      if (!kids || !kids->IsArray()) {
         continue;
       }
+      const auto field = field_index.find(dict);
       if (!budget.Take(kEntryCost)) {
         truncated = true;
         break;
@@ -1061,7 +1157,9 @@ char* INK_Form(FPDF_DOCUMENT doc) {
       if (!first_group) {
         groups.push_back(',');
       }
-      if (AppendGroup(&groups, dict, static_cast<int>(i), pages, &reader)) {
+      if (AppendGroup(&groups, walk, i,
+                      field != field_index.end() ? field->second : -1, &pages,
+                      &reader)) {
         truncated = true;
       }
       // The budget charges at least what is written; this is a backstop.
@@ -1077,6 +1175,20 @@ char* INK_Form(FPDF_DOCUMENT doc) {
   groups.push_back(']');
   AppendNextKey(&out, "groups");
   out.append(groups);
+  // /Fields itself, so a reader can walk from the root; [] for a refused
+  // form, as "groups".
+  AppendNextKey(&out, "fieldsRoot");
+  {
+    const size_t mark = out.size();
+    AppendKids(&out, too_large ? nullptr : root_fields.Get(), &budget,
+               &truncated);
+    // The budget charges at least what is written; this is a backstop.
+    if (out.size() > kMaxReportBytes / 2) {
+      out.resize(mark);
+      out.append("[]");
+      truncated = true;
+    }
+  }
   truncated = truncated || reader.exhausted();
 
   // Each /CO entry names the field whose full name its dictionary has, as

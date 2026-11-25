@@ -76,12 +76,15 @@ extern "C" {
 //     "truncated": true } ],
 //   "groups": [ {
 //     "name": "group.sub", "objectNumber": 8, "generation": 0,
-//     "walkIndex": 1,
+//     "walkIndex": 1, "field": 4, "t": Text | null,
+//     "parentIsWalkParent": false, "subtype": "Widget",
 //     "kids": [ { "ref": [10, 0] | null, "dictionary": true, "hasT": true,
 //                 "hasKids": false } ],
 //     "borderColor": [...], "backgroundColor": [...], "rotation": 90,
 //     "caption": Text, "page": 0, "scripts": Scripts,
 //     "truncated": true } ],
+//   "fieldsRoot": [ { "ref": [7, 0] | null, "dictionary": true, "hasT": true,
+//                     "hasKids": true } ],
 //   "calculationOrder": [3, -1], "calculationOrderRefs": [[11, 0], null],
 //   "fieldTreeDepth": 2, "fieldTreeRevisits": false, "tooLarge": false,
 //   "truncated": false }
@@ -117,7 +120,8 @@ extern "C" {
 // null, at most 1,000,000 entries; null when /Opt is not an array, absent
 // when no dictionary has it or it is null. "walkIndex" is the place of the
 // field's dictionary in the walk "groups" describes, absent when the walk did
-// not reach it (a field the page sweep recovered, or one past a cap).
+// not reach it (a field the page sweep recovered, or one past a cap). With
+// it come "t" and "parentIsWalkParent", as for a group.
 // "options" is /Opt of a choice field as PDFium reads it. "maxLength" is
 // /MaxLen of a text field, present when it is not 0. "topIndex" is a list
 // box's /TI. "tooltip" is the field dictionary's own /TU.
@@ -149,9 +153,12 @@ extern "C" {
 //
 // A widget of a list or combo box whose dictionary is not the field's also
 // gives "selectedIndices": the widget's own /I (not inherited), the same
-// shape, absent when it has none. PDF.js reads /I from the widget alone.
+// shape, absent when it has none. PDF.js reads /I from the widget alone. A
+// checkbox's or a radio's widget whose dictionary is not the field's gives
+// "opt": its own /Opt, the same shape as the field's, absent when it has
+// none. PDF.js looks /Opt up from the widget, then along /Parent.
 //
-// "groups": the field dictionaries that are no field's own. A walk visits
+// "groups": the dictionaries of the field tree that have /Kids. A walk visits
 // /Fields depth first, each array in the file's order: a dictionary, then its
 // /Kids. Each dictionary is visited the first time it is reached, each /Kids
 // array is read once, the walk goes 1,000 levels deep and visits at most
@@ -159,16 +166,31 @@ extern "C" {
 // where it reaches a dictionary already visited. Every visited dictionary,
 // widgets included, takes the next "walkIndex" from 0; the indices of the
 // groups and of the fields' dictionaries, sorted, give the order the walk
-// visits them, with gaps where it visited widgets or dictionaries listed in
-// neither. PDF.js follows only references in /Fields and /Kids; a kid's "ref"
-// null shows a direct one, which this walk visits too. A group is every
-// visited dictionary with a /Kids array that is not the dictionary of a field
-// in "fields": a parent of fields, a dictionary PDFium left out (no name, or
-// deeper than its 33 levels), or a second dictionary with a field's full
-// name, which PDFium merges into the first. "name" is its full name as
-// PDFium builds it (the /T of it and its /Parent chain). "kids" is its /Kids
-// in the file's order, at most 50,000: "ref" the entry as a reference (null
-// when it is written direct), "dictionary" whether it resolves to a
+// visits them, with gaps where it visited widgets. PDF.js follows only
+// references in /Fields and /Kids; a "ref" of null shows a direct entry, which
+// this walk visits too. "fieldsRoot" is /AcroForm /Fields in the file's order,
+// each entry as a kid below, at most 50,000, so the walk can be done again
+// from the root; it is [] without /Fields and when "tooLarge".
+//
+// A group is every visited dictionary with a /Kids array, a field's own
+// dictionary included (PDF.js gives each such dictionary an entry of its own):
+// a parent of fields, a radio's or a field's dictionary above its widgets, a
+// dictionary PDFium left out (no name, or deeper than its 33 levels), or a
+// second dictionary with a field's full name, which PDFium merges into the
+// first. "objectNumber" and "generation" are absent for a direct dictionary.
+// "field" is the index in "fields" of the field whose own dictionary it is,
+// absent for any other. "name" is its full name as PDFium builds it (the /T of
+// it and its /Parent chain, an empty /T left out). PDF.js builds a name from
+// the walk instead: the names above it in the walk, then its own /T, and
+// /Parent only when it has no /T; "t" and "parentIsWalkParent" give what that
+// needs. "t" is the dictionary's own /T: Text when it is a string ("" for an
+// empty one), null when it is something else, absent when it has none.
+// "parentIsWalkParent" is present, and false, only when its /Parent is not
+// the dictionary whose /Kids the walk reached it through (for an entry of
+// /Fields, when it has a /Parent at all). "subtype" is its /Subtype when that
+// is a name (PDF.js skips a /Link and what lies under it). "kids" is its
+// /Kids in the file's order, at most 50,000: "ref" the entry as a reference
+// (null when it is written direct), "dictionary" whether it resolves to a
 // dictionary, and for one that does whether it has the keys /T and /Kids.
 // PDFium treats a dictionary's kids as widgets when its first kid has neither,
 // PDF.js names a kid without /T by its parent, and the consumer can apply
@@ -178,8 +200,9 @@ extern "C" {
 // "scripts" is read as a widget's: /AA merged along /Parent, each key from the
 // nearest dictionary (the group first) whose action holds JavaScript, and "A"
 // the group's own /A only; its kids' scripts are not merged into it. Groups
-// are charged to the fields' half of the report; a group the budget cuts says
-// "truncated" and ends the list. When "tooLarge", "groups" is [].
+// and "fieldsRoot" are charged to the fields' half of the report. A group cut
+// by a cap (its /Kids past 50,000) or by the budget says "truncated"; once the
+// budget is spent the list ends there. When "tooLarge", "groups" is [].
 //
 // "calculationOrder" has an entry for each entry of /AcroForm /CO: the index
 // in "fields" of the field whose full name its dictionary has (as

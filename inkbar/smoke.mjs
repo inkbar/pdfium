@@ -4524,7 +4524,7 @@ const inked = (bytes) => bytes.some((b) => b !== 0)
     assert.equal(annots[5].truncated, true)
     assert.equal(annots[4].truncated, undefined)
     const form = takeJson(m._INK_Form(doc))
-    assert.deepEqual(form, { kind: 'none', needAppearances: false, fields: [], groups: [], calculationOrder: [], calculationOrderRefs: [], fieldTreeDepth: 0, fieldTreeRevisits: false, tooLarge: false, truncated: false })
+    assert.deepEqual(form, { kind: 'none', needAppearances: false, fields: [], groups: [], fieldsRoot: [], calculationOrder: [], calculationOrderRefs: [], fieldTreeDepth: 0, fieldTreeRevisits: false, tooLarge: false, truncated: false })
     assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'a report changed what a save writes')
   })
 }
@@ -5338,28 +5338,39 @@ function scriptReports(pdf, within, what) {
   // Field dictionaries that are no field's own: a three-level tree (group, sub,
   // terminals a and b, listed b first) with a script on sub, /MK and /P on
   // group and /CO naming group; a radio field's /Opt; /I on a parent and on a
-  // widget kid; a tree whose /Kids loop back to its root.
+  // widget kid; a tree whose /Kids loop back to its root. Every dictionary
+  // with /Kids is described, a field's own included: the radio parent r (with
+  // /MK, /P and a script of its own, and a widget with its own /Opt), list2,
+  // and mix, whose first kid is a bare widget and whose second has /T. A
+  // top-level field whose /Parent names another, an empty /T, a /Link
+  // subtype and /Fields itself.
   const widget = (rest) => `<< /Type /Annot /Subtype /Widget /Rect [10 10 60 30] ${rest} >>`
   const pdf = onePagePdf(
     '',
-    { catalog: '/AcroForm 6 0 R', page: '/Annots [9 0 R 10 0 R 12 0 R 13 0 R 15 0 R 17 0 R 18 0 R 21 0 R]' },
+    { catalog: '/AcroForm 6 0 R', page: '/Annots [9 0 R 10 0 R 12 0 R 13 0 R 15 0 R 17 0 R 18 0 R 21 0 R 23 0 R 24 0 R 25 0 R 27 0 R]' },
     [
-      '<< /Fields [7 0 R 11 0 R 14 0 R 16 0 R 19 0 R] /CO [7 0 R 9 0 R] >>',
+      '<< /Fields [7 0 R 11 0 R 14 0 R 16 0 R 19 0 R 22 0 R 25 0 R 26 0 R] /CO [7 0 R 9 0 R] >>',
       '<< /T (group) /Kids [8 0 R] /MK << /BC [1 0 0] /BG [0 1 0] /R 90 >> /P 3 0 R >>',
       '<< /T (sub) /Parent 7 0 R /Kids [10 0 R 9 0 R] /AA << /K << /S /JavaScript /JS (subK) >> >> >>',
       widget('/T (a) /FT /Tx /Parent 8 0 R'),
       widget('/T (b) /FT /Tx /Parent 8 0 R'),
-      '<< /T (r) /FT /Btn /Ff 49152 /Opt [(Alpha) <FEFF00E9> 5] /Kids [12 0 R 13 0 R] >>',
-      widget('/Parent 11 0 R'),
+      '<< /T (r) /FT /Btn /Ff 49152 /Opt [(Alpha) <FEFF00E9> /Nm 5] /Kids [12 0 R 13 0 R] /MK << /BC [0 0 1] >> /P 3 0 R /AA << /F << /S /JavaScript /JS (rF) >> >> >>',
+      widget('/Parent 11 0 R /Opt [(W)]'),
       widget('/Parent 11 0 R'),
       '<< /T (lp) /I [1] /Kids [15 0 R] >>',
       widget('/T (list) /FT /Ch /Opt [(x) (y)] /Parent 14 0 R'),
       '<< /T (list2) /FT /Ch /Opt [(x) (y)] /I [0] /Kids [17 0 R 18 0 R] >>',
       widget('/Parent 16 0 R /I [1]'),
       widget('/Parent 16 0 R'),
-      '<< /T (loop) /Kids [20 0 R] >>',
+      '<< /T (loop) /Subtype /Link /Kids [20 0 R] >>',
       '<< /T (inner) /Parent 19 0 R /Kids [19 0 R 21 0 R] >>',
       widget('/T (w) /FT /Tx /Parent 20 0 R'),
+      '<< /T (mix) /FT /Tx /Kids [23 0 R 24 0 R] >>',
+      widget('/Parent 22 0 R'),
+      widget('/T (x) /Parent 22 0 R'),
+      widget('/T (orphan) /FT /Tx /Parent 7 0 R'),
+      '<< /T () /Kids [27 0 R] >>',
+      widget('/T (e) /FT /Tx /Parent 26 0 R'),
     ],
   )
   withPdf(pdf, (doc) => {
@@ -5377,15 +5388,22 @@ function scriptReports(pdf, within, what) {
     const group = (name) => form.groups?.find((g) => g.name === name)
     const kid = (n, hasKids = false) => ({ ref: [n, 0], dictionary: true, hasT: true, hasKids })
 
-    check('the groups, in walk order', () =>
+    const bare = (n) => ({ ref: [n, 0], dictionary: true, hasT: false, hasKids: false })
+    const indexOf = (name) => form.fields.findIndex((f) => f.name === name)
+
+    check('the groups, in walk order, fields\' own included', () =>
       assert.deepEqual(
-        form.groups.map((g) => [g.name, g.objectNumber, g.walkIndex]),
+        form.groups.map((g) => [g.name, g.objectNumber, g.walkIndex, g.field]),
         [
-          ['group', 7, 0],
-          ['group.sub', 8, 1],
-          ['lp', 14, 7],
-          ['loop', 19, 12],
-          ['loop.inner', 20, 13],
+          ['group', 7, 0, undefined],
+          ['group.sub', 8, 1, undefined],
+          ['r', 11, 4, indexOf('r')],
+          ['lp', 14, 7, undefined],
+          ['list2', 16, 9, indexOf('list2')],
+          ['loop', 19, 12, undefined],
+          ['loop.inner', 20, 13, undefined],
+          ['mix', 22, 15, indexOf('mix')],
+          ['', 26, 19, undefined],
         ],
       ),
     )
@@ -5395,6 +5413,7 @@ function scriptReports(pdf, within, what) {
         objectNumber: 7,
         generation: 0,
         walkIndex: 0,
+        t: 'group',
         kids: [kid(8, true)],
         borderColor: [1, 0, 0],
         backgroundColor: [0, 1, 0],
@@ -5406,15 +5425,30 @@ function scriptReports(pdf, within, what) {
     check('sub: kids in file order and its script', () =>
       assert.deepEqual([group('group.sub').kids, group('group.sub').scripts], [[kid(10), kid(9)], { K: ['subK'] }]),
     )
+    check('the radio parent: kids, /MK, page and its own script', () => {
+      const r = group('r')
+      assert.deepEqual([r.kids, r.borderColor, r.page, r.scripts], [[bare(12), bare(13)], [0, 0, 1], 0, { F: ['rF'] }])
+    })
+    check('list2 with its widget kids', () => assert.deepEqual(group('list2').kids, [bare(17), bare(18)]))
+    check('a later kid with /T under a bare first widget', () => assert.deepEqual(group('mix').kids, [bare(23), { ...bare(24), hasT: true }]))
     check('the walk order rebuilt', () => {
-      const entries = [...form.groups.map((g) => [g.walkIndex, g.name]), ...form.fields.filter((f) => 'walkIndex' in f).map((f) => [f.walkIndex, f.name])]
+      const byIndex = new Map([...form.groups, ...form.fields.filter((f) => 'walkIndex' in f)].map((e) => [e.walkIndex, e.objectNumber]))
       assert.deepEqual(
-        entries.sort((x, y) => x[0] - y[0]).map((e) => e[1]),
-        ['group', 'group.sub', 'group.sub.b', 'group.sub.a', 'r', 'lp', 'lp.list', 'list2', 'loop', 'loop.inner', 'loop.inner.w'],
+        [...byIndex].sort((x, y) => x[0] - y[0]).map((e) => e[1]),
+        [7, 8, 10, 9, 11, 14, 15, 16, 19, 20, 21, 22, 25, 26, 27],
       )
     })
+    check('/Fields itself', () =>
+      assert.deepEqual(form.fieldsRoot.map((e) => [e.ref[0], e.dictionary, e.hasT]), [7, 11, 14, 16, 19, 22, 25, 26].map((n) => [n, true, true])),
+    )
+    check('own /T and /Parent against the walk', () => {
+      const orphan = form.fields.find((f) => f.objectNumber === 25)
+      assert.deepEqual([orphan.t, orphan.parentIsWalkParent, group('group.sub').t, 'parentIsWalkParent' in group('group.sub'), form.groups.find((g) => g.objectNumber === 26).t], ['orphan', false, 'sub', false, ''])
+    })
+    check('a /Link subtype', () => assert.equal(group('loop').subtype, 'Link'))
+    check('a widget\'s own /Opt', () => assert.deepEqual([field('r').widgets[0].opt, 'opt' in field('r').widgets[1]], [['W'], false]))
     check('/CO names the group by reference', () => assert.deepEqual([form.calculationOrder[0], form.calculationOrderRefs[0]], [-1, [group('group').objectNumber, 0]]))
-    check('a radio field\'s /Opt', () => assert.deepEqual(field('r').opt, ['Alpha', 'é', null]))
+    check('a radio field\'s /Opt', () => assert.deepEqual(field('r').opt, ['Alpha', 'é', { name: 'Nm' }, null]))
     check('/I on the parent', () => assert.deepEqual([field('lp.list').selectedIndices, field('lp.list').selectedIndicesOwn], [[1], false]))
     check('/I on the field and on a widget kid', () => {
       const list2 = field('list2')
