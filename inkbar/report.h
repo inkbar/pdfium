@@ -1,0 +1,302 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Edward Coleridge Smith
+//
+// What annots.cc and form.cc share to write a report of what the file says:
+// its strings as text or bytes, its numbers, its names, a report's caps and
+// the JavaScript an action chain holds.
+
+#ifndef INKBAR_REPORT_H_
+#define INKBAR_REPORT_H_
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include <map>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "core/fxcrt/bytestring.h"
+#include "core/fxcrt/data_vector.h"
+#include "core/fxcrt/retain_ptr.h"
+#include "core/fxcrt/widestring.h"
+
+class CPDF_Array;
+class CPDF_Dictionary;
+class CPDF_Number;
+class CPDF_Object;
+class CPDF_Stream;
+
+namespace inkbar::report {
+
+// The most bytes one report writes. An entry that would pass it is left out,
+// and the report stops there and says "truncated".
+constexpr size_t kMaxReportBytes = 16 * 1024 * 1024;
+// The most bytes a text string of the file writes inside its JSON string,
+// escapes included; hex bytes take half as many of the file's bytes.
+constexpr size_t kMaxTextBytes = 1024 * 1024;
+// The most bytes one script writes inside its JSON string.
+constexpr size_t kMaxScriptBytes = 4 * 1024 * 1024;
+// The most numbers read from one array of numbers (/InkList as a whole,
+// /Vertices, /QuadPoints).
+constexpr size_t kMaxNumbers = 1000000;
+// The deepest a walk goes: a field tree, a /Parent chain, a structure tree.
+constexpr int kMaxDepth = 1000;
+// The most actions read from one chain of /Next.
+constexpr size_t kMaxChain = 1000;
+
+// The cost charged for the keys and punctuation of one annotation, field or
+// widget entry, and for one entry of an array; a number is charged 16 bytes,
+// text and names what they write. Charges are at least what is written.
+constexpr size_t kEntryCost = 1024;
+constexpr size_t kItemCost = 32;
+
+// The bytes a report may still write. The writers below take what they write
+// from it before they write it; once too few are left they write no more, set
+// their |*cut| and leave the budget spent, so every later writer stops too.
+class Budget {
+ public:
+  explicit Budget(size_t bytes) : left_(bytes) {}
+  // Takes |bytes| when that many are left. Otherwise spends the budget and
+  // returns false.
+  bool Take(size_t bytes) {
+    if (spent_ || bytes > left_) {
+      Spend();
+      return false;
+    }
+    left_ -= bytes;
+    return true;
+  }
+  void Spend() {
+    left_ = 0;
+    spent_ = true;
+  }
+  size_t left() const { return left_; }
+  bool spent() const { return spent_; }
+
+ private:
+  size_t left_;
+  bool spent_ = false;
+};
+
+const char* Boolean(bool value);
+
+// "key":
+void AppendKey(std::string* out, const char* key);
+// ,"key":
+void AppendNextKey(std::string* out, const char* key);
+
+// A direct object, with a null object taken as absent.
+RetainPtr<const CPDF_Object> EntryFor(const CPDF_Dictionary* dict,
+                                      const char* key);
+
+// A text string's bytes as a JSON string of the text, or as
+// { "bytes": "<hex>" } when they are neither UTF-16 with a byte order mark
+// (an odd length or an unpaired surrogate is not), UTF-8 with one, nor
+// PDFDocEncoding (0x7F, 0x9F and 0xAD are undefined there). The text is
+// PDFium's decoding, with language escapes taken out; it is cut after the
+// last character that ends within |limit| written bytes, and hex after
+// |limit| / 2 bytes, and within what |budget| has left. Sets |*cut| when it
+// was cut and leaves it otherwise.
+void AppendFileText(std::string* out,
+                    const ByteString& bytes,
+                    size_t limit,
+                    Budget* budget,
+                    bool* cut);
+// Text PDFium decoded, cut the same way.
+void AppendWideText(std::string* out,
+                    const WideString& text,
+                    size_t limit,
+                    Budget* budget,
+                    bool* cut);
+
+// A name's bytes as json::AppendName writes them, or null when |budget| has
+// too little left.
+void AppendFileName(std::string* out,
+                    const ByteString& name,
+                    Budget* budget,
+                    bool* cut);
+
+// [n, g] of a reference: its object number and the generation of the object
+// the file holds under it (PDFium keeps none in a reference), 0 when none.
+void AppendRef(std::string* out, const CPDF_Object* object);
+
+// A number of the file as AppendNumber writes it, null for none.
+//
+// An integer is written exactly as PDFium holds it: a token without a point
+// is kept as a 32-bit integer (one out of that range PDFium reads as 0), and
+// an unsigned one past INT_MAX is written unsigned. A real is kept by PDFium
+// only as a 32-bit float, the token being dropped as it parses, so it is
+// written as the shortest decimal that reads back as that float
+// (json::AppendShortestNumber, std::to_chars): 0.4 is written 0.4, not
+// 0.400000006, and 600.0 is written 600. A real that is not finite is null.
+void AppendNumber(std::string* out, const CPDF_Number* number);
+
+// An array's entries as AppendNumber writes them, each null when it is not a
+// finite number, at most |max| of them and as many as |budget| allows. Sets
+// |*cut| when there were more.
+void AppendNumbers(std::string* out,
+                   const CPDF_Array* array,
+                   size_t max,
+                   Budget* budget,
+                   bool* cut);
+
+// An array's names, each null when it is not a name, as many as |budget|
+// allows.
+void AppendNames(std::string* out,
+                 const CPDF_Array* array,
+                 Budget* budget,
+                 bool* cut);
+
+// The facts an annotation and a widget share, each written as ,"key":value.
+//
+// "rect": /Rect's four entries as written (corners not put in order), each a
+// number or null; null when /Rect is not an array. "rectOk": four finite
+// numbers. An array of more than four keeps its first four, and is not ok.
+void AppendRect(std::string* out, const CPDF_Dictionary* dict);
+// "hasAppearance": /AP /N is a stream, or a dictionary whose entry under /AS
+// is one. "appearance": "stream", "states" (a dictionary) or null. "states":
+// the names of /N's entries when /N is a dictionary, in the unsigned byte
+// order of the names, not the file's: PDFium's parser stores a dictionary as
+// a map sorted by key and keeps no trace of the order the keys were written
+// in, and a key written twice is listed once (the parser keeps the last).
+// "as": /AS when it is a name.
+void AppendAppearance(std::string* out,
+                      const CPDF_Dictionary* dict,
+                      Budget* budget,
+                      bool* cut);
+// "borderStyle": { "width": /W or null, "style": /S or null } when /BS is a
+// dictionary, with "dash": /D's entries as numbers (null for one that is not
+// a number), or null when /D is not an array, present when /BS has /D.
+// "border": /Border's first three entries when it is an array, and
+// "borderDash" its fourth as numbers (null when that is not an array),
+// present when /Border has a fourth entry. The dash arrays are written as the
+// file has them, an empty, negative or all-zero one included, at most
+// kMaxNumbers entries each and as many as |budget| allows; |*cut| is set when
+// one was cut.
+void AppendBorder(std::string* out,
+                  const CPDF_Dictionary* dict,
+                  Budget* budget,
+                  bool* cut);
+
+// The most units of work one report spends reading JavaScript: an object of
+// an action chain, an entry of a /Next array, a key of an /AA dictionary, a
+// level of a /Parent chain or a memoised result looked up each cost one. A
+// few million reads take well under a second.
+constexpr size_t kMaxScriptWork = 4000000;
+// The most decoded JavaScript one report holds, in the bytes it takes in
+// memory (4 a character). Each /JS is decoded once and kept for the report,
+// so this, not the report's 16 MB, bounds the decoding: past it nothing more
+// is decoded and the sources are cut.
+constexpr size_t kMaxDecodedBytes = 16 * 1024 * 1024;
+// The most bytes decoded from one /JS stream, all of which are turned into
+// text: enough for kMaxScriptBytes of text in any encoding (4 bytes a
+// character at most). No more of a stream is ever held decoded:
+//  - a stream with no filter, with a /Filter PDFium cannot use, or whose
+//    first filter PDFium takes for an image's (any name it does not decode,
+//    BrotliDecode among them in this build) gives its first stored bytes, as
+//    PDFium reads it;
+//  - a stream whose one filter is FlateDecode, with no /DecodeParms or with
+//    one PDFium reads as no predictor, is inflated here with zlib, which
+//    stops at the cap;
+//  - any other (a chain of filters, a predictor, another filter) is decoded
+//    by PDFium, whose stream reader runs the filters to the end with no cap,
+//    and only when no stage of it can pass the cap: its stored size times
+//    the most its filters can grow it. A larger one is not decoded, and its
+//    source is empty and cut.
+// An encrypted file's streams are read the same way: PDFium decrypts a
+// stream when it parses the object, so its stored bytes are already plain.
+constexpr size_t kMaxScriptStreamBytes = 4 * kMaxScriptBytes + 3;
+// The most bytes one report reads from /JS streams and decodes from them,
+// whatever text they leave. A stream read as stored is charged the bytes
+// taken. A stream inflated here is charged its stored bytes and the bytes
+// inflated. A stream PDFium decodes is charged its stored bytes and, before
+// it is decoded, the most every stage of its filters could produce (a stage
+// can do that work and leave nothing), and is not decoded when that is more
+// than is left. A stream is cut to what is left, and once it is spent no
+// stream is read. It is four times the most bytes that can become text a
+// report keeps (kMaxDecodedBytes is 4 M characters, of 4 bytes at most), and
+// decoding all of it takes a fraction of a second.
+constexpr size_t kMaxDecodeBytes = 64 * 1024 * 1024;
+
+// Reads the JavaScript of action chains and /AA dictionaries for one report.
+// Each chain is read once, memoised by its first action, each /JS string or
+// stream decoded once, and each /AA dictionary's keys read once, so an object
+// the file shares is read once a report however often it is reached. All of
+// it is charged to a work allowance (kMaxScriptWork); once that is spent
+// nothing more is read and every call sets its |*cut|. Decoding /JS streams
+// has an allowance of its own (kMaxDecodeBytes).
+class ScriptReader {
+ public:
+  explicit ScriptReader(Budget* budget);
+  ~ScriptReader();
+
+  // The sources of the JavaScript actions in the chain |action| starts, in
+  // the order /Next gives them, depth first, each object once and at most
+  // kMaxChain objects (actions, /Next arrays and any other entry they hold
+  // count alike). Each source is cut as
+  // CutText cuts it at kMaxScriptBytes; no source is decoded once the budget
+  // is spent. Sets |*cut| when one was cut or the chain was longer.
+  const std::vector<WideString>& Sources(const CPDF_Object* action, bool* cut);
+
+  // The keys of an /AA dictionary whose chains hold JavaScript, in key order,
+  // each with its chain.
+  using Keyed = std::vector<std::pair<ByteString, RetainPtr<const CPDF_Object>>>;
+  const Keyed& KeysWithScripts(const CPDF_Dictionary* aa, bool* cut);
+
+  // Spends |units| of the allowance; false once it is spent.
+  bool Work(size_t units);
+  // Whether the allowance ran out: something was left unread.
+  bool exhausted() const { return exhausted_; }
+  Budget* budget() const { return budget_; }
+
+ private:
+  struct Chain {
+    std::vector<WideString> sources;
+    bool cut = false;
+  };
+  const WideString& Decode(const CPDF_Dictionary* action, bool* cut);
+  // The decoded bytes of a /JS stream, at most kMaxScriptStreamBytes and what
+  // the decode allowance has left, charged to it. Sets |*cut| when the stream
+  // held more or was not decoded.
+  DataVector<uint8_t> StreamBytes(const CPDF_Stream* stream, bool* cut);
+  // The first stored bytes of |stream|, bounded and charged the same way.
+  DataVector<uint8_t> StoredBytes(const CPDF_Stream* stream, bool* cut);
+
+  Budget* const budget_;
+  size_t work_left_ = kMaxScriptWork;
+  bool exhausted_ = false;
+  std::map<const CPDF_Object*, Chain> chains_;
+  struct Decoded {
+    WideString text;
+    bool cut = false;
+  };
+  std::map<const CPDF_Object*, Decoded> decoded_;
+  // What decoded text the reader may still hold, in the bytes it takes.
+  size_t decoded_left_ = kMaxDecodedBytes;
+  // What the reader may still read and decode from /JS streams.
+  size_t decode_left_ = kMaxDecodeBytes;
+  std::map<const CPDF_Dictionary*, Keyed> keyed_;
+  const std::vector<WideString> none_;
+  const Keyed no_keys_;
+};
+
+// |sources| as a JSON array, [] when there are none: each source cut to what
+// |budget| has left and charged with its punctuation. Returns how many it
+// wrote.
+size_t AppendSources(std::string* out,
+                     const std::vector<WideString>& sources,
+                     Budget* budget,
+                     bool* cut);
+// AppendSources of |reader|'s sources for |action|.
+size_t AppendScripts(std::string* out,
+                     ScriptReader* reader,
+                     const CPDF_Object* action,
+                     bool* cut);
+
+// A malloc'd copy of |text| with its NUL, freed with INK_Json_Free.
+char* Copy(const std::string& text);
+
+}  // namespace inkbar::report
+
+#endif  // INKBAR_REPORT_H_

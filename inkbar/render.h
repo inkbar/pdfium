@@ -26,13 +26,15 @@ typedef struct InkRender InkRender;
 
 // Draws |page| into |bitmap| as FPDF_RenderPageBitmap_Start would (|start_x|
 // and |start_y| may be negative to draw a region), leaving out the
-// annotations whose object numbers are in |skip|. |flags|: FPDF_ANNOT and
-// EPDF_RENDER_WIDGETS as given. |skip| is read before Start returns, and a
-// listed annotation is hidden only while Start lists the page's annotations:
+// annotations whose object numbers are in |skip| and those at the places in
+// /Annots in |skip_at| (for a direct dictionary, which has no number).
+// |flags|: FPDF_ANNOT and EPDF_RENDER_WIDGETS as given. |skip| and |skip_at|
+// are read before Start returns, and a listed annotation is hidden only while
+// Start lists the page's annotations:
 // the document is as it was when Start returns, so a save during the render
 // writes what it would have written without it. Returns NULL on failure: a
-// NULL bitmap or page, a negative |skip_count|, NULL |skip| with a positive
-// count, a page another render holds, or a render PDFium cannot start.
+// NULL bitmap or page, a negative count, a NULL list with a positive count, a
+// page another render holds, or a render PDFium cannot start.
 InkRender* INK_Render_Start(FPDF_BITMAP bitmap,
                             FPDF_PAGE page,
                             int start_x,
@@ -42,7 +44,9 @@ InkRender* INK_Render_Start(FPDF_BITMAP bitmap,
                             int rotate,
                             int flags,
                             const unsigned int* skip,
-                            int skip_count);
+                            int skip_count,
+                            const int* skip_at,
+                            int skip_at_count);
 
 // Runs for at most |slice_ms| milliseconds (0 or less: until the first point
 // where the render can pause). Returns 1 when the page is finished, 0 when

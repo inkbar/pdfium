@@ -76,12 +76,15 @@ struct SavedFlags {
 };
 
 // Sets the Hidden flag on each annotation of |page| whose object number is in
-// |skip|, and returns what to put back, in the order it was changed.
+// |skip| or whose place in /Annots is in |skip_at|, and returns what to put
+// back, in the order it was changed.
 std::vector<SavedFlags> HideListed(FPDF_PAGE page,
                                    const unsigned int* skip,
-                                   int skip_count) {
+                                   int skip_count,
+                                   const int* skip_at,
+                                   int skip_at_count) {
   std::vector<SavedFlags> saved;
-  if (skip_count <= 0) {
+  if (skip_count <= 0 && skip_at_count <= 0) {
     return saved;
   }
   std::unordered_set<uint32_t> listed;
@@ -90,13 +93,23 @@ std::vector<SavedFlags> HideListed(FPDF_PAGE page,
       listed.insert(skip[i]);
     }
   }
+  std::unordered_set<size_t> places;
+  for (int i = 0; i < skip_at_count; ++i) {
+    if (skip_at[i] >= 0) {
+      places.insert(static_cast<size_t>(skip_at[i]));
+    }
+  }
   ScopedFPDFPageView view(page);
   const CPDF_Page* pdf_page = view.Get();
   RetainPtr<const CPDF_Array> annots =
       pdf_page ? pdf_page->GetAnnotsArray() : nullptr;
   for (size_t i = 0; annots && i < annots->size(); ++i) {
     RetainPtr<const CPDF_Dictionary> dict = annots->GetDictAt(i);
-    if (!dict || !listed.count(dict->GetObjNum())) {
+    // A place names a dictionary only, as the reports count them: a stream
+    // there is not an annotation.
+    const bool at_place =
+        places.count(i) && ToDictionary(annots->GetDirectObjectAt(i));
+    if (!dict || (!listed.count(dict->GetObjNum()) && !at_place)) {
       continue;
     }
     // The render lists annotations through the same const_cast.
@@ -152,8 +165,11 @@ InkRender* INK_Render_Start(FPDF_BITMAP bitmap,
                             int rotate,
                             int flags,
                             const unsigned int* skip,
-                            int skip_count) {
-  if (!bitmap || !page || skip_count < 0 || (skip_count > 0 && !skip)) {
+                            int skip_count,
+                            const int* skip_at,
+                            int skip_at_count) {
+  if (!bitmap || !page || skip_count < 0 || (skip_count > 0 && !skip) ||
+      skip_at_count < 0 || (skip_at_count > 0 && !skip_at)) {
     return nullptr;
   }
   {
@@ -171,7 +187,8 @@ InkRender* INK_Render_Start(FPDF_BITMAP bitmap,
   // Start does the least it can: the caller's slices do the drawing.
   r->deadline = std::chrono::steady_clock::now();
 
-  std::vector<SavedFlags> saved = HideListed(page, skip, skip_count);
+  std::vector<SavedFlags> saved =
+      HideListed(page, skip, skip_count, skip_at, skip_at_count);
   r->status = FPDF_RenderPageBitmap_Start(bitmap, page, start_x, start_y,
                                           size_x, size_y, rotate, flags,
                                           &r->pause);

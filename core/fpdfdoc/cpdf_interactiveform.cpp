@@ -885,50 +885,83 @@ RetainPtr<const CPDF_Dictionary> CPDF_InteractiveForm::ResolveCurrentDict(
   return current ? current : dict;
 }
 
+// Inkbar: whether |object| has not been walked from |level| or a shallower
+// one yet; records |level| when so.
+bool CPDF_InteractiveForm::WalkFrom(RetainPtr<const CPDF_Object> object,
+                                    int level) {
+  auto [it, inserted] = loaded_fields_.try_emplace(std::move(object), level);
+  if (inserted) {
+    return true;
+  }
+  if (level >= it->second) {
+    return false;
+  }
+  it->second = level;
+  return true;
+}
+
 // EmbedPDF(reads-dont-write): loading the form walks const dictionaries.
 void CPDF_InteractiveForm::LoadField(
     RetainPtr<const CPDF_Dictionary> field_dict,
     int nLevel) {
-  if (nLevel > kMaxRecursion) {
-    return;
-  }
-  if (!field_dict) {
-    return;
-  }
-  // EmbedPDF(forms-model): bind to the document's current view so layer
-  // promotions win over frozen base instances reached through base-held
-  // references.
-  field_dict = ResolveCurrentDict(std::move(field_dict));
-
-  uint32_t dwParentObjNum = field_dict->GetObjNum();
-  // EmbedPDF(reads-dont-write): read without the mutable getter.
-  RetainPtr<const CPDF_Array> kids =
-      field_dict->GetArrayFor(pdfium::form_fields::kKids);
-  if (!kids) {
-    AddTerminalField(std::move(field_dict));
-    return;
-  }
-
-  RetainPtr<const CPDF_Dictionary> pFirstKid = kids->GetDictAt(0);
-  if (!pFirstKid) {
-    return;
-  }
-
-  if (!pFirstKid->KeyExist(pdfium::form_fields::kT) &&
-      !pFirstKid->KeyExist(pdfium::form_fields::kKids)) {
-    AddTerminalField(std::move(field_dict));
-    return;
-  }
-  for (size_t i = 0; i < kids->size(); i++) {
-    // EmbedPDF(reads-dont-write): read without the mutable getter. Kids of a
-    // direct field (object number 0) load too; only the field itself is
-    // skipped.
-    RetainPtr<const CPDF_Dictionary> pChildDict = kids->GetDictAt(i);
-    if (pChildDict && pChildDict.Get() != field_dict.Get() &&
-        (dwParentObjNum == 0 || pChildDict->GetObjNum() != dwParentObjNum)) {
-      LoadField(std::move(pChildDict), nLevel + 1);
+  // Inkbar: the form walks each field dictionary and each /Kids array once
+  // from each level (|loaded_fields_| keeps the shallowest level each was
+  // walked from), so at most kMaxRecursion + 1 times in all. A /Kids loop
+  // whose nodes list each other more than once doubled the work at every
+  // level down to kMaxRecursion, and fields sharing one /Kids array walked it
+  // once each. Walking again from a shallower level reaches what a walk
+  // cut off at kMaxRecursion missed, as upstream does.
+  auto load = [this](auto& self,
+                              RetainPtr<const CPDF_Dictionary> field_dict,
+                              int nLevel) -> void {
+    if (nLevel > kMaxRecursion) {
+      return;
     }
-  }
+    if (!field_dict) {
+      return;
+    }
+    // EmbedPDF(forms-model): bind to the document's current view so layer
+    // promotions win over frozen base instances reached through base-held
+    // references.
+    field_dict = ResolveCurrentDict(std::move(field_dict));
+    if (!WalkFrom(field_dict, nLevel)) {
+      return;
+    }
+
+    uint32_t dwParentObjNum = field_dict->GetObjNum();
+    // EmbedPDF(reads-dont-write): read without the mutable getter.
+    RetainPtr<const CPDF_Array> kids =
+        field_dict->GetArrayFor(pdfium::form_fields::kKids);
+    if (!kids) {
+      AddTerminalField(std::move(field_dict));
+      return;
+    }
+
+    RetainPtr<const CPDF_Dictionary> pFirstKid = kids->GetDictAt(0);
+    if (!pFirstKid) {
+      return;
+    }
+
+    if (!pFirstKid->KeyExist(pdfium::form_fields::kT) &&
+        !pFirstKid->KeyExist(pdfium::form_fields::kKids)) {
+      AddTerminalField(std::move(field_dict));
+      return;
+    }
+    if (!WalkFrom(kids, nLevel)) {
+      return;
+    }
+    for (size_t i = 0; i < kids->size(); i++) {
+      // EmbedPDF(reads-dont-write): read without the mutable getter. Kids of
+      // a direct field (object number 0) load too; only the field itself is
+      // skipped.
+      RetainPtr<const CPDF_Dictionary> pChildDict = kids->GetDictAt(i);
+      if (pChildDict && pChildDict.Get() != field_dict.Get() &&
+          (dwParentObjNum == 0 || pChildDict->GetObjNum() != dwParentObjNum)) {
+        self(self, std::move(pChildDict), nLevel + 1);
+      }
+    }
+  };
+  load(load, std::move(field_dict), nLevel);
 }
 
 void CPDF_InteractiveForm::FixPageFields(CPDF_Page* page) {

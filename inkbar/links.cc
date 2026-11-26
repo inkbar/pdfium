@@ -246,51 +246,6 @@ void AppendFile(std::string* out, const CPDF_Dictionary* action) {
   out->append("null");
 }
 
-// The bytes inkbar::json writes for |c| inside a string: 2 for a quote or a
-// backslash, 6 for a control character or DEL (\u00XX), else its UTF-8. A
-// surrogate and a value past U+10FFFF become U+FFFD, which takes 3.
-size_t WrittenSize(uint32_t c) {
-  if (c == '"' || c == '\\') {
-    return 2;
-  }
-  if (c < 0x20 || c == 0x7F) {
-    return 6;
-  }
-  if (c < 0x80) {
-    return 1;
-  }
-  if (c < 0x800) {
-    return 2;
-  }
-  if (c < 0x10000 || c > 0x10FFFF) {
-    return 3;
-  }
-  return 4;
-}
-
-// |script| cut after the last character whose written form ends within
-// |limit| bytes. Adds the bytes it keeps to |*written| and sets |*cut| when it
-// was longer.
-WideString CutScript(const WideString& script,
-                     size_t limit,
-                     size_t* written,
-                     bool* cut) {
-  size_t bytes = 0;
-  size_t length = 0;
-  *cut = false;
-  for (wchar_t c : script) {
-    const size_t size = WrittenSize(static_cast<uint32_t>(c));
-    if (bytes + size > limit) {
-      *cut = true;
-      break;
-    }
-    bytes += size;
-    ++length;
-  }
-  *written += bytes;
-  return *cut ? script.First(length) : script;
-}
-
 // |page_scripts|: the bytes the scripts of this page's links have written so
 // far, or null outside a page.
 void AppendAction(std::string* out,
@@ -355,7 +310,8 @@ void AppendAction(std::string* out,
             ? std::min(kMaxScriptBytes, kMaxPageScriptBytes - *page_scripts)
             : kMaxScriptBytes;
     bool cut = false;
-    AppendText(out, CutScript(js.GetJavaScript(), limit, written, &cut));
+    AppendText(out, inkbar::json::CutText(js.GetJavaScript(), limit, written,
+                                          &cut));
     if (cut) {
       out->push_back(',');
       AppendKey(out, "scriptTruncated");

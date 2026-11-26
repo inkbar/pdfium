@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Edward Coleridge Smith
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { deflateSync, inflateSync } from 'node:zlib'
+import { constants, deflateRawSync, deflateSync, inflateSync } from 'node:zlib'
 import createModule from './out/inkbar-pdfium.mjs'
 
 const pdfPath = process.argv[2]
@@ -11,7 +12,7 @@ assert.ok(pdfPath, 'usage: node inkbar/smoke.mjs <one-page.pdf>')
 
 const exportsUrl = new URL('./out/exports.txt', import.meta.url)
 const names = readFileSync(fileURLToPath(exportsUrl), 'utf8').split('\n').filter(Boolean)
-assert.equal(names.length, 106)
+assert.equal(names.length, 112)
 
 const m = await createModule()
 for (const name of names) {
@@ -2928,8 +2929,8 @@ withDoc(standardPdf, (doc) => {
 // Renders page |index| through the INK_Render_* calls, |slice| ms a call, onto
 // white, with FPDF_RenderPageBitmap's arguments |args| (start_x, start_y,
 // size_x, size_y, rotate) and |flags|, leaving out the annotations numbered in
-// |skip|. Returns the bytes and the statuses INK_Render_Continue returned.
-function inkRender(doc, { index = 0, flags = FPDF_ANNOT, skip = [], slice = 1000, args } = {}) {
+// |skip| and those at the places in /Annots in |skipAt|. Returns the bytes and the statuses INK_Render_Continue returned.
+function inkRender(doc, { index = 0, flags = FPDF_ANNOT, skip = [], skipAt = [], slice = 1000, args } = {}) {
   const page = m._FPDF_LoadPage(doc, index)
   assert.notEqual(page, 0)
   const width = Math.round(m._FPDF_GetPageWidthF(page))
@@ -2939,9 +2940,12 @@ function inkRender(doc, { index = 0, flags = FPDF_ANNOT, skip = [], slice = 1000
   m._FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0xffffffff)
   const skipPtr = skip.length ? m._malloc(skip.length * 4) : 0
   if (skipPtr) m.HEAPU32.set(skip, skipPtr / 4)
-  const r = m._INK_Render_Start(bitmap, page, startX, startY, sizeX, sizeY, rotate, flags, skipPtr, skip.length)
-  // Start reads the list before it returns.
+  const skipAtPtr = skipAt.length ? m._malloc(skipAt.length * 4) : 0
+  skipAt.forEach((at, i) => m.setValue(skipAtPtr + i * 4, at, 'i32'))
+  const r = m._INK_Render_Start(bitmap, page, startX, startY, sizeX, sizeY, rotate, flags, skipPtr, skip.length, skipAtPtr, skipAt.length)
+  // Start reads the lists before it returns.
   if (skipPtr) m._free(skipPtr)
+  if (skipAtPtr) m._free(skipAtPtr)
   assert.notEqual(r, 0, 'INK_Render_Start failed')
   const statuses = []
   for (;;) {
@@ -3031,7 +3035,7 @@ withDoc(bigImagePdf, (doc) => {
   const page = m._FPDF_LoadPage(doc, 0)
   const bitmap = m._FPDFBitmap_CreateEx(400, 400, 4, 0, 0)
   m._FPDFBitmap_FillRect(bitmap, 0, 0, 400, 400, 0xffffffff)
-  const r = m._INK_Render_Start(bitmap, page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0)
+  const r = m._INK_Render_Start(bitmap, page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0, 0, 0)
   assert.notEqual(r, 0)
   assert.equal(m._INK_Render_Continue(r, 0), 0, 'the render ended in its first slice')
   m._INK_Render_Close(r)
@@ -3067,7 +3071,7 @@ m._INK_Render_Close(0)
     m._FPDFBitmap_FillRect(bitmap, 0, 0, 400, 200, 0xffffffff)
     const skipPtr = m._malloc(4)
     m.HEAPU32[skipPtr / 4] = SQUARE_OBJ
-    const r = m._INK_Render_Start(bitmap, page, 0, 0, 400, 200, 0, FPDF_ANNOT, skipPtr, 1)
+    const r = m._INK_Render_Start(bitmap, page, 0, 0, 400, 200, 0, FPDF_ANNOT, skipPtr, 1, 0, 0)
     m._free(skipPtr)
     assert.notEqual(r, 0)
     assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), neverRendered[0]), 'a save during a render differs')
@@ -3092,10 +3096,10 @@ withDoc(bigImagePdf, (doc) => {
     m._FPDFBitmap_FillRect(bitmap, 0, 0, 400, 400, 0xffffffff)
     return bitmap
   })
-  const r1 = m._INK_Render_Start(bitmaps[0], page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0)
+  const r1 = m._INK_Render_Start(bitmaps[0], page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0, 0, 0)
   assert.notEqual(r1, 0)
   m._FPDF_RenderPageBitmap(bitmaps[1], page, 0, 0, 400, 400, 0, FPDF_ANNOT)
-  const r2 = m._INK_Render_Start(bitmaps[2], page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0)
+  const r2 = m._INK_Render_Start(bitmaps[2], page, 0, 0, 400, 400, 0, FPDF_ANNOT, 0, 0, 0, 0)
   assert.notEqual(r2, 0, 'a render could not start after a stale one')
   assert.equal(m._INK_Render_Continue(r1, 1000), -1, 'a stale render continued')
   m._INK_Render_Close(r1)
@@ -4281,6 +4285,1204 @@ m._INK_Json_Free(0)
     assert.equal(outline.items.length, 100000)
     assert.equal(outline.items.at(-1).title, 'I99999')
     assert.equal(outline.truncated, true, 'the item cap does not truncate')
+  })
+}
+
+// INK_Annots_Page, INK_Form, INK_Scripts, INK_Doc_Facts, INK_Struct_Order and
+// INK_Annot_Draw: what the file says about a page's annotations, its form, its
+// scripts and itself, the order its structure gives annotations, and one
+// annotation drawn alone. None of them writes to the document.
+
+// A float[6] matrix in the heap. The caller frees it.
+function heapMatrix(values) {
+  const ptr = m._malloc(24)
+  values.forEach((v, i) => m.setValue(ptr + i * 4, v, 'float'))
+  return ptr
+}
+
+// Draws annotation |index| of page |pageIndex| alone onto a transparent bitmap
+// of the page's size, in |state| (null: the one /AS selects; a Buffer: the
+// name's bytes; a string: its UTF-8). Returns the result and the bytes.
+function drawAnnot(doc, pageIndex, index, state) {
+  const page = m._FPDF_LoadPage(doc, pageIndex)
+  assert.notEqual(page, 0)
+  const width = Math.round(m._FPDF_GetPageWidthF(page))
+  const height = Math.round(m._FPDF_GetPageHeightF(page))
+  const bitmap = m._FPDFBitmap_CreateEx(width, height, 4, 0, 0)
+  m._FPDFBitmap_FillRect(bitmap, 0, 0, width, height, 0)
+  const matrix = heapMatrix([width / m._FPDF_GetPageWidthF(page), 0, 0, height / m._FPDF_GetPageHeightF(page), 0, 0])
+  let drew
+  if (state === null) {
+    drew = m._INK_Annot_Draw(bitmap, page, index, 0, matrix)
+  } else if (Buffer.isBuffer(state)) {
+    // A state as the name's own bytes.
+    const name = heapBytes(Buffer.concat([state, Buffer.from([0])]))
+    drew = m._INK_Annot_Draw(bitmap, page, index, name, matrix)
+    m._free(name)
+  } else {
+    drew = withStrings([state], (name) => m._INK_Annot_Draw(bitmap, page, index, name, matrix))
+  }
+  const bytes = bitmapBytes(bitmap, height)
+  m._free(matrix)
+  m._FPDFBitmap_Destroy(bitmap)
+  m._FPDF_ClosePage(page)
+  return { drew, bytes }
+}
+
+const inked = (bytes) => bytes.some((b) => b !== 0)
+
+{
+  // form-fields.pdf, from the monorepo's fixtures: every field kind, 23
+  // widgets, 20 of them on page 0, and page 1 turned 90 degrees.
+  const formFields = readFileSync(new URL('./testdata/form-fields.pdf', import.meta.url))
+  const KINDS = {
+    agree: 'checkbox',
+    auto: 'text',
+    city: 'combo',
+    code: 'text',
+    country: 'combo',
+    email: 'text',
+    'header.ref': 'text',
+    interests: 'list',
+    internal: 'text',
+    locked: 'text',
+    name: 'text',
+    notes: 'text',
+    pin: 'text',
+    plan: 'radio',
+    reset: 'button',
+    rotated: 'text',
+    shared: 'radio',
+    sig: 'signature',
+    sig2: 'signature',
+    styled: 'text',
+  }
+  withPdf(formFields, (doc) => {
+    const unread = [saveWith(doc, NO_INCREMENTAL), saveWith(doc, 1)]
+
+    const form = takeJson(m._INK_Form(doc))
+    assert.equal(form.kind, 'acroform')
+    assert.equal(form.truncated, false)
+    assert.deepEqual(Object.fromEntries(form.fields.map((f) => [f.name, f.kind])), KINDS)
+    assert.equal(form.fields.length, Object.keys(KINDS).length, 'a field is listed twice')
+    assert.equal(form.fields.flatMap((f) => f.widgets).length, 23)
+    const field = (name) => form.fields.find((f) => f.name === name)
+
+    const { annots, tabs, truncated } = takeJson(m._INK_Annots_Page(doc, 0))
+    assert.equal(truncated, false)
+    assert.equal(tabs, 'R')
+    assert.equal(annots.length, 20)
+    assert.deepEqual(
+      annots.map((a) => [a.index, a.subtype]),
+      annots.map((_, i) => [i, 'Widget']),
+    )
+    // Every widget on page 0 is the annotation at its place in /Annots.
+    const onPage0 = form.fields.flatMap((f) => f.widgets).filter((w) => w.page === 0)
+    assert.equal(onPage0.length, 20)
+    for (const w of onPage0) assert.equal(annots[w.annotIndex].objectNumber, w.objectNumber)
+    // shared's second widget sits after country's in /Annots, apart from its first.
+    assert.equal(field('shared').widgets[1].annotIndex, field('country').widgets[0].annotIndex + 1)
+    assert.notEqual(field('shared').widgets[0].annotIndex + 1, field('shared').widgets[1].annotIndex)
+    // header.ref's second widget is on the turned page, turned back by /MK /R.
+    assert.deepEqual([field('header.ref').widgets[1].page, field('header.ref').widgets[1].rotation], [1, 90])
+    assert.equal(takeJson(m._INK_Annots_Page(doc, 1)).annots.length, 3)
+    assert.equal(field('email').tooltip, 'Email address')
+    assert.equal(field('pin').maxLength, 4)
+    assert.deepEqual([field('country').valueKind, field('country').value], ['string', 'gb'])
+    assert.deepEqual(field('country').options[0], { exportValue: 'gb', displayValue: 'United Kingdom' })
+    assert.deepEqual([field('plan').valueKind, field('plan').value, field('plan').defaultValue], ['name', 'monthly', 'yearly'])
+    assert.deepEqual(
+      field('plan').widgets.map((w) => w.onState),
+      ['monthly', 'yearly'],
+    )
+    assert.deepEqual(field('reset').widgets[0].action, { s: 'ResetForm', fields: [], refs: [], flags: 0 })
+    assert.equal(field('styled').widgets[0].da, '/F1 10 Tf 0 0 1 rg')
+
+    // The checkbox drawn off and on gives different pixels; with no state it
+    // draws what /AS selects, Off.
+    const agree = field('agree').widgets[0]
+    assert.ok(agree.states.includes('Off') && agree.states.includes(agree.onState), JSON.stringify(agree.states))
+    const off = drawAnnot(doc, 0, agree.annotIndex, 'Off')
+    const on = drawAnnot(doc, 0, agree.annotIndex, agree.onState)
+    assert.deepEqual([off.drew, on.drew], [1, 1])
+    assert.ok(inked(on.bytes), 'the checked box drew nothing')
+    assert.ok(!off.bytes.equals(on.bytes), 'Off and on draw the same')
+    assert.ok(drawAnnot(doc, 0, agree.annotIndex, null).bytes.equals(off.bytes), 'no state is not /AS')
+    assert.equal(drawAnnot(doc, 0, agree.annotIndex, 'Missing').drew, 0, 'a state /N lacks')
+    assert.equal(drawAnnot(doc, 0, 99, null).drew, 0, 'no annotation at 99')
+
+    // Drawn alone, a widget lands where the page with its widgets draws it:
+    // laid over the page drawn without widgets, it gives the pixels of the page
+    // drawn with them, to within 1 level, on the turned page too. On page 0 its
+    // pixels fill its /Rect's box.
+    for (const w of [field('name').widgets[0], field('plan').widgets[1], field('header.ref').widgets[1], field('rotated').widgets[0]]) {
+      const page = m._FPDF_LoadPage(doc, w.page)
+      const width = Math.round(m._FPDF_GetPageWidthF(page))
+      const height = Math.round(m._FPDF_GetPageHeightF(page))
+      m._FPDF_ClosePage(page)
+      const alone = drawAnnot(doc, w.page, w.annotIndex, null)
+      assert.equal(alone.drew, 1)
+      const full = renderPixels(doc, w.page, FPDF_ANNOT | EPDF_RENDER_WIDGETS).bytes
+      const bare = renderPixels(doc, w.page, FPDF_ANNOT).bytes
+      const box = [width, height, -1, -1]
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          if (alone.bytes[(y * width + x) * 4 + 3] === 0) continue
+          box[0] = Math.min(box[0], x)
+          box[1] = Math.min(box[1], y)
+          box[2] = Math.max(box[2], x)
+          box[3] = Math.max(box[3], y)
+        }
+      }
+      assert.ok(box[2] >= box[0], `widget ${w.objectNumber} drew nothing`)
+      let worst = 0
+      for (let y = box[1]; y <= box[3]; y++) {
+        for (let x = box[0]; x <= box[2]; x++) {
+          const i = (y * width + x) * 4
+          const a = alone.bytes[i + 3] / 255
+          for (let c = 0; c < 3; c++) worst = Math.max(worst, Math.abs(Math.round(alone.bytes[i + c] * a + bare[i + c] * (1 - a)) - full[i + c]))
+        }
+      }
+      assert.ok(worst <= 1, `widget ${w.objectNumber} drawn alone is ${worst} levels off the page's render`)
+      if (w.page === 0) {
+        const [l, b, r, t] = w.rect
+        assert.deepEqual(box, [Math.floor(l), height - Math.ceil(t), Math.ceil(r) - 1, height - Math.floor(b) - 1], `widget ${w.objectNumber} is not in its /Rect`)
+      }
+    }
+
+    // A draw fails while a render holds the page.
+    {
+      const page = m._FPDF_LoadPage(doc, 0)
+      const bitmap = m._FPDFBitmap_CreateEx(612, 792, 4, 0, 0)
+      const r = m._INK_Render_Start(bitmap, page, 0, 0, 612, 792, 0, FPDF_ANNOT, 0, 0, 0, 0)
+      assert.notEqual(r, 0)
+      assert.equal(m._INK_Annot_Draw(bitmap, page, agree.annotIndex, 0, 0), 0, 'a draw during a render')
+      m._INK_Render_Close(r)
+      assert.equal(m._INK_Annot_Draw(bitmap, page, agree.annotIndex, 0, 0), 1, 'a draw after the render closed')
+      assert.equal(m._INK_Annot_Draw(0, page, agree.annotIndex, 0, 0), 0, 'a NULL bitmap')
+      m._FPDFBitmap_Destroy(bitmap)
+      m._FPDF_ClosePage(page)
+    }
+
+    assert.deepEqual(takeJson(m._INK_Scripts(doc)), { document: [], documentActions: {}, pageActions: [], truncated: false })
+    assert.deepEqual(takeJson(m._INK_Doc_Facts(doc)), { title: 'Inkbar fixture', author: 'Inkbar', encrypted: false, openedAs: 'none' })
+    assert.deepEqual(takeJson(m._INK_Struct_Order(doc, 0)), { order: [], truncated: false })
+
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread[0]), 'a read or a draw changed what a save writes')
+    assert.ok(sameSave(saveWith(doc, 1), unread[1]), 'a read or a draw changed what an incremental save writes')
+  })
+  for (const call of ['_INK_Annots_Page', '_INK_Struct_Order']) {
+    assert.equal(m[call](0, 0), 0, `${call} of a NULL document`)
+    withPdf(onePagePdf(''), (doc) => assert.equal(m[call](doc, 1), 0, `${call} of page 1 of a one-page file`))
+  }
+  for (const call of ['_INK_Form', '_INK_Scripts', '_INK_Doc_Facts']) assert.equal(m[call](0), 0, `${call} of a NULL document`)
+}
+
+{
+  // Annotations whose dictionaries are wrong: /Rect missing, a colour of five
+  // components and /Contents in no encoding, /IRT naming itself and a UTF-16
+  // string with an unpaired surrogate, an /InkList entry that is not a number
+  // and one that is not an array, /Rect with a string in it, and a direct
+  // dictionary. No AcroForm.
+  const pdf = onePagePdf('', { mediaBox: letterBox, page: '/Annots [6 0 R 7 0 R 8 0 R 9 0 R << /Subtype /Square /Rect [0 0 10 10] /F 2 >> 10 0 R]' }, [
+    '<< /Type /Annot /Subtype /Square /C [1 0 0] >>',
+    '<< /Type /Annot /Subtype /Text /Rect [10 10 30 30] /C [1 0 0 0 0] /Contents (a\\177b) /Name /Comment /T <FEFF00E9> /CA 0.5 >>',
+    '<< /Type /Annot /Subtype /Text /Rect [30 30 10 10] /IRT 8 0 R /Contents <FEFFD800> /M (D:20261125) >>',
+    '<< /Type /Annot /Subtype /Ink /Rect [0 0 (x) 10] /InkList [[1 2 /x 4] 5] /BS << /W 2 /S /D >> /Border [0 0 3] >>',
+    `<< /Type /Annot /Subtype /Ink /Rect [0 0 10 10] /InkList [[${'1 '.repeat(600000)}] [${'2 '.repeat(600000)}]] >>`,
+  ])
+  withPdf(pdf, (doc) => {
+    const unread = saveWith(doc, NO_INCREMENTAL)
+    const { annots, truncated } = takeJson(m._INK_Annots_Page(doc, 0))
+    assert.equal(truncated, false)
+    assert.deepEqual(
+      annots.map((a) => [a.index, a.objectNumber]),
+      [
+        [0, 6],
+        [1, 7],
+        [2, 8],
+        [3, 9],
+        [4, undefined],
+        [5, 10],
+      ],
+    )
+    assert.deepEqual([annots[0].rect, annots[0].rectOk], [null, false], '/Rect missing')
+    assert.deepEqual(annots[1].color, [1, 0, 0, 0, 0])
+    assert.deepEqual(annots[1].contents, { bytes: hex('a\x7fb') })
+    assert.deepEqual([annots[1].author, annots[1].icon, annots[1].opacity], ['é', 'Comment', 0.5])
+    assert.deepEqual([annots[2].inReplyTo, annots[2].contents, annots[2].modified], [[8, 0], { bytes: 'feffd800' }, 'D:20261125'])
+    assert.deepEqual([annots[2].rect, annots[2].rectOk], [[30, 30, 10, 10], true], 'corners as written')
+    assert.deepEqual([annots[3].rect, annots[3].rectOk], [[0, 0, null, 10], false])
+    assert.deepEqual(annots[3].inkLists, [[1, 2, null, 4], null])
+    assert.deepEqual([annots[3].borderStyle, annots[3].border], [{ width: 2, style: 'D' }, [0, 0, 3]])
+    assert.deepEqual([annots[4].flags, annots[4].hasAppearance, annots[4].appearance], [2, false, null])
+    // /InkList is read up to 1,000,000 numbers in all.
+    assert.deepEqual(
+      annots[5].inkLists.map((path) => path.length),
+      [600000, 400000],
+    )
+    assert.equal(annots[5].truncated, true)
+    assert.equal(annots[4].truncated, undefined)
+    const form = takeJson(m._INK_Form(doc))
+    assert.deepEqual(form, { kind: 'none', needAppearances: false, fields: [], groups: [], fieldsRoot: [], calculationOrder: [], calculationOrderRefs: [], fieldTreeDepth: 0, fieldTreeRevisits: false, tooLarge: false, truncated: false })
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'a report changed what a save writes')
+  })
+}
+
+{
+  // A field tree whose /Kids loop, each node listing the other twice (walked
+  // without care, the work doubles at each level), a field whose widget no
+  // page holds, a field with no widget, a widget with no /T and no parent, and
+  // a widget /Fields does not reach. /CO names a field, a page and a number.
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 8 0 R 10 0 R 11 0 R] /CO [8 0 R 3 0 R 12] /DA (/Helv 0 Tf 0 g) >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [11 0 R 12 0 R] >>`,
+    '<< >>',
+    '<< >>',
+    '<< /T (a) /Kids [7 0 R 7 0 R] >>',
+    '<< /T (b) /Parent 6 0 R /Kids [6 0 R 6 0 R] >>',
+    '<< /FT /Tx /T (lost) /Kids [9 0 R] >>',
+    '<< /Type /Annot /Subtype /Widget /Parent 8 0 R /Rect [0 0 10 10] >>',
+    '<< /FT /Tx /T (unplaced) >>',
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /Rect [0 0 10 10] >>',
+    '<< /Type /Annot /Subtype /Widget /FT /Btn /T (stray) /Rect [20 20 30 30] >>',
+  ])
+  withPdf(pdf, (doc) => {
+    const unread = saveWith(doc, NO_INCREMENTAL)
+    const started = Date.now()
+    const form = takeJson(m._INK_Form(doc))
+    assert.ok(Date.now() - started < 5000, `the looping tree took ${Date.now() - started} ms`)
+    assert.equal(form.fieldTreeRevisits, true)
+    assert.equal(form.tooLarge, false)
+    assert.equal(form.truncated, false)
+    const field = (name) => form.fields.find((f) => f.name === name)
+    assert.deepEqual(
+      form.fields.map((f) => f.name).sort(),
+      ['lost', 'stray', 'unplaced'],
+    )
+    assert.deepEqual(
+      field('lost').widgets.map((w) => [w.objectNumber, w.page, w.annotIndex]),
+      [[9, -1, -1]],
+    )
+    assert.deepEqual(field('unplaced').widgets, [])
+    assert.deepEqual([field('stray').origin, field('stray').widgets[0].page, field('stray').widgets[0].annotIndex], ['recovered', 0, 1])
+    assert.equal(field('lost').origin, 'acroform')
+    assert.deepEqual(form.calculationOrder, [form.fields.indexOf(field('lost')), -1, -1])
+    assert.deepEqual(form.calculationOrderRefs, [[8, 0], [3, 0], null])
+    assert.equal(form.da, '/Helv 0 Tf 0 g')
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'the form report changed what a save writes')
+  })
+}
+
+{
+  // 50,001 fields: none is read, and the report says so at once. 200,001
+  // annotations on a page: the report stops within 16 MB and 200,000 entries.
+  const fields = 50001
+  const pdf = buildPdf([
+    `<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [${Array.from({ length: fields }, (_, i) => `${i + 4} 0 R`).join(' ')}] >> >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [${'<< /Subtype /Square /Rect [0 0 1 1] >> '.repeat(200001)}] >>`,
+    ...Array.from({ length: fields }, (_, i) => `<< /FT /Tx /T (f${i}) >>`),
+  ])
+  withPdf(pdf, (doc) => {
+    const started = Date.now()
+    const form = takeJson(m._INK_Form(doc))
+    assert.ok(Date.now() - started < 5000, `50,001 fields took ${Date.now() - started} ms`)
+    assert.deepEqual([form.fields.length, form.tooLarge, form.truncated], [0, true, false], 'refused, not cut short')
+    const ptr = m._INK_Annots_Page(doc, 0)
+    const text = cString(ptr)
+    m._INK_Json_Free(ptr)
+    assert.ok(Buffer.byteLength(text) <= 16 * 1024 * 1024, `${Buffer.byteLength(text)} bytes of JSON`)
+    const { annots, truncated } = JSON.parse(text)
+    assert.equal(truncated, true)
+    assert.ok(annots.length > 0 && annots.length <= 200000, `${annots.length} annotations`)
+    assert.deepEqual(
+      annots.slice(0, 2).map((a) => a.index),
+      [0, 1],
+    )
+  })
+}
+
+{
+  // 1,000 form fields and 50,001 widget annotations with no /FT, which the
+  // form does not load: they do not count towards the limit.
+  const fields = 1000
+  const pdf = buildPdf([
+    `<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [${Array.from({ length: fields }, (_, i) => `${i + 4} 0 R`).join(' ')}] >> >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [${'<< /Subtype /Widget /Rect [0 0 1 1] >> '.repeat(50001)}] >>`,
+    ...Array.from({ length: fields }, (_, i) => `<< /FT /Tx /T (f${i}) >>`),
+  ])
+  withPdf(pdf, (doc) => {
+    const form = takeJson(m._INK_Form(doc))
+    assert.deepEqual([form.fields.length, form.tooLarge, form.truncated], [fields, false, false])
+  })
+}
+
+{
+  // 20,000 dictionaries that all share one /Kids array, which lists them all,
+  // as the form's fields and as the /Names /JavaScript tree. Each array is
+  // walked once.
+  const n = 20000
+  const refs = Array.from({ length: n }, (_, i) => `${i + 5} 0 R`).join(' ')
+  const pdf = buildPdf([
+    `<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [${refs}] >> /Names << /JavaScript << /Kids 4 0 R >> >> >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} >>`,
+    `[${refs}]`,
+    ...Array.from({ length: n }, (_, i) => `<< /T (f${i}) /Kids 4 0 R /Names [(s${i}) << /S /JavaScript /JS (x) >>] >>`),
+  ])
+  withPdf(pdf, (doc) => {
+    let started = Date.now()
+    const form = takeJson(m._INK_Form(doc))
+    assert.ok(Date.now() - started < 2000, `the shared /Kids took ${Date.now() - started} ms`)
+    assert.equal(form.fieldTreeRevisits, true)
+    started = Date.now()
+    const scripts = takeJson(m._INK_Scripts(doc))
+    assert.ok(Date.now() - started < 2000, `the shared name tree took ${Date.now() - started} ms`)
+    assert.deepEqual([scripts.document.length, scripts.document[0], scripts.truncated], [n, { name: 's0', source: 'x' }, false])
+  })
+}
+
+{
+  // 1,000 JavaScript actions whose /JS is one 3 MB stream, as the open
+  // action's chain and as a widget's /A chain, and 2,000 widgets of one
+  // field sharing a /MK /BC of 1,000,000 numbers: each report stops within
+  // 16 MB and says so.
+  const chain = `<< /S /JavaScript /JS 6 0 R /Next [${'<< /S /JavaScript /JS 6 0 R >> '.repeat(999)}] >>`
+  const widgets = 2000
+  const pdf = buildPdf([
+    `<< /Type /Catalog /Pages 2 0 R /OpenAction ${chain} /AcroForm << /Fields [8 0 R 9 0 R] >> >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} >>`,
+    '<< >>',
+    '<< >>',
+    streamObject('', `/* ${'x'.repeat(3 * 1024 * 1024)} */`, true),
+    `[${'1 '.repeat(1000000)}]`,
+    `<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (script) /Rect [0 0 10 10] /A ${chain} >>`,
+    `<< /FT /Tx /T (wide) /Kids [${Array.from({ length: widgets }, (_, i) => `${i + 10} 0 R`).join(' ')}] >>`,
+    ...Array.from({ length: widgets }, () => '<< /Type /Annot /Subtype /Widget /Parent 9 0 R /Rect [0 0 1 1] /MK << /BC 7 0 R >> >>'),
+  ])
+  withPdf(pdf, (doc) => {
+    for (const call of ['_INK_Scripts', '_INK_Form']) {
+      const ptr = m[call](doc)
+      assert.notEqual(ptr, 0, call)
+      const text = cString(ptr)
+      m._INK_Json_Free(ptr)
+      assert.ok(Buffer.byteLength(text) <= 16 * 1024 * 1024, `${call}: ${Buffer.byteLength(text)} bytes`)
+      assert.equal(JSON.parse(text).truncated, true, `${call} was not cut`)
+    }
+  })
+}
+
+{
+  // A field 40 levels down, below PDFium's walk of 33 levels, whose widget is
+  // on the page; only the top and the bottom have /T. The page sweep climbs
+  // from the widget and walks down again, so the field is the bottom
+  // dictionary (object 45), not its widget (46): the fields and object numbers
+  // EPDFForm_LoadModel gives for this file in the released v8165.8 module.
+  const levels = 40
+  const nodes = Array.from(
+    { length: levels },
+    (_, i) => `<< ${i === 0 || i === levels - 1 ? `/T (n${i})` : ''} ${i > 0 ? `/Parent ${i + 5} 0 R` : ''} ${i + 1 < levels ? `/Kids [${i + 7} 0 R]` : '/FT /Tx /Kids [46 0 R]'} >>`,
+  )
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R] >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [46 0 R] >>',
+    '<< >>',
+    '<< >>',
+    ...nodes,
+    '<< /Type /Annot /Subtype /Widget /Parent 45 0 R /Rect [0 0 10 10] >>',
+  ])
+  withPdf(pdf, (doc) => {
+    const form = takeJson(m._INK_Form(doc))
+    assert.deepEqual(
+      form.fields.map((f) => [f.name, f.objectNumber, f.widgets.map((w) => w.objectNumber)]),
+      [['n0.n39', 45, [46]]],
+    )
+  })
+}
+
+{
+  // Script reading is bounded by work, not only by bytes. A widget under 1,000
+  // /Parent levels whose /AA are one dictionary of 1,000 keys, each the same
+  // chain of 999 Named actions and one empty script; and a catalog /AA of
+  // 200,000 keys, each that chain. Each shared object
+  // is read once a report.
+  // Objects |first| on: |count| - 1 Named actions, each naming the next, and
+  // an empty script.
+  const chain = (first, count) =>
+    Array.from({ length: count }, (_, i) => (i + 1 < count ? `<< /S /Named /N /NextPage /Next ${first + i + 1} 0 R >>` : '<< /S /JavaScript /JS () >>'))
+  const levels = 1000
+  const keys = 200000
+  // 6: the /AA of 1,000 keys; 7 to 1006: the chain; 1007 to 2006: the levels;
+  // 2007: the widget.
+  const pdf = buildPdf([
+    `<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [2007 0 R] >> /AA << ${Array.from({ length: keys }, (_, i) => `/k${i} 7 0 R`).join(' ')} >> >>`,
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [2007 0 R] >>',
+    '<< >>',
+    '<< >>',
+    `<< ${Array.from({ length: 1000 }, (_, i) => `/k${i} 7 0 R`).join(' ')} >>`,
+    ...chain(7, 1000),
+    ...Array.from({ length: levels }, (_, i) => `<< /AA 6 0 R ${i + 1 < levels ? `/Parent ${i + 1008} 0 R` : ''} >>`),
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (deep) /Rect [0 0 10 10] /Parent 1007 0 R /AA 6 0 R >>',
+  ])
+  withPdf(pdf, (doc) => {
+    let started = Date.now()
+    const form = takeJson(m._INK_Form(doc))
+    assert.ok(Date.now() - started < 2000, `the shared /AA took ${Date.now() - started} ms`)
+    assert.equal(Object.keys(form.fields[0].widgets[0].scripts).length, 1000)
+    started = Date.now()
+    const ptr = m._INK_Scripts(doc)
+    const text = cString(ptr)
+    m._INK_Json_Free(ptr)
+    assert.ok(Date.now() - started < 2000, `200,000 /AA keys took ${Date.now() - started} ms`)
+    assert.ok(Buffer.byteLength(text) <= 16 * 1024 * 1024, `${Buffer.byteLength(text)} bytes of JSON`)
+    const scripts = JSON.parse(text)
+    assert.equal(Object.keys(scripts.documentActions).length, keys)
+    assert.deepEqual(scripts.documentActions.k0, [''])
+  })
+}
+
+{
+  // A field whose five widgets share one /AA of 1,000 keys, each holding a
+  // script, at each of 1,000 /Parent levels: about 5,000,000 units of work,
+  // past the allowance of 4,000,000. The report stops reading and says so.
+  const levels = 1000
+  // 6: the /AA; 7: the field; 8 to 12: the widgets; 13 on: the levels.
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R] >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
+    '<< >>',
+    '<< >>',
+    `<< ${Array.from({ length: 1000 }, (_, i) => `/k${i} << /S /JavaScript /JS (s${i}) >>`).join(' ')} >>`,
+    '<< /FT /Tx /T (five) /Kids [8 0 R 9 0 R 10 0 R 11 0 R 12 0 R] /AA 6 0 R /Parent 13 0 R >>',
+    ...Array.from({ length: 5 }, () => '<< /Type /Annot /Subtype /Widget /Parent 7 0 R /Rect [0 0 10 10] /AA 6 0 R >>'),
+    ...Array.from({ length: levels }, (_, i) => `<< /AA 6 0 R ${i + 1 < levels ? `/Parent ${i + 14} 0 R` : ''} >>`),
+  ])
+  withPdf(pdf, (doc) => {
+    const started = Date.now()
+    const form = takeJson(m._INK_Form(doc))
+    assert.ok(Date.now() - started < 2000, `five widgets under 1,000 levels took ${Date.now() - started} ms`)
+    assert.deepEqual([form.fields[0].truncated, form.truncated], [true, true], 'the work allowance ran out unmarked')
+  })
+}
+
+{
+  // 130 Flate /JS streams, each 4 MB of text from a few KB, under one /AA of
+  // the catalog and of a widget: a report holds at most 16 MB of decoded text,
+  // so it returns, cut.
+  const bomb = deflateSync(Buffer.alloc(4 * 1024 * 1024, 'x'))
+  const count = 130
+  const stream = Buffer.concat([Buffer.from(`<< /Length ${bomb.length} /Filter /FlateDecode >>\nstream\n`), bomb, Buffer.from('\nendstream')])
+  // 6: the /AA; 7: the widget; 8 on: the streams.
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R] >> /AA 6 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
+    '<< >>',
+    '<< >>',
+    `<< ${Array.from({ length: count }, (_, i) => `/k${i} << /S /JavaScript /JS ${i + 8} 0 R >>`).join(' ')} >>`,
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (bomb) /Rect [0 0 10 10] /AA 6 0 R >>',
+    ...Array.from({ length: count }, () => stream),
+  ])
+  withPdf(pdf, (doc) => {
+    for (const call of ['_INK_Scripts', '_INK_Form']) {
+      const ptr = m[call](doc)
+      assert.notEqual(ptr, 0, call)
+      const text = cString(ptr)
+      m._INK_Json_Free(ptr)
+      assert.equal(JSON.parse(text).truncated, true, `${call} was not cut`)
+    }
+  })
+}
+
+{
+  // One /JS stream of 5 MB, cut at 4 MB, read first through a parent's /AA
+  // under field a (a's own /K is nearer) and then through field b's own
+  // chain: b's source is cut too, and says so.
+  const big = deflateSync(Buffer.alloc(5 * 1024 * 1024, 'y'))
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R 8 0 R] >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
+    '<< >>',
+    '<< >>',
+    Buffer.concat([Buffer.from(`<< /Length ${big.length} /Filter /FlateDecode >>\nstream\n`), big, Buffer.from('\nendstream')]),
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (a) /Rect [0 0 10 10] /Parent 9 0 R /AA << /K << /S /JavaScript /JS (small) >> >> >>',
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (b) /Rect [0 20 10 30] /AA << /K << /S /JavaScript /JS 6 0 R >> >> >>',
+    '<< /AA << /K << /S /JavaScript /JS 6 0 R >> >> >>',
+  ])
+  withPdf(pdf, (doc) => {
+    const form = takeJson(m._INK_Form(doc))
+    const widget = (name) => form.fields.find((f) => f.name === name).widgets[0]
+    assert.deepEqual(widget('a').scripts, { K: ['small'] })
+    // Cut at 4 MB, less the 5 characters of 'small' the decoded allowance
+    // already holds.
+    assert.equal(widget('b').scripts.K[0].length, 4 * 1024 * 1024 - 5)
+    assert.equal(widget('b').truncated, true, 'a cut /JS reached a second time lost its mark')
+  })
+}
+
+// A zlib stream that inflates to |piece| |times| over, built a piece at a
+// time so the whole is never held.
+function repeatedDeflate(piece, times) {
+  const block = deflateRawSync(piece, { finishFlush: constants.Z_FULL_FLUSH })
+  let a = 1n
+  let b = 0n
+  for (const byte of piece) {
+    a = (a + BigInt(byte)) % 65521n
+    b = (b + a) % 65521n
+  }
+  // Adler-32 of the piece repeated: each repeat adds the piece's sums, and
+  // its length times the sum so far.
+  let allA = 1n
+  let allB = 0n
+  for (let i = 0; i < times; i++) {
+    allB = (allB + b + BigInt(piece.length) * (allA - 1n)) % 65521n
+    allA = (allA + a - 1n) % 65521n
+  }
+  const adler = Buffer.alloc(4)
+  adler.writeUInt32BE(Number((allB << 16n) | allA))
+  return Buffer.concat([Buffer.from([0x78, 0x9c]), ...Array.from({ length: times }, () => block), Buffer.from([0x03, 0x00]), adler])
+}
+// A catalog whose /AA and a widget whose /AA hold the /JS |streams|, objects
+// 8 on.
+const scriptsPdf = (streams) =>
+  buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R] >> /AA 6 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
+    '<< >>',
+    '<< >>',
+    `<< ${streams.map((_, i) => `/k${i} << /S /JavaScript /JS ${i + 8} 0 R >>`).join(' ')} >>`,
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (f) /Rect [0 0 10 10] /AA 6 0 R >>',
+    ...streams,
+  ])
+// Both reports of |pdf|, each checked to return within |within| ms.
+function scriptReports(pdf, within, what) {
+  return withPdf(pdf, (doc) =>
+    ['_INK_Scripts', '_INK_Form'].map((call) => {
+      const started = Date.now()
+      const ptr = m[call](doc)
+      const took = Date.now() - started
+      assert.notEqual(ptr, 0, call)
+      const report = takeJson(ptr)
+      assert.ok(took < within, `${call} took ${took} ms over ${what}`)
+      return report
+    }),
+  )
+}
+
+{
+  // One /JS stream of 1 MB that inflates to 1,008 MB: only its first 16 MB
+  // are inflated, and the source is cut.
+  const bomb = repeatedDeflate(Buffer.alloc(16 * 1024 * 1024, 'a'), 63)
+  assert.ok(bomb.length < 1100000, `${bomb.length} bytes stored`)
+  const [scripts, form] = scriptReports(scriptsPdf([streamObject('/Filter /FlateDecode', bomb, true)]), 1000, 'a stream of 1,008 MB')
+  assert.equal(scripts.documentActions.k0[0], 'a'.repeat(4 * 1024 * 1024))
+  assert.equal(scripts.truncated, true, 'the cut source is not marked')
+  const widget = form.fields[0].widgets[0]
+  assert.equal(widget.scripts.k0[0].length, 4 * 1024 * 1024)
+  assert.deepEqual([widget.truncated, form.truncated], [true, true], 'the cut source is not marked in the form')
+}
+
+{
+  // 300 /JS streams that each inflate to 64 MB and leave no text: UTF-16 with
+  // a language escape that never closes. What is decoded is charged, whatever
+  // text it leaves, so the report stops decoding after 64 MB.
+  const piece = Buffer.alloc(1024 * 1024)
+  for (let i = 1; i < piece.length; i += 2) piece[i] = 0x41
+  const silent = Buffer.concat([Buffer.from([0x78, 0x9c]), deflateRawSync(Buffer.from([0xfe, 0xff, 0x00, 0x1b]), { finishFlush: constants.Z_FULL_FLUSH }), repeatedDeflate(piece, 64).subarray(2)])
+  const stream = streamObject('/Filter /FlateDecode', silent, true)
+  const [scripts, form] = scriptReports(scriptsPdf(Array.from({ length: 300 }, () => stream)), 2000, '300 streams of 64 MB')
+  assert.equal(Object.keys(scripts.documentActions).length, 300)
+  assert.ok(Object.values(scripts.documentActions).every((sources) => sources.length === 1 && sources[0] === ''), 'a silent stream left text')
+  assert.equal(scripts.truncated, true, 'the decode allowance ran out unmarked')
+  assert.deepEqual([form.fields[0].widgets[0].truncated, form.truncated], [true, true], 'the decode allowance ran out unmarked in the form')
+}
+
+{
+  // A script of 30,000 characters that Flate cannot shrink below 16 KB.
+  let seed = 1
+  const script = Array.from({ length: 30000 }, () => {
+    seed ^= seed << 13
+    seed ^= seed >>> 17
+    seed ^= seed << 5
+    return String.fromCharCode(48 + ((seed >>> 0) % 64))
+  }).join('')
+  const packed = deflateSync(Buffer.from(script, 'latin1'))
+  assert.ok(packed.length * 1032 > 16 * 1024 * 1024 + 3, `${packed.length} bytes stored`)
+  // PNG "up" rows of 100 bytes, as /Predictor 12 reads them.
+  const rows = (text) => Buffer.concat(Array.from({ length: text.length / 100 }, (_, i) => Buffer.from(`\0${text.slice(i * 100, i * 100 + 100)}`, 'latin1')))
+  const small = 'app.alert("predicted");'.padEnd(100) + ' '.repeat(100)
+  const [scripts, form] = scriptReports(
+    scriptsPdf([
+      // k0: one FlateDecode, no /DecodeParms: inflated in full, not cut.
+      streamObject('/Filter /FlateDecode', packed, true),
+      // k1: no filter.
+      streamObject('', Buffer.from(script, 'latin1'), true),
+      // k2 and k3: a predictor and a chain, small enough that no decoding
+      // of them can pass the cap: PDFium decodes them.
+      streamObject('/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 100 >>', deflateSync(rows(small)), true),
+      streamObject('/Filter [/ASCIIHexDecode /FlateDecode]', Buffer.from(`${deflateSync(Buffer.from('chained()')).toString('hex')}>`), true),
+      // k4 and k5: /DecodeParms PDFium reads as no predictor: inflated in
+      // full like k0.
+      streamObject('/Filter /FlateDecode /DecodeParms << >>', packed, true),
+      streamObject('/Filter /FlateDecode /DecodeParms << /Predictor 1 >>', packed, true),
+    ]),
+    2000,
+    'six ordinary scripts',
+  )
+  assert.deepEqual(scripts.documentActions, { k0: [script], k1: [script], k2: [small], k3: ['chained()'], k4: [script], k5: [script] })
+  assert.equal(scripts.truncated, false, 'an ordinary script was marked cut')
+  assert.deepEqual(form.fields[0].widgets[0].scripts, scripts.documentActions)
+  assert.deepEqual([form.fields[0].widgets[0].truncated, form.truncated], [undefined, false])
+  // The same predictor and chain over stored bytes that could decode past the
+  // cap (stored size times 1,032 for Flate): not decoded, empty and cut.
+  for (const stream of [
+    streamObject('/Filter /FlateDecode /DecodeParms << /Predictor 12 /Columns 100 >>', deflateSync(rows(script)), true),
+    streamObject('/Filter [/ASCIIHexDecode /FlateDecode]', Buffer.from(`${packed.toString('hex')}>`), true),
+  ]) {
+    const [cutScripts, cutForm] = scriptReports(scriptsPdf([stream]), 2000, 'a stream PDFium would decode whole')
+    assert.deepEqual([cutScripts.documentActions, cutScripts.truncated], [{ k0: [''] }, true])
+    assert.deepEqual([cutForm.fields[0].widgets[0].scripts, cutForm.fields[0].widgets[0].truncated, cutForm.truncated], [{ k0: [''] }, true, true])
+  }
+}
+
+{
+  // 1,000 /JS streams of 15 KB stored that inflate to a "0" and 15 MB of
+  // spaces and then go through ASCIIHex, which leaves one byte. A stream
+  // PDFium decodes is charged what its stages could produce, not what they
+  // leave, so the report decodes two and stops.
+  const packed = deflateSync(Buffer.concat([Buffer.from('0'), Buffer.alloc(15 * 1024 * 1024, ' ')]), { level: 9 })
+  assert.ok(packed.length * 1032 <= 16 * 1024 * 1024 + 3, `${packed.length} bytes stored`)
+  const stream = streamObject('/Filter [/FlateDecode /ASCIIHexDecode]', packed, true)
+  const [scripts, form] = scriptReports(scriptsPdf(Array.from({ length: 1000 }, () => stream)), 2000, '1,000 streams of 15 MB that leave a byte')
+  const sources = Object.values(scripts.documentActions).map(([source]) => source)
+  assert.equal(sources.length, 1000)
+  assert.equal(sources[0].length, 1, 'the first stream was not decoded')
+  assert.ok(sources.filter((source) => source !== '').length <= 4, 'more streams were decoded than the allowance covers')
+  assert.equal(scripts.truncated, true, 'the decode allowance ran out unmarked')
+  assert.deepEqual([form.fields[0].widgets[0].truncated, form.truncated], [true, true], 'the decode allowance ran out unmarked in the form')
+}
+
+{
+  // The same 15 MB of spaces under one Flate and a few hundred ASCIIHex
+  // filters, each a stage that could hold 15.8 MB. The stored length and the
+  // number of stages are picked so the stages' sum is a small number modulo
+  // 2^32, the size of the module's size_t: the charge stops at the allowance
+  // and cannot wrap, so none of 1,000 such streams is decoded.
+  const packed = deflateSync(Buffer.concat([Buffer.from('0'), Buffer.alloc(15 * 1024 * 1024, ' ')]), { level: 9 })
+  let stored = 0
+  let stages = 0
+  for (let length = packed.length; !stages && length <= 16256; length++) {
+    for (let n = 257; n <= 1200; n++) {
+      if ((length * 1032 * n) % 2 ** 32 < 30000) {
+        stored = length
+        stages = n
+        break
+      }
+    }
+  }
+  assert.ok(stages, 'no chain wraps the sum')
+  // Bytes after the end of the zlib data are not read.
+  const padded = Buffer.concat([packed, Buffer.alloc(stored - packed.length)])
+  const stream = streamObject(`/Filter [/FlateDecode${' /ASCIIHexDecode'.repeat(stages - 1)}]`, padded, true)
+  const [scripts, form] = scriptReports(scriptsPdf(Array.from({ length: 1000 }, () => stream)), 2000, `1,000 streams of ${stages} stages`)
+  const sources = Object.values(scripts.documentActions).map(([source]) => source)
+  assert.equal(sources.length, 1000)
+  assert.ok(sources.every((source) => source === ''), 'a stream past the allowance was decoded')
+  assert.equal(scripts.truncated, true, 'the refused streams are not marked')
+  assert.deepEqual([form.fields[0].widgets[0].truncated, form.truncated], [true, true], 'the refused streams are not marked in the form')
+}
+
+{
+  // An encrypted file (RC4, 40 bits, empty user password) with a Flate /JS
+  // stream: the bytes inflated are the decrypted ones.
+  const rc4 = (key, data) => {
+    const s = Uint8Array.from({ length: 256 }, (_, i) => i)
+    for (let i = 0, j = 0; i < 256; i++) {
+      j = (j + s[i] + key[i % key.length]) & 255
+      ;[s[i], s[j]] = [s[j], s[i]]
+    }
+    const out = Buffer.alloc(data.length)
+    for (let n = 0, i = 0, j = 0; n < data.length; n++) {
+      i = (i + 1) & 255
+      j = (j + s[i]) & 255
+      ;[s[i], s[j]] = [s[j], s[i]]
+      out[n] = data[n] ^ s[(s[i] + s[j]) & 255]
+    }
+    return out
+  }
+  const md5 = (...parts) => createHash('md5').update(Buffer.concat(parts)).digest()
+  const pad = Buffer.from('28bf4e5e4e758a4164004e56fffa01082e2e00b6d0683e802f0ca9fe6453697a', 'hex')
+  const id = Buffer.alloc(16, 7)
+  const owner = rc4(md5(pad).subarray(0, 5), pad)
+  const key = md5(pad, owner, Buffer.from([0xfc, 0xff, 0xff, 0xff]), id).subarray(0, 5)
+  const user = rc4(key, pad)
+  const source = 'app.alert("locked");\n'.repeat(500)
+  // Object 4's key: the file key, then the object and generation numbers.
+  const stored = rc4(md5(key, Buffer.from([4, 0, 0, 0, 0])).subarray(0, 10), deflateSync(Buffer.from(source)))
+  const pdf = buildPdf(
+    [
+      '<< /Type /Catalog /Pages 2 0 R /OpenAction << /S /JavaScript /JS 4 0 R >> >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>',
+      streamObject('/Filter /FlateDecode', stored, true),
+      `<< /Filter /Standard /V 1 /R 2 /O <${owner.toString('hex')}> /U <${user.toString('hex')}> /P -4 >>`,
+    ],
+    `/Encrypt 5 0 R /ID [<${id.toString('hex')}> <${id.toString('hex')}>]`,
+  )
+  withPdf(pdf, (doc) => {
+    assert.equal(takeJson(m._INK_Doc_Facts(doc)).encrypted, true)
+    const scripts = takeJson(m._INK_Scripts(doc))
+    assert.deepEqual([scripts.documentActions.OpenAction, scripts.truncated], [[source], false])
+  })
+}
+
+{
+  // A field tree 1,005 levels deep: the walk stops at 1,000; PDFium loads 33
+  // levels, so the text field at the bottom is not a field.
+  const levels = 1005
+  const nodes = Array.from({ length: levels }, (_, i) => `<< /T (n${i}) ${i > 0 ? `/Parent ${i + 5} 0 R` : ''} ${i + 1 < levels ? `/Kids [${i + 7} 0 R]` : '/FT /Tx'} >>`)
+  const pdf = onePagePdf('', { mediaBox: letterBox, catalog: '/AcroForm << /Fields [6 0 R] >>' }, nodes)
+  withPdf(pdf, (doc) => {
+    const form = takeJson(m._INK_Form(doc))
+    assert.deepEqual([form.fieldTreeDepth, form.truncated, form.fields.length], [1000, true, 0])
+  })
+}
+
+{
+  // Widget facts: /MK, /Q, /TU, /PMD, /DA inherited, scripts by event from the
+  // widget and its field, the widget's own /A, a URI and a Named action.
+  const js = (source) => `<< /S /JavaScript /JS (${source}) >>`
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 8 0 R 9 0 R] /DA (/Helv 0 Tf 0 g) >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [7 0 R 8 0 R 9 0 R] >>`,
+    '<< >>',
+    '<< >>',
+    `<< /FT /Tx /T (total) /Q 1 /DA (/Helv 9 Tf 1 0 0 rg) /AA << /C ${js('calc()')} /K ${js('parentK()')} >> /Kids [7 0 R] >>`,
+    `<< /Type /Annot /Subtype /Widget /Parent 6 0 R /Rect [0 0 100 20] /F 4 /AA << /K ${js('ownK()')} /Fo << /S /JavaScript /JS (focus\\(\\)) /Next [${js('then()')} << /S /URI /URI (x) >>] >> /U << /S /URI /URI (x) >> >> /A ${js('click()')} /MK << /BC [1 0 0] /BG [0 0 1 0 0] /R 90 /CA (OK) >> /TU (tip) /PMD << >> >>`,
+    '<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (go) /Rect [0 30 100 50] /A << /S /URI /URI (https://example.com/a) >> >>',
+    '<< /Type /Annot /Subtype /Widget /FT /Btn /Ff 65536 /T (print) /Rect [0 60 100 80] /A << /S /Named /N /Print >> >>',
+  ])
+  withPdf(pdf, (doc) => {
+    const unread = saveWith(doc, NO_INCREMENTAL)
+    const form = takeJson(m._INK_Form(doc))
+    const field = (name) => form.fields.find((f) => f.name === name)
+    const w = field('total').widgets[0]
+    assert.deepEqual(w.scripts, { A: ['click()'], C: ['calc()'], Fo: ['focus()', 'then()'], K: ['ownK()'] })
+    assert.deepEqual(w.action, { s: 'JavaScript' })
+    assert.deepEqual([w.borderColor, w.backgroundColor, w.rotation, w.caption], [[1, 0, 0], [0, 0, 1, 0, 0], 90, 'OK'])
+    assert.deepEqual([w.q, w.tooltip, w.da, w.pmd, w.flags], [1, 'tip', '/Helv 9 Tf 1 0 0 rg', true, 4])
+    assert.deepEqual(field('go').widgets[0].action, { s: 'URI', uriHex: hex('https://example.com/a') })
+    assert.deepEqual(field('go').widgets[0].scripts, {})
+    assert.deepEqual(field('print').widgets[0].action, { s: 'Named', name: 'Print' })
+    assert.equal(field('go').kind, 'button')
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'the form report changed what a save writes')
+  })
+}
+
+{
+  // Toggles whose appearances are odd: a checkbox with no Off appearance, an
+  // on-state with a space (/Yes#20No) and one with a byte past ASCII
+  // (/On#E9), a text widget with no appearance and an open popup with none,
+  // whose parent note has text for it.
+  // Drawing them writes nothing to the file.
+  const box = (x) => `/Rect [${x} 10 ${x + 20} 30]`
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [6 0 R 7 0 R 8 0 R 9 0 R] /DA (/Helv 12 Tf 0 g) >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 100] /Annots [6 0 R 7 0 R 8 0 R 9 0 R 10 0 R] >>`,
+    '<< >>',
+    '<< >>',
+    `<< /Type /Annot /Subtype /Widget /FT /Btn /T (noOff) ${box(10)} /AS /Yes /AP << /N << /Yes 11 0 R >> >> >>`,
+    `<< /Type /Annot /Subtype /Widget /FT /Btn /T (spaced) ${box(40)} /AS /Off /AP << /N << /Off 12 0 R /Yes#20No 11 0 R >> >> >>`,
+    `<< /Type /Annot /Subtype /Widget /FT /Btn /T (accent) ${box(70)} /AS /Off /AP << /N << /Off 12 0 R /On#E9 11 0 R >> >> >>`,
+    '<< /Type /Annot /Subtype /Widget /FT /Tx /T (bare) /Rect [100 10 200 30] /V (hello) >>',
+    '<< /Type /Annot /Subtype /Popup /Rect [0 50 100 90] /Open true /Parent 13 0 R >>',
+    streamObject('/Type /XObject /Subtype /Form /BBox [0 0 20 20]', '0 0 1 rg 0 0 20 20 re f'),
+    streamObject('/Type /XObject /Subtype /Form /BBox [0 0 20 20]', '1 0 0 rg 0 0 20 20 re f'),
+    '<< /Type /Annot /Subtype /Text /Rect [0 90 20 100] /Contents (A note) /T (Sam) /Popup 10 0 R >>',
+  ])
+  withPdf(pdf, (doc) => {
+    const unread = saveWith(doc, NO_INCREMENTAL)
+    const form = takeJson(m._INK_Form(doc))
+    const widget = (name) => form.fields.find((f) => f.name === name).widgets[0]
+    assert.deepEqual([widget('noOff').states, widget('noOff').onState], [['Yes'], 'Yes'])
+    assert.equal(drawAnnot(doc, 0, 0, 'Off').drew, 0, 'Off where there is none')
+    assert.ok(inked(drawAnnot(doc, 0, 0, null).bytes), 'the checked box with no Off drew nothing')
+    // The on-state name round-trips into the draw as the report writes it.
+    assert.equal(widget('spaced').onState, 'Yes No')
+    const spacedOff = drawAnnot(doc, 0, 1, 'Off')
+    const spacedOn = drawAnnot(doc, 0, 1, widget('spaced').onState)
+    assert.deepEqual([spacedOff.drew, spacedOn.drew], [1, 1])
+    assert.ok(!spacedOff.bytes.equals(spacedOn.bytes), '/Yes#20No draws as Off')
+    // A name's bytes past ASCII are code points U+0080 to U+00FF: the draw
+    // takes them back as those bytes, not as their UTF-8.
+    assert.equal(widget('accent').onState, 'Oné')
+    const accentOn = drawAnnot(doc, 0, 2, Buffer.from(widget('accent').onState, 'latin1'))
+    assert.equal(accentOn.drew, 1)
+    assert.ok(inked(accentOn.bytes), 'the on-state with a byte past ASCII drew nothing')
+    assert.equal(drawAnnot(doc, 0, 2, widget('accent').onState).drew, 0, 'a state given as UTF-8')
+    assert.equal(widget('bare').hasAppearance, false)
+    drawAnnot(doc, 0, 3, null)
+    assert.equal(drawAnnot(doc, 0, 4, null).drew, 0, 'an open popup')
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'a draw changed what a save writes')
+  })
+}
+
+{
+  // The document's scripts: a name tree whose first script's /Next names
+  // itself and whose second is a stream, an open action with a /Next, /AA on
+  // the catalog and on the page.
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /Names << /JavaScript 6 0 R >> /OpenAction << /S /JavaScript /JS (open\\(\\)) /Next << /S /JavaScript /JS (next\\(\\)) >> >> /AA << /WC << /S /JavaScript /JS (bye\\(\\)) >> /WS << /S /URI /URI (x) >> >> >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /AA << /O << /S /JavaScript /JS (opened\\(\\)) >> /C << /S /URI /URI (x) >> >> >>`,
+    '<< >>',
+    '<< >>',
+    '<< /Kids [9 0 R] >>',
+    '<< /S /JavaScript /JS (var a = 1;) /Next 7 0 R >>',
+    streamObject('', 'var b = "two";'),
+    '<< /Names [(init) 7 0 R <FEFF00E9> << /S /JavaScript /JS 8 0 R >>] >>',
+  ])
+  withPdf(pdf, (doc) => {
+    assert.deepEqual(takeJson(m._INK_Scripts(doc)), {
+      document: [
+        { name: 'init', source: 'var a = 1;' },
+        { name: 'é', source: 'var b = "two";' },
+      ],
+      documentActions: { OpenAction: ['open()', 'next()'], WC: ['bye()'] },
+      pageActions: [{ page: 0, scripts: { O: ['opened()'] } }],
+      truncated: false,
+    })
+  })
+}
+
+{
+  // Structure order: the tree reaches annotation 8, then 7 through a nested
+  // element (whose /K also points back up), then 6; 5 is not an annotation of
+  // the page, and 6 is reached twice.
+  const pdf = buildPdf([
+    '<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 9 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    `<< /Type /Page /Parent 2 0 R /MediaBox ${letterBox} /Annots [6 0 R 7 0 R 8 0 R] /Tabs /S >>`,
+    '<< >>',
+    '<< >>',
+    '<< /Type /Annot /Subtype /Link /Rect [0 0 10 10] >>',
+    '<< /Type /Annot /Subtype /Link /Rect [0 20 10 30] >>',
+    '<< /Type /Annot /Subtype /Link /Rect [0 40 10 50] >>',
+    '<< /Type /StructTreeRoot /K 10 0 R >>',
+    '<< /Type /StructElem /S /Document /K [<< /Type /OBJR /Obj 8 0 R >> 11 0 R << /Type /OBJR /Obj 6 0 R >> << /Type /OBJR /Obj 5 0 R >>] >>',
+    '<< /Type /StructElem /S /P /K [5 << /Type /OBJR /Obj 7 0 R >> 10 0 R << /Type /OBJR /Obj 6 0 R >>] >>',
+  ])
+  withPdf(pdf, (doc) => {
+    assert.deepEqual(takeJson(m._INK_Struct_Order(doc, 0)), { order: [8, 7, 6], truncated: false })
+    assert.equal(takeJson(m._INK_Annots_Page(doc, 0)).tabs, 'S')
+  })
+}
+
+{
+  // /Info's title and author, and an encrypted file opened with its user and
+  // its owner password.
+  withPdf(onePagePdf('', { trailer: '/Info 6 0 R' }, ['<< /Title (Facts) /Author <FEFF00C9> /Subject 5 >>']), (doc) => {
+    assert.deepEqual(takeJson(m._INK_Doc_Facts(doc)), { title: 'Facts', author: 'É', encrypted: false, openedAs: 'none' })
+  })
+  withPdf(onePagePdf('', { trailer: '/Info << /Title <FEFF00> >>' }), (doc) => {
+    assert.deepEqual(takeJson(m._INK_Doc_Facts(doc)), { title: { bytes: 'feff00' }, encrypted: false, openedAs: 'none' }, 'a direct /Info')
+  })
+  const encrypted = readFileSync(new URL('../testing/resources/encrypted.pdf', import.meta.url))
+  for (const [password, openedAs] of [
+    ['1234', 'user'],
+    ['5678', 'owner'],
+  ]) {
+    const buf = heapBytes(encrypted)
+    const doc = withStrings([password], (pw) => m._FPDF_LoadMemDocument64(buf, encrypted.length, pw))
+    assert.notEqual(doc, 0, `encrypted.pdf did not open with ${password}`)
+    assert.deepEqual(takeJson(m._INK_Doc_Facts(doc)), { title: 'Title', encrypted: true, openedAs }, `opened with ${password}`)
+    m._FPDF_CloseDocument(doc)
+    m._free(buf)
+  }
+}
+
+{
+  // A direct annotation is left out of a render by its place in /Annots.
+  const pdf = onePagePdf('', {
+    page: '/Annots [<< /Type /Annot /Subtype /Square /Rect [100 20 300 120] /AP << /N 6 0 R >> >>]',
+  }, [streamObject('/Type /XObject /Subtype /Form /BBox [100 20 300 120]', '1 0 0 rg 100 20 200 100 re f')])
+  const neverRendered = withPdf(pdf, (doc) => saveWith(doc, NO_INCREMENTAL))
+  withPdf(pdf, (doc) => {
+    const withAnnots = referenceRender(doc)
+    const withoutAnnots = referenceRender(doc, { flags: 0 })
+    assert.ok(!withAnnots.equals(withoutAnnots), 'the direct square draws nothing')
+    assert.ok(inkRender(doc, { skipAt: [0] }).bytes.equals(withoutAnnots), 'the square left out by place was drawn')
+    assert.ok(inkRender(doc, { skipAt: [1] }).bytes.equals(withAnnots), 'a place past /Annots left the square out')
+    assert.ok(referenceRender(doc).equals(withAnnots), 'the square stays hidden after the render')
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), neverRendered), 'a render by place changed what a save writes')
+  })
+}
+
+{
+  // Facts PDF.js reads that the reports carry as the file has them: a choice
+  // field's /I (here disagreeing with /V, inherited from a parent, with wrong
+  // entries, and not an array), /V and /DV present as null against absent, a
+  // name inside a /V array, a Launch and a GoToR action's /F, border dashes
+  // (valid, from /Border, invalid, all zeros, not arrays) and reals written
+  // as the shortest decimal that reads back as PDFium's float.
+  const widget = (rest) => `<< /Type /Annot /Subtype /Widget /Rect [10 10 60 30] ${rest} >>`
+  const square = (rest) => `<< /Type /Annot /Subtype /Square /Rect [0 0 10 10] ${rest} >>`
+  const pdf = onePagePdf(
+    '',
+    { catalog: '/AcroForm 6 0 R', page: '/Annots [7 0 R 8 0 R 9 0 R 10 0 R 11 0 R 12 0 R 13 0 R 15 0 R 16 0 R 17 0 R 18 0 R 19 0 R 20 0 R 21 0 R]' },
+    [
+      '<< /Fields [7 0 R 8 0 R 9 0 R 10 0 R 11 0 R 12 0 R 13 0 R 14 0 R] >>',
+      widget('/FT /Ch /Ff 2097152 /T (list) /Opt [(a) (b) (c)] /V (a) /I [1 2]'),
+      widget('/FT /Tx /T (vnull) /V null /DV null'),
+      widget('/FT /Tx /T (vnone)'),
+      widget('/FT /Ch /Ff 2097152 /T (varr) /Opt [(x) (y)] /V [/Nm (str) 3] /DV [/D1] /I [(x) /n 2.5 -1]'),
+      widget('/FT /Btn /Ff 65536 /T (launch) /A << /S /Launch /F (app.exe) >>'),
+      widget('/FT /Btn /Ff 65536 /T (gotor) /A << /S /GoToR /F << /Type /Filespec /F (other.pdf) /UF <FEFF00E9> >> /D [0 /Fit] >>'),
+      widget('/FT /Btn /Ff 65536 /T (oddfile) /I 3 /A << /S /Launch /F 5 >>'),
+      '<< /T (group) /FT /Ch /V (p) /I [0] /Kids [15 0 R] >>',
+      widget('/Parent 14 0 R /T (kid)'),
+      square('/BS << /W 0.4 /S /D /D [3 2] >> /C [0.1 0.4 0.7] /CA 0.4'),
+      square('/Border [0 0 1 [4 2]]'),
+      square('/BS << /D [-1 (x) 0] >> /Border [0 0 1 5]'),
+      square('/BS << /D [0 0] >> /Border [0 0 1 [] 9]'),
+      square('/BS << /D 7 >> /Border [0 0 1 null]'),
+      // One array of 1,000,001 numbers as both dashes: the first is cut at
+      // 1,000,000, the second by the report's budget, and the report is
+      // still JSON.
+      square('/BS << /D 22 0 R >> /Border [0 0 1 22 0 R]'),
+      `[${'1 '.repeat(1000001)}]`,
+    ],
+  )
+  withPdf(pdf, (doc) => {
+    const unread = saveWith(doc, NO_INCREMENTAL)
+    const failures = []
+    const check = (label, fn) => {
+      try {
+        fn()
+      } catch (error) {
+        failures.push(`${label}: ${error.message.split('\n')[0]}`)
+      }
+    }
+    const form = takeJson(m._INK_Form(doc))
+    const field = (name) => form.fields.find((f) => f.name === name)
+    const { annots, truncated } = takeJson(m._INK_Annots_Page(doc, 0))
+    const annot = (i) => annots.find((a) => a.index === i)
+
+    check('/I disagreeing with /V', () => assert.deepEqual([field('list').value, field('list').selectedIndices], ['a', [1, 2]]))
+    check('/I inherited from the parent', () => assert.deepEqual([field('group.kid').value, field('group.kid').selectedIndices], ['p', [0]]))
+    check('/I with wrong entries', () => assert.deepEqual(field('varr').selectedIndices, [null, null, 2.5, -1]))
+    check('/I not an array', () => assert.equal(field('oddfile').selectedIndices, null))
+    check('no /I', () => assert.ok(!('selectedIndices' in field('vnull'))))
+    check('/V null', () => assert.deepEqual([field('vnull').valueKind, field('vnull').valueNull, field('vnull').defaultValueNull], ['none', true, true]))
+    check('no /V', () => assert.deepEqual([field('vnone').valueKind, 'valueNull' in field('vnone'), 'defaultValueNull' in field('vnone')], ['none', false, false]))
+    check('a name in a /V array', () => assert.deepEqual([field('varr').valueKind, field('varr').value, field('varr').defaultValue], ['array', [{ name: 'Nm' }, 'str', null], [{ name: 'D1' }]]))
+    check('Launch /F', () => assert.deepEqual(field('launch').widgets[0].action, { s: 'Launch', fileKind: 'string', fileHex: hex('app.exe') }))
+    check('GoToR /F', () => assert.deepEqual(field('gotor').widgets[0].action, { s: 'GoToR', fileKind: 'spec', fileSpecFHex: hex('other.pdf'), fileSpecUFHex: 'feff00e9' }))
+    check('Launch /F of another type', () => assert.deepEqual(field('oddfile').widgets[0].action, { s: 'Launch', fileKind: 'other' }))
+    check('/BS /D', () => assert.deepEqual(annot(8).borderStyle, { width: 0.4, style: 'D', dash: [3, 2] }))
+    check('/Border dash', () => assert.deepEqual([annot(9).border, annot(9).borderDash], [[0, 0, 1], [4, 2]]))
+    check('an invalid dash', () => assert.deepEqual([annot(10).borderStyle.dash, annot(10).borderDash], [[-1, null, 0], null]))
+    check('an all-zero dash and an empty one', () => assert.deepEqual([annot(11).borderStyle.dash, annot(11).borderDash], [[0, 0], []]))
+    check('dashes that are not arrays', () => assert.deepEqual([annot(12).borderStyle.dash, annot(12).borderDash], [null, null]))
+    check('a long shared dash', () => {
+      assert.equal(annot(13).borderStyle.dash.length, 1000000)
+      assert.ok(annot(13).borderDash.length < 1000000, 'the budget did not cut the second dash')
+      assert.deepEqual([annot(13).truncated, truncated], [true, true])
+    })
+    check('reals written short', () => assert.deepEqual([annot(8).color, annot(8).opacity], [[0.1, 0.4, 0.7], 0.4]))
+    // Absent when the file has none.
+    check('no dash', () => assert.ok(!('borderDash' in annot(0)) && !('borderStyle' in annot(0))))
+    assert.deepEqual(failures, [], failures.join('\n'))
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'a report changed what a save writes')
+  })
+}
+
+{
+  // How numbers are written, read from the report's text, which parsed values
+  // cannot show: whole reals without an exponent or a point, minus zero, a
+  // denormal, an unsigned integer past INT_MAX written exactly, a large real,
+  // a colour component of n/255, and 0.4 and 0.1 as written.
+  const tiny = `0.${'0'.repeat(44)}14`
+  const pdf = onePagePdf('', { page: '/Annots [6 0 R]' }, [
+    `<< /Type /Annot /Subtype /Square /Rect [100.0 0 600.0 10.5] /C [-0.0 ${tiny} 3000000000 3000000000.5 0.9490196 0.4 0.1] /CA 0.1 >>`,
+  ])
+  withPdf(pdf, (doc) => {
+    const ptr = m._INK_Annots_Page(doc, 0)
+    const text = cString(ptr)
+    m._INK_Json_Free(ptr)
+    assert.ok(text.includes('"rect":[100,0,600,10.5]'), text)
+    assert.ok(text.includes('"color":[-0,1e-45,3000000000,3e+09,0.9490196,0.4,0.1]'), text)
+    assert.ok(text.includes('"opacity":0.1'), text)
+    const { annots } = JSON.parse(text)
+    assert.ok(Object.is(annots[0].color[0], -0), 'minus zero')
+    assert.deepEqual(
+      annots[0].color.slice(1).map((v) => Math.fround(v)),
+      [1e-45, 3000000000, 3000000000.5, 0.9490196, 0.4, 0.1].map((v) => Math.fround(v)),
+      'each reads back as the float',
+    )
+  })
+}
+
+{
+  // Field dictionaries that are no field's own: a three-level tree (group, sub,
+  // terminals a and b, listed b first) with a script on sub, /MK and /P on
+  // group and /CO naming group; a radio field's /Opt; /I on a parent and on a
+  // widget kid; a tree whose /Kids loop back to its root. Every dictionary
+  // with /Kids is described, a field's own included: the radio parent r (with
+  // /MK, /P and a script of its own, and a widget with its own /Opt), list2,
+  // and mix, whose first kid is a bare widget and whose second has /T. A
+  // top-level field whose /Parent names another, an empty /T, a /Link
+  // subtype and /Fields itself. Kid facts for every dictionary listed: a /T
+  // that is null or a reference to nothing, a /Parent that names another
+  // dictionary, and /Rotate on a group with no /MK and on a widget.
+  const widget = (rest) => `<< /Type /Annot /Subtype /Widget /Rect [10 10 60 30] ${rest} >>`
+  const pdf = onePagePdf(
+    '',
+    { catalog: '/AcroForm 6 0 R', page: '/Annots [9 0 R 10 0 R 12 0 R 13 0 R 15 0 R 17 0 R 18 0 R 21 0 R 23 0 R 24 0 R 25 0 R 27 0 R 29 0 R 30 0 R]' },
+    [
+      '<< /Fields [7 0 R 11 0 R 14 0 R 16 0 R 19 0 R 22 0 R 25 0 R 26 0 R 28 0 R] /CO [7 0 R 9 0 R] >>',
+      '<< /T (group) /Kids [8 0 R] /MK << /BC [1 0 0] /BG [0 1 0] /R 90 >> /P 3 0 R >>',
+      '<< /T (sub) /Parent 7 0 R /Kids [10 0 R 9 0 R] /AA << /K << /S /JavaScript /JS (subK) >> >> >>',
+      widget('/T (a) /FT /Tx /Parent 8 0 R'),
+      widget('/T (b) /FT /Tx /Parent 8 0 R'),
+      '<< /T (r) /FT /Btn /Ff 49152 /Opt [(Alpha) <FEFF00E9> /Nm 5] /Kids [12 0 R 13 0 R] /MK << /BC [0 0 1] >> /P 3 0 R /AA << /F << /S /JavaScript /JS (rF) >> >> >>',
+      widget('/Parent 11 0 R /Opt [(W)]'),
+      widget('/Parent 11 0 R /Rotate 180'),
+      '<< /T (lp) /I [1] /Kids [15 0 R] >>',
+      widget('/T (list) /FT /Ch /Opt [(x) (y)] /Parent 14 0 R'),
+      '<< /T (list2) /FT /Ch /Opt [(x) (y)] /I [0] /Kids [17 0 R 18 0 R] >>',
+      widget('/Parent 16 0 R /I [1]'),
+      widget('/Parent 16 0 R'),
+      '<< /T (loop) /Subtype /Link /Kids [20 0 R] >>',
+      '<< /T (inner) /Parent 19 0 R /Kids [19 0 R 21 0 R] >>',
+      widget('/T (w) /FT /Tx /Parent 20 0 R'),
+      '<< /T (mix) /FT /Tx /Kids [23 0 R 24 0 R] >>',
+      widget('/Parent 22 0 R'),
+      widget('/T (x) /Parent 22 0 R'),
+      widget('/T (orphan) /FT /Tx /Parent 7 0 R'),
+      '<< /T () /Kids [27 0 R] >>',
+      widget('/T (e) /FT /Tx /Parent 26 0 R'),
+      '<< /T (tn) /FT /Tx /Rotate 90 /Kids [29 0 R 30 0 R] >>',
+      widget('/T null /Parent 28 0 R'),
+      widget('/T 99 0 R /Parent 7 0 R'),
+    ],
+  )
+  withPdf(pdf, (doc) => {
+    const unread = saveWith(doc, NO_INCREMENTAL)
+    const failures = []
+    const check = (label, fn) => {
+      try {
+        fn()
+      } catch (error) {
+        failures.push(`${label}: ${error.message.split('\n')[0]}`)
+      }
+    }
+    const form = takeJson(m._INK_Form(doc))
+    const field = (name) => form.fields.find((f) => f.name === name)
+    const group = (name) => form.groups?.find((g) => g.name === name)
+    const kid = (n, t, hasKids = false, extra = {}) => ({ ref: [n, 0], dictionary: true, hasT: true, hasKids, t, ...extra })
+
+    const bare = (n) => ({ ref: [n, 0], dictionary: true, hasT: false, hasKids: false })
+    const indexOf = (name) => form.fields.findIndex((f) => f.name === name)
+
+    check('the groups, in walk order, fields\' own included', () =>
+      assert.deepEqual(
+        form.groups.map((g) => [g.name, g.objectNumber, g.walkIndex, g.field]),
+        [
+          ['group', 7, 0, undefined],
+          ['group.sub', 8, 1, undefined],
+          ['r', 11, 4, indexOf('r')],
+          ['lp', 14, 7, undefined],
+          ['list2', 16, 9, indexOf('list2')],
+          ['loop', 19, 12, undefined],
+          ['loop.inner', 20, 13, undefined],
+          ['mix', 22, 15, indexOf('mix')],
+          ['', 26, 19, undefined],
+          ['tn', 28, 21, undefined],
+        ],
+      ),
+    )
+    check('group', () =>
+      assert.deepEqual(group('group'), {
+        name: 'group',
+        objectNumber: 7,
+        generation: 0,
+        walkIndex: 0,
+        t: 'group',
+        kids: [kid(8, 'sub', true)],
+        borderColor: [1, 0, 0],
+        backgroundColor: [0, 1, 0],
+        rotation: 90,
+        page: 0,
+        scripts: {},
+      }),
+    )
+    check('sub: kids in file order and its script', () =>
+      assert.deepEqual([group('group.sub').kids, group('group.sub').scripts], [[kid(10, 'b'), kid(9, 'a')], { K: ['subK'] }]),
+    )
+    check('the radio parent: kids, /MK, page and its own script', () => {
+      const r = group('r')
+      assert.deepEqual([r.kids, r.borderColor, r.page, r.scripts], [[bare(12), bare(13)], [0, 0, 1], 0, { F: ['rF'] }])
+    })
+    check('list2 with its widget kids', () => assert.deepEqual(group('list2').kids, [bare(17), bare(18)]))
+    check('a later kid with /T under a bare first widget', () => assert.deepEqual(group('mix').kids, [bare(23), { ...bare(24), hasT: true, t: 'x' }]))
+    check('the walk order rebuilt', () => {
+      const byIndex = new Map([...form.groups, ...form.fields.filter((f) => 'walkIndex' in f)].map((e) => [e.walkIndex, e.objectNumber]))
+      assert.deepEqual(
+        [...byIndex].sort((x, y) => x[0] - y[0]).map((e) => e[1]),
+        // 29 is a field of PDFium's, whose kids under tn have /T; 30's /T
+        // names no object.
+        [7, 8, 10, 9, 11, 14, 15, 16, 19, 20, 21, 22, 25, 26, 27, 28, 29],
+      )
+    })
+    check('/Fields itself', () =>
+      assert.deepEqual(form.fieldsRoot.map((e) => [e.ref[0], e.dictionary, e.hasT]), [7, 11, 14, 16, 19, 22, 25, 26, 28].map((n) => [n, true, true])),
+    )
+    check('own /T and /Parent against the walk', () => {
+      const orphan = form.fields.find((f) => f.objectNumber === 25)
+      assert.deepEqual([orphan.t, orphan.parentIsWalkParent, group('group.sub').t, 'parentIsWalkParent' in group('group.sub'), form.groups.find((g) => g.objectNumber === 26).t], ['orphan', false, 'sub', false, ''])
+    })
+    check('a /Link subtype', () => assert.equal(group('loop').subtype, 'Link'))
+    check('a widget\'s own /Opt', () => assert.deepEqual([field('r').widgets[0].opt, 'opt' in field('r').widgets[1]], [['W'], false]))
+    check('/CO names the group by reference', () => assert.deepEqual([form.calculationOrder[0], form.calculationOrderRefs[0]], [-1, [group('group').objectNumber, 0]]))
+    check('a radio field\'s /Opt', () => assert.deepEqual(field('r').opt, ['Alpha', 'é', { name: 'Nm' }, null]))
+    check('/I on the parent', () => assert.deepEqual([field('lp.list').selectedIndices, field('lp.list').selectedIndicesOwn], [[1], false]))
+    check('/I on the field and on a widget kid', () => {
+      const list2 = field('list2')
+      assert.deepEqual([list2.selectedIndices, list2.selectedIndicesOwn, list2.widgets[0].selectedIndices, 'selectedIndices' in list2.widgets[1]], [[0], true, [1], false])
+    })
+    check('the loop ends', () => assert.deepEqual(group('loop.inner')?.kids, [kid(19, 'loop', true, { parentIsWalkParent: false }), kid(21, 'w')]))
+    check('a /T null, a /T to nothing and a /Parent elsewhere', () =>
+      assert.deepEqual(form.groups.find((g) => g.objectNumber === 28)?.kids, [
+        { ...bare(29), hasT: true, t: null },
+        { ...bare(30), hasT: true, t: null, parentIsWalkParent: false },
+      ]),
+    )
+    check('/Fields with each entry\'s /T and /Parent', () =>
+      assert.deepEqual(
+        form.fieldsRoot.map((e) => [e.ref[0], e.t, e.parentIsWalkParent]),
+        [[7, 'group'], [11, 'r'], [14, 'lp'], [16, 'list2'], [19, 'loop'], [22, 'mix'], [25, 'orphan', false], [26, ''], [28, 'tn']].map(([n, t, p]) => [n, t, p]),
+      ),
+    )
+    check('a field whose /T is null says t: null', () => {
+      const f = form.fields.find((x) => x.objectNumber === 29)
+      assert.deepEqual([f?.t, 'parentIsWalkParent' in f], [null, false])
+    })
+    check('/Rotate on a group without /MK and on a widget', () => assert.deepEqual([form.groups.find((g) => g.objectNumber === 28)?.rotate, field('r').widgets[1].rotate, 'rotate' in field('r').widgets[0]], [90, 180, false]))
+    assert.deepEqual(failures, [], failures.join('\n'))
+    assert.equal(form.truncated, false)
+    assert.ok(sameSave(saveWith(doc, NO_INCREMENTAL), unread), 'a report changed what a save writes')
   })
 }
 
