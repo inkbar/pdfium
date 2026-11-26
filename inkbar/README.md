@@ -174,6 +174,10 @@ Take upstream once a month. Also take it out of cycle when a Chrome stable relea
 
 The `upstream` workflow runs every Monday. It writes the number of upstream commits not yet merged to its job summary. It also runs the freshness check, and it never fails for being behind.
 
+## Pull requests
+
+The smoke workflow builds the module from each pull request and runs the smoke check on it, so a failure shows before the merge. It also fails when the module is over the size budget or its exports differ from `inkbar/exports.txt`. A pull request that changes only Markdown is not built.
+
 ## Releases
 
 Changes reach `main` through a pull request, merged as one squashed commit whose title is the pull request's title.

@@ -1,0 +1,42 @@
+name: smoke
+
+# Builds the module from a pull request and runs the smoke test, so a failure shows before the
+# merge. The release workflow runs the same build and test again on main. A pull request that
+# changes only Markdown is not built.
+on:
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Build
+        run: CONTAINER=docker inkbar/build.sh
+
+      - name: Smoke test
+        run: node inkbar/smoke.mjs testing/resources/hello_world.pdf
+
+      - name: Report the size
+        run: |
+          GZ="$(gzip -9 -c inkbar/out/inkbar-pdfium.wasm | wc -c)"
+          echo "Gzipped module size: $GZ bytes (budget $(tr -d '[:space:]' < inkbar/size-budget.txt))" >> "$GITHUB_STEP_SUMMARY"
